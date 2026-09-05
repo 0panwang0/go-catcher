@@ -1,6 +1,6 @@
 // 运行时可调配置：最大并发下载任务数 / 单任务分片并发数 / 分片失败重试次数。
 // 提供：resizableSem（替代原先固定容量的 sem channel，支持运行中改上限）、
-// config 结构体读写 videocatch_config.json、/config 端点应用与落盘。
+// config 结构体读写 gocatcher_config.json、/config 端点应用与落盘。
 package core
 
 import (
@@ -129,9 +129,9 @@ func getConfigPath() string {
 		return configPath
 	}
 	if exe, err := os.Executable(); err == nil {
-		configPath = filepath.Join(filepath.Dir(exe), "videocatch_config.json")
+		configPath = filepath.Join(filepath.Dir(exe), "gocatcher_config.json")
 	} else {
-		configPath = "videocatch_config.json"
+		configPath = "gocatcher_config.json"
 	}
 	return configPath
 }

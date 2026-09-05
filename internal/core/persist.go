@@ -1,4 +1,4 @@
-// 任务状态持久化到 videocatch_state.json。
+// 任务状态持久化到 gocatcher_state.json。
 package core
 
 import (
@@ -51,10 +51,10 @@ var (
 func getStatePath() string {
 	statePathOnce.Do(func() {
 		if exe, err := os.Executable(); err == nil {
-			statePath = filepath.Join(filepath.Dir(exe), "videocatch_state.json")
+			statePath = filepath.Join(filepath.Dir(exe), "gocatcher_state.json")
 			return
 		}
-		statePath = "videocatch_state.json"
+		statePath = "gocatcher_state.json"
 	})
 	return statePath
 }
