@@ -1,0 +1,183 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>下载设置 · GoCatcher</title>
+<style>
+  :root{--bg:#0f172a;--card:#1e293b;--line:#334155;--txt:#e2e8f0;--muted:#94a3b8;--ok:#22c55e;--run:#3b82f6;--err:#ef4444;--warn:#f59e0b;}
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{
+    font-family:"Segoe UI Variable","Segoe UI","Microsoft YaHei UI","Microsoft YaHei",-apple-system,Roboto,sans-serif;
+    background:var(--bg);color:var(--txt);
+    min-height:100vh;padding:28px 20px 80px;
+    font-feature-settings:"ss01","cv02";
+    -webkit-font-smoothing:antialiased;
+    -moz-osx-font-smoothing:grayscale;
+    text-rendering:optimizeLegibility;
+    font-smooth:always;
+  }
+  ::-webkit-scrollbar{width:8px;height:8px}
+  ::-webkit-scrollbar-track{background:transparent}
+  ::-webkit-scrollbar-thumb{background:#334155;border-radius:4px}
+  ::-webkit-scrollbar-thumb:hover{background:#475569}
+  *{scrollbar-color:#334155 transparent;scrollbar-width:thin}
+  .wrap{max-width:640px;margin:0 auto}
+
+  .top{display:flex;align-items:center;gap:12px;margin-bottom:6px}
+  .top h1{font-size:20px}
+  .back{display:inline-flex;align-items:center;gap:6px;background:transparent;border:1px solid var(--line);
+        color:var(--muted);border-radius:9px;padding:6px 12px;font-size:13px;cursor:pointer;transition:all .15s}
+  .back:hover{color:var(--txt);border-color:#64748b}
+  .sub{color:var(--muted);font-size:13px;margin-bottom:20px}
+
+  .card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:18px 20px;margin-bottom:14px}
+  .sec{display:flex;align-items:center;gap:8px;font-size:13px;font-weight:600;color:#cbd5e1;margin-bottom:16px}
+  .sec::before{content:"";width:3px;height:14px;border-radius:2px;background:var(--run)}
+  .field{margin-bottom:16px}
+  .field:last-child{margin-bottom:0}
+  .field label{display:flex;justify-content:space-between;align-items:baseline;font-size:13px;margin-bottom:6px}
+  .field label b{font-weight:600}
+  .field label span{color:var(--muted);font-size:11px}
+  .field input{width:100%;background:#0b1220;border:1px solid var(--line);color:var(--txt);
+               border-radius:8px;padding:9px 12px;font-size:14px;box-sizing:border-box}
+  .field input:focus{outline:none;border-color:#3b82f6}
+  .field .desc{color:var(--muted);font-size:12px;line-height:1.6;margin-top:6px}
+  .field .desc em{font-style:normal;color:#7dd3fc}
+
+  .segrow{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap}
+  .segrow .lb{font-size:13px;font-weight:600}
+  .segrow .hb{color:var(--muted);font-size:11.5px;margin-left:6px;font-weight:400}
+  .seg{display:inline-flex;background:#0b1220;border:1px solid var(--line);border-radius:999px;padding:2px;gap:2px}
+  .seg button{border:none;cursor:pointer;font-size:12px;font-weight:600;padding:5px 16px;border-radius:999px;
+              background:transparent;color:var(--muted);line-height:1.4;transition:all .12s}
+  .seg button.on{background:#3b82f6;color:#fff}
+
+  .note{display:flex;gap:10px;align-items:flex-start;background:rgba(245,158,11,.08);
+        border:1px solid rgba(245,158,11,.35);border-radius:10px;padding:11px 14px;
+        color:#fcd34d;font-size:12.5px;line-height:1.7}
+  .note b{font-weight:600}
+
+  .savebar{display:flex;align-items:center;justify-content:flex-end;gap:12px;margin-top:6px}
+  button.save{background:#3b82f6;color:#fff;border:none;padding:9px 26px;border-radius:9px;font-size:13.5px;
+              font-weight:600;cursor:pointer;transition:filter .15s}
+  button.save:hover{filter:brightness(1.15)}
+
+  #toast{position:fixed;left:50%;bottom:22px;transform:translateX(-50%);z-index:999;
+         background:var(--card);border:1px solid var(--line);border-radius:10px;
+         padding:9px 16px;font-size:13px;box-shadow:0 6px 24px rgba(0,0,0,.4);
+         max-width:86vw;opacity:0;pointer-events:none;transition:opacity .2s}
+  #toast.show{opacity:1}
+  #toast.err{border-color:var(--err);color:#fca5a5}
+  #toast.ok{border-color:var(--ok);color:#86efac}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="top">
+    <button class="back" onclick="location.href='/'">← 返回监控</button>
+    <h1>下载设置</h1>
+  </div>
+  <div class="sub">调整后立即生效，无需重启；正在下载的不受影响，新任务按新配置调度。</div>
+
+  <div class="card">
+    <div class="sec">下载参数</div>
+    <div class="field">
+      <label><b>同时下载文件数</b><span>1 – 16</span></label>
+      <input id="f_maxc" type="number" min="1" max="16">
+    </div>
+    <div class="field">
+      <label><b>单文件分片并发</b><span>1 – 32</span></label>
+      <input id="f_segc" type="number" min="1" max="32">
+      <div class="desc">单个下载任务内同时抓取的分片数，越大下载越快，但更占带宽 / 内存。</div>
+    </div>
+    <div class="field">
+      <label><b>分片失败重试</b><span>0 – 10</span></label>
+      <input id="f_retry" type="number" min="0" max="10">
+    </div>
+    <div class="field">
+      <label><b>服务端口</b><span>1 – 65535</span></label>
+      <input id="f_port" type="number" min="1" max="65535">
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="sec">界面偏好</div>
+    <div class="segrow">
+      <span class="lb">任务列表显示模式<span class="hb">任务卡片的展示详略</span></span>
+      <span class="seg" id="viewseg">
+        <button type="button" data-v="detail">详细</button><button type="button" data-v="compact">简略</button>
+      </span>
+    </div>
+  </div>
+
+  <div class="note">
+    <span>⚠</span>
+    <span><b>改动端口需重启服务生效</b>：托盘右键「启动 / 停止服务」切换一次，或重启客户端；浏览器扩展需同步改为新端口。</span>
+  </div>
+
+  <div class="savebar">
+    <button class="save" onclick="save()">保存</button>
+  </div>
+</div>
+<div id="toast"></div>
+
+<script>
+function el(id){return document.getElementById(id)}
+var segVal = 'detail';
+var toastTimer = null;
+function toast(msg, isErr){
+  var t = el('toast');
+  t.textContent = msg;
+  t.className = 'toast' + (isErr ? ' show err' : ' show ok');
+  if (toastTimer) clearTimeout(toastTimer);
+  toastTimer = setTimeout(function(){ t.className = 'toast'; }, 5000);
+}
+function syncSeg(v){
+  var bs = el('viewseg').querySelectorAll('button');
+  for (var i=0;i<bs.length;i++) bs[i].className = (bs[i].getAttribute('data-v')===v) ? 'on' : '';
+}
+el('viewseg').addEventListener('click', function(e){
+  var b = e.target.closest('button');
+  if (b){ segVal = b.getAttribute('data-v'); syncSeg(segVal); }
+});
+async function load(){
+  try{
+    const r = await fetch('/config', {cache:'no-store'});
+    const d = await r.json();
+    el('f_maxc').value = d.maxConcurrent;
+    el('f_segc').value = d.segConcurrency;
+    el('f_retry').value = d.maxRetries;
+    el('f_port').value = d.port;
+    segVal = (d.uiView === 'compact') ? 'compact' : 'detail';
+    syncSeg(segVal);
+  }catch(e){ toast('无法读取服务端配置', true); }
+}
+async function save(){
+  const v = {
+    maxConcurrent:  parseInt(el('f_maxc').value, 10),
+    segConcurrency: parseInt(el('f_segc').value, 10),
+    maxRetries:     parseInt(el('f_retry').value, 10),
+    port:           parseInt(el('f_port').value, 10),
+    uiView:         segVal
+  };
+  if (isNaN(v.maxConcurrent) || isNaN(v.segConcurrency) || isNaN(v.maxRetries) || isNaN(v.port) || v.port<1 || v.port>65535){
+    toast('请填写有效的数字（端口 1 – 65535）', true); return;
+  }
+  try{
+    const r = await fetch('/config', {method:'POST', headers:{'Content-Type':'application/json'},
+                                      body:JSON.stringify(v), cache:'no-store'});
+    if (!r.ok){ const t = await r.json().catch(()=>({})); throw new Error(t.error || ('HTTP '+r.status)); }
+    const d = await r.json();
+    if (d.restartRequired){
+      toast('已保存。新端口 '+d.port+' 需重启服务生效：托盘右键「启动 / 停止服务」切换一次');
+    }else{
+      toast('设置已保存并生效');
+    }
+    setTimeout(function(){ location.href = '/'; }, 800);
+  }catch(e){ toast('保存失败：'+e.message, true); }
+}
+load();
+</script>
+</body>
+</html>

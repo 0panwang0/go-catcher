@@ -1,0 +1,479 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>GoCatcher 下载监控</title>
+<style>
+  :root{--bg:#0f172a;--card:#1e293b;--line:#334155;--txt:#e2e8f0;--muted:#94a3b8;--ok:#22c55e;--run:#3b82f6;--err:#ef4444;--warn:#f59e0b;}
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{
+    font-family:"Segoe UI Variable","Segoe UI","Microsoft YaHei UI","Microsoft YaHei",-apple-system,Roboto,sans-serif;
+    background:var(--bg);color:var(--txt);
+    min-height:100vh;padding:28px 20px 60px;
+    font-feature-settings:"ss01","cv02";
+    -webkit-font-smoothing:antialiased;
+    -moz-osx-font-smoothing:grayscale;
+    text-rendering:optimizeLegibility;
+    font-smooth:always;
+  }
+  /* 滚动条改成深色细条（不再用 Windows 默认的灰白丑样式） */
+  ::-webkit-scrollbar{width:8px;height:8px}
+  ::-webkit-scrollbar-track{background:transparent}
+  ::-webkit-scrollbar-thumb{background:#334155;border-radius:4px}
+  ::-webkit-scrollbar-thumb:hover{background:#475569}
+  *{scrollbar-color:#334155 transparent;scrollbar-width:thin}
+  /* 修复遮罩/弹层导致的页面双重抖动 */
+  html{scroll-behavior:auto}
+  .wrap{max-width:900px;margin:0 auto}
+  .hd{display:flex;align-items:center;gap:10px;margin-bottom:4px}
+  h1{font-size:20px}
+  .hd .dot{width:10px;height:10px;border-radius:50%;background:var(--muted);display:inline-block;flex:none}
+  .hd .dot.any{background:var(--run);animation:pulse 1s infinite}
+  @keyframes pulse{0%,100%{opacity:1}50%{opacity:.25}}
+  .sub{color:var(--muted);font-size:13px;margin-bottom:16px}
+  .stats{display:flex;gap:14px;margin-bottom:6px;flex-wrap:wrap;color:var(--muted);font-size:12.5px;
+         background:var(--card);border:1px solid var(--line);border-radius:12px;padding:11px 16px}
+  .stats b{color:var(--txt)}
+
+  /* 日期分割线：滚动时吸顶，长列表里始终知道当前看到哪天 */
+  .daysep{position:sticky;top:0;z-index:5;background:var(--bg);
+          display:flex;align-items:center;gap:12px;margin:20px 0 12px;padding:8px 0 8px 2px}
+  .daysep:first-child{margin-top:6px}
+  .daysep .lb{font-size:13px;font-weight:600;color:#cbd5e1;white-space:nowrap}
+  .daysep .ct{font-size:11.5px;color:#64748b;white-space:nowrap}
+  .daysep .ln{flex:1;height:1px;background:var(--line)}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:16px 18px;margin-bottom:12px}
+  .card.active{border-color:#2563eb}
+  .card.paused{border-color:#78350f}
+  .thead{display:flex;align-items:center;gap:12px;margin-bottom:11px;flex-wrap:wrap}
+  .badge{font-size:11px;padding:3px 9px;border-radius:20px;font-weight:600}
+  .badge.que{background:#334155;color:var(--warn)}
+  .badge.run{background:rgba(59,130,246,.2);color:#7dd3fc;animation:pulse 1s infinite}
+  .badge.pause{background:rgba(245,158,11,.18);color:#fcd34d}
+  .badge.done{background:rgba(34,197,94,.18);color:var(--ok)}
+  .badge.err{background:rgba(239,68,68,.18);color:var(--err)}
+  .badge.cancel{background:#334155;color:#94a3b8}
+  .fname{font-weight:600;word-break:break-all;overflow-wrap:anywhere;font-size:15px;flex:1;min-width:160px}
+  .fname .id{color:var(--muted);font-size:11.5px;font-weight:400;margin-left:8px}
+  .meta2{display:grid;grid-template-columns:auto 1fr;gap:4px 14px;font-size:12.5px;color:var(--muted);margin-bottom:10px}
+  .meta2 .mv{color:var(--txt);word-break:break-all;overflow-wrap:anywhere;text-align:left}
+  .stage{color:#7dd3fc;font-weight:600;font-size:13px;word-break:break-all;overflow-wrap:anywhere}
+  .stage.err{color:var(--err)}
+  .stage.ok{color:var(--ok)}
+  .stage.pause{color:#fcd34d}
+  .stage.stale{color:#94a3b8}
+  .pctline{display:flex;justify-content:space-between;font-size:12px;color:var(--muted);margin-bottom:5px}
+  .bar{height:10px;background:#0b1220;border-radius:6px;overflow:hidden}
+  .bar>i{display:block;height:100%;width:0;background:linear-gradient(90deg,#3b82f6,#22c55e);transition:width .3s}
+  .bar>i.err{background:var(--err)}
+  .bar>i.done{background:var(--ok)}
+  .bar>i.pause{background:var(--warn)}
+  .bar>i.indet{width:42%;background:linear-gradient(90deg,#3b82f6,#22c55e,#3b82f6);background-size:220% 100%;animation:indet 1.1s linear infinite}
+  @keyframes indet{0%{background-position:220% 0}100%{background-position:-220% 0}}
+  .acts{display:flex;gap:8px;margin-top:13px;flex-wrap:wrap}
+  button{background:#3b82f6;color:#fff;border:none;padding:7px 13px;border-radius:9px;font-size:12.5px;cursor:pointer;transition:filter .15s}
+  button:hover{filter:brightness(1.15)}
+  button:disabled{opacity:.4;cursor:not-allowed}
+  button.ghost{background:transparent;border:1px solid var(--line);color:var(--muted)}
+  button.danger{background:rgba(239,68,68,.16);border:1px solid rgba(239,68,68,.5);color:#fca5a5}
+  button.warn{background:rgba(245,158,11,.16);border:1px solid rgba(245,158,11,.5);color:#fcd34d}
+  .empty{color:var(--muted);text-align:center;padding:50px 0;font-size:14px;background:var(--card);border:1px dashed var(--line);border-radius:14px}
+  .foot{color:#64748b;font-size:11.5px;margin-top:8px;display:flex;justify-content:space-between;flex-wrap:wrap;gap:6px}
+  #errline{color:var(--err)}
+  /* 操作反馈 toast：独立于 errline，避免被 poll 清掉 */
+  #toast{position:fixed;left:50%;bottom:22px;transform:translateX(-50%);z-index:999;
+         background:var(--card);border:1px solid var(--line);border-radius:10px;
+         padding:9px 16px;font-size:13px;box-shadow:0 6px 24px rgba(0,0,0,.4);
+         max-width:86vw;opacity:0;pointer-events:none;transition:opacity .2s}
+  #toast.show{opacity:1}
+  #toast.err{border-color:var(--err);color:#fca5a5}
+  #toast.ok{border-color:var(--ok);color:#86efac}
+  /* 左下角设置按钮 */
+  #setbtn{position:fixed;left:16px;bottom:16px;z-index:50;width:40px;height:40px;border-radius:50%;
+          background:var(--card);border:1px solid var(--line);color:var(--muted);font-size:18px;
+          display:flex;align-items:center;justify-content:center;cursor:pointer;transition:filter .15s}
+  #setbtn:hover{filter:brightness(1.2);color:var(--txt)}
+
+  /* —— 简略模式：每任务单行 —— */
+  .row{position:relative;display:flex;align-items:center;gap:8px;height:34px;background:var(--card);
+       border:1px solid var(--line);border-radius:8px;padding:0 8px;margin-bottom:6px;overflow:hidden;
+       transition:border-color .15s}
+  .row:hover{border-color:#475569}
+  .row.run{border-color:#2563eb}
+  .row .badge{font-size:10.5px;padding:2px 8px;flex:none;min-width:44px;text-align:center}
+  .rowname{flex:1;min-width:0;overflow:hidden;white-space:nowrap;height:18px;line-height:18px}
+  .rowname>span{display:inline-block;white-space:nowrap;will-change:transform}
+  .rowpct{flex:none;font-size:11.5px;color:#7dd3fc;font-weight:600;font-variant-numeric:tabular-nums}
+  .rowacts{display:flex;gap:4px;flex:none}
+  .ibtn{width:26px;height:26px;border-radius:7px;border:1px solid var(--line);background:transparent;
+        color:var(--muted);font-size:12px;line-height:1;cursor:pointer;display:flex;align-items:center;
+        justify-content:center;transition:all .12s;padding:0}
+  .ibtn:hover{border-color:#64748b;color:var(--txt);background:#0b1220}
+  .ibtn.danger:hover{border-color:rgba(239,68,68,.6);color:#fca5a5}
+  .ibtn.primary{background:#3b82f6;border-color:#3b82f6;color:#fff}
+  .ibtn.primary:hover{filter:brightness(1.15)}
+  .rowstrip{position:absolute;left:0;bottom:0;height:3px;width:100%;background:#0b1220}
+  .rowstrip i{display:block;height:100%;background:linear-gradient(90deg,#3b82f6,#22c55e);transition:width .3s}
+  .rowstrip i.indet{width:42%;background-size:220% 100%;animation:indet 1.1s linear infinite}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="hd"><span class="dot" id="dot"></span><h1>GoCatcher 下载监控</h1></div>
+  <div class="sub">本地服务 <span id="svcaddr">127.0.0.1:…</span></div>
+
+  <div class="stats" id="stats"></div>
+  <div id="list"></div>
+
+  <div class="foot"><span id="errline"></span><span>暂停后可从断点继续 · 任务记录自动保存</span></div>
+</div>
+<div id="toast"></div>
+<button id="setbtn" title="设置">⚙</button>
+
+<script>
+var tasks = [];
+var lastAction = 0;   // 操作后短暂停止重建 DOM，避免按钮被刷新打断
+var lastSig = '';
+var curCfg = {maxConcurrent:3, segConcurrency:10, maxRetries:3, port:7891}; // 当前服务端配置
+var viewMode = 'detail';  // 任务列表详略（detail=卡片 / compact=单行），启动后由 /config 的 uiView 覆盖
+
+function applyViewMode(v){
+  if (v !== 'detail' && v !== 'compact') return;
+  viewMode = v;
+  lastSig = '';
+  render();
+}
+
+async function poll() {
+  try {
+    const r = await fetch('/status', {cache:'no-store'});
+    const d = await r.json();
+    tasks = d.tasks || [];
+    setErr('');
+    updateStats();
+    const sig = tasks.map(t=>t.id+t.stage+t.segDone+t.pct+t.paused+t.canceled+t.done+t.fileMissing+(t.error||'')+(t.live&&t.running?Math.floor((Date.now()-(t.started?new Date(t.started).getTime():Date.now()))/1000):'')).join('|');
+    if (sig !== lastSig && Date.now() - lastAction > 1200) {
+      lastSig = sig;
+      render();
+    }
+  } catch(e) {
+    setErr('无法连接本地服务，请确认 go-catcher.exe 已启动');
+  }
+}
+function el(id){return document.getElementById(id)}
+function setErr(m){el('errline').textContent=m||''}
+function esc(s){ return String(s==null?'':s).replace(/[&<>"]/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c];}); }
+
+function updateStats(){
+  const dot=el('dot');
+  dot.className = 'dot' + (tasks.some(function(t){return t.running||t.queued;}) ? ' any' : '');
+  el('stats').innerHTML =
+      '下载中 <b>'+cnt(function(t){return t.running&&!t.done;})+'</b>'
+    + ' · 排队 <b>'+cnt(function(t){return t.queued;})+'</b>'
+    + ' · 暂停 <b style="color:var(--warn)">'+cnt(function(t){return t.paused&&!t.done;})+'</b>'
+    + ' · 已完成 <b style="color:var(--ok)">'+cnt(function(t){return t.done&&!t.error&&!t.canceled;})+'</b>'
+    + ' · 失败 <b style="color:var(--err)">'+cnt(function(t){return t.error&&!t.canceled;})+'</b>';
+}
+function cnt(f){ return tasks.filter(f).length; }
+
+function badge(t){
+  if(t.canceled) return '<span class="badge cancel">已取消</span>';
+  if(t.error) return '<span class="badge err">失败</span>';
+  if(t.paused) return '<span class="badge pause">已暂停</span>';
+  if(t.queued) return '<span class="badge que">排队中</span>';
+  if(t.running && t.live) return '<span class="badge run">录制中</span>';
+  if(t.running) return '<span class="badge run">下载中</span>';
+  if(t.done) return t.fileMissing ? '<span class="badge cancel">已失效</span>' : '<span class="badge done">已完成</span>';
+  return '<span class="badge que">等待</span>';
+}
+function fnameOf(t){ return t.filename || (t.finalPath? t.finalPath.split(/[\\/]/).pop() : ('任务 '+t.id)); }
+function saveDirOf(t){ return t.saveDir || (t.finalPath? t.finalPath.replace(/[\\/][^\\/]+$/,'') : ''); }
+
+// 直播/事件流没有总进度，用录制时长展示（运行中=现在-开始；暂停/完成=结束-开始）
+function durText(t){
+  const end = (t.running||t.queued) ? Date.now() : (t.finished ? new Date(t.finished).getTime() : Date.now());
+  const start = t.started ? new Date(t.started).getTime() : end;
+  const s = Math.max(0, Math.floor((end-start)/1000));
+  const m = Math.floor(s/60), ss = s%60;
+  return (m<10?'0':'')+m+':'+(ss<10?'0':'')+ss;
+}
+
+function stageText(t){
+  if(t.canceled) return '<span class="stage err">已取消，临时文件已清理</span>';
+  if(t.error) return '<span class="stage err">失败：'+esc(t.error)+'</span>';
+  if(t.paused) return t.live
+    ? '<span class="stage pause">已暂停 · 已录制 '+t.segDone+' 个分片（'+durText(t)+'），可继续录制</span>'
+    : '<span class="stage pause">已暂停 · 已下载 '+t.segDone+' 个分片，可从断点继续</span>';
+  if(t.queued) return '<span class="stage">排队中…（最多同时 '+esc(curCfg.maxConcurrent)+' 个在下载）</span>';
+  if(t.done) return t.fileMissing
+    ? '<span class="stage stale">已失效 · 文件已被移动或删除</span>'
+    : '<span class="stage ok">完成 · '+esc(t.stage||'已保存')+'</span>';
+  if(t.running && t.live) return '<span class="stage">录制直播中 · 已录 '+t.segDone+' 片 · '+durText(t)+'</span>';
+  return '<span class="stage">'+esc(t.stage||'进行中')+'</span>';
+}
+
+function card(t){
+  const pct = Math.max(0, Math.min(100, t.pct||0));
+  let barCls='';
+  if(t.error||t.canceled) barCls='err';
+  else if(t.done) barCls='done';
+  else if(t.paused) barCls='pause';
+  else if(t.live) barCls='indet';                    // 直播：无限进度条
+  else if(t.stage==='解析视频源') barCls='indet'; // 源站响应慢时显示流动进度，避免像死锁
+  const seg = t.live
+    ? ('已录制 '+t.segDone+' 个分片')
+    : ((t.segTot>0)?('分片 '+t.segDone+' / '+t.segTot):'');
+  const pctTxt = (t.queued&&!t.running) ? '—'
+    : (t.error ? '失败'
+    : (t.canceled ? '已取消'
+    : (t.stage==='解析视频源' ? '等待源站响应…'
+    : (t.stage==='下载直链文件中' ? '下载中…'
+    : (t.live ? ((t.paused||t.done)?'已录制 ':'录制中 ')+durText(t)
+    : pct.toFixed(1)+'%')))));
+  const started = t.started? new Date(t.started).toLocaleTimeString('zh-CN',{hour12:false,hour:'2-digit',minute:'2-digit'}) : '';
+  const cls = t.canceled ? 'card' : (t.paused ? 'card paused' : ((t.running||t.queued) ? 'card active':'card'));
+  return '<div class="'+cls+'">'
+    + '<div class="thead">'+badge(t)+'<div class="fname">'+esc(fnameOf(t))+'<span class="id">'+esc(t.id)+'</span></div></div>'
+    + '<div class="meta2">'
+    +   (saveDirOf(t)?'<div>保存到</div><div class="mv">'+esc(saveDirOf(t))+'</div>':'')
+    +   (started?'<div>开始</div><div class="mv" style="color:var(--muted)">'+started+'</div>':'')
+    + '</div>'
+    + '<div style="margin-bottom:6px">'+stageText(t)+'</div>'
+    + '<div class="pctline"><span>'+pctTxt+'</span><span style="color:var(--muted)">'+seg+'</span></div>'
+    + '<div class="bar"><i class="'+barCls+'"'+(barCls==='indet'?'':' style="width:'+(t.done&&!t.error?100:(t.live?100:pct))+'%"')+'></i></div>'
+    + actions(t)
+    + '</div>';
+}
+
+// 每个任务按状态给出可用操作
+function actions(t){
+  const id = JSON.stringify(t.id);
+  const op = t.openPath ? JSON.stringify(t.openPath) : null; // 真实存在的文件（成品或 .part 半成品）
+  const sd = t.saveDir ? JSON.stringify(t.saveDir) : null;
+  let b = [];
+  if (t.canceled) {
+    b.push(btn('ghost','🗑 移除记录','removeTask('+id+')'));
+  } else if (t.done && !t.error) {
+    if (op) b.push(btn('primary','▶ 打开文件','openFile('+op+')'));
+    if (sd) b.push(btn('ghost','📂 打开文件夹','openFolder('+sd+')'));
+    b.push(btn('ghost','🗑 移除记录','removeTask('+id+')'));
+  } else if (t.paused) {
+    if (op) b.push(btn('ghost','▶ 打开半成品','openFile('+op+')'));
+    if (sd) b.push(btn('ghost','📂 打开文件夹','openFolder('+sd+')'));
+    b.push(btn('primary','▶ 继续下载','resumeTask('+id+')'));
+    b.push(btn('danger','✕ 取消','cancelTask('+id+')'));
+  } else if (t.error) {
+    if (op) b.push(btn('ghost','▶ 打开半成品','openFile('+op+')'));
+    b.push(btn('primary','▶ 重试','resumeTask('+id+')'));
+    b.push(btn('danger','✕ 取消','cancelTask('+id+')'));
+    if (sd) b.push(btn('ghost','📂 打开文件夹','openFolder('+sd+')'));
+    b.push(btn('ghost','🗑 移除记录','removeTask('+id+')'));
+  } else {
+    // 下载中 / 排队中
+    b.push(btn('warn','⏸ 暂停','pauseTask('+id+')'));
+    b.push(btn('danger','✕ 取消','cancelTask('+id+')'));
+  }
+  return b.length ? '<div class="acts">'+b.join('')+'</div>' : '';
+}
+function btn(kind,label,onclick){
+  const c = kind==='primary'?'':(' '+kind);
+  // 关键修复：onclick 属性本身用双引号包裹，而参数(JSON.stringify/字符串)也常含双引号。
+  // 若直接内插，onclick 属性值会被参数里的第一个 " 提前截断成残缺 JS(如 openFile()，
+  // 点按钮完全无反应)。必须把 onclick 内所有 " 转义成 &quot;，HTML 解析后才还原成合法 JS。
+  const safe = String(onclick).replace(/"/g,'&quot;');
+  return '<button class="'+c.trim()+'" onclick="'+safe+'">'+label+'</button>';
+}
+
+// —— 简略模式：单行任务 ——
+function ibtn(kind,icon,title,onclick){
+  const safe = String(onclick).replace(/"/g,'&quot;');
+  return '<button type="button" class="ibtn'+(kind?' '+kind:'')+'" title="'+esc(title)+'" onclick="'+safe+'">'+icon+'</button>';
+}
+function rowCard(t){
+  const id  = JSON.stringify(t.id);
+  const op  = t.openPath ? JSON.stringify(t.openPath) : null;
+  const sd  = t.saveDir ? JSON.stringify(t.saveDir) : null;
+  const pct = Math.max(0, Math.min(100, t.pct||0));
+  const isRun = t.running && !t.done && !t.error && !t.canceled;
+  let pctTxt = '';
+  if (isRun || t.paused) pctTxt = (t.stage==='解析视频源'||t.stage==='下载直链文件中') ? '…' : (t.live ? durText(t) : pct.toFixed(1)+'%');
+  let acts = '';
+  if (t.canceled) {
+    acts = ibtn('','🗑','移除记录','removeTask('+id+')');
+  } else if (t.done && !t.error) {
+    acts = (op ? ibtn('','▶','打开文件','openFile('+op+')') : '')
+         + (sd ? ibtn('','📂','打开文件夹','openFolder('+sd+')') : '')
+         + ibtn('','🗑','移除记录','removeTask('+id+')');
+  } else if (t.paused) {
+    acts = ibtn('primary','▶','继续下载','resumeTask('+id+')')
+         + ibtn('danger','✕','取消（删除文件）','cancelTask('+id+')');
+  } else if (t.error) {
+    acts = ibtn('primary','↻','重试','resumeTask('+id+')')
+         + ibtn('danger','✕','取消（删除文件）','cancelTask('+id+')')
+         + ibtn('','🗑','移除记录','removeTask('+id+')');
+  } else {
+    acts = ibtn('','⏸','暂停','pauseTask('+id+')')
+         + ibtn('danger','✕','取消（删除文件）','cancelTask('+id+')');
+  }
+  const name = esc(fnameOf(t));
+  return '<div class="row'+(isRun?' run':'')+'" data-id="'+esc(t.id)+'">'
+    + badge(t)
+    + '<div class="rowname"><span>'+name+'</span></div>'
+    + (pctTxt ? '<span class="rowpct">'+pctTxt+'</span>' : '')
+    + '<span class="rowacts">'+acts+'</span>'
+    + (isRun ? '<span class="rowstrip"><i class="'+(t.live?'indet':'')+'" style="'+(t.live?'':'width:'+pct+'%')+'"></i></span>' : '')
+    + '</div>';
+}
+// —— 名称滚动：放不下才滚 ——
+// 用 Web Animations 做"摆动"：滑到文本末尾停顿，再原路滑回，无限往复（alternate）。
+// 进度按任务 id 记录、重建 DOM 后接续：poll 每 900ms 会因 pct 变化整表重建，
+// 不接续的话动画每次都从 0 开始，下载期间永远滚不完一趟。
+var scrollState = {}; // id -> {t: 动画进度(ms), paused: 鼠标悬停中}
+function harvestScroll(){
+  document.querySelectorAll('.row[data-id]').forEach(function(row){
+    const txt = row.querySelector('.rowname>span');
+    if (!txt) return;
+    const anims = txt.getAnimations();
+    if (anims && anims.length){
+      scrollState[row.getAttribute('data-id')] = {t: anims[0].currentTime, paused: anims[0].playState === 'paused'};
+    }
+  });
+}
+function setupScroll(){
+  const live = {};
+  document.querySelectorAll('.row[data-id]').forEach(function(row){
+    const id = row.getAttribute('data-id');
+    live[id] = true;
+    const nm  = row.querySelector('.rowname');
+    const txt = nm && nm.querySelector('span');
+    if (!nm || !txt) return;
+    const over = Math.ceil(txt.getBoundingClientRect().width - nm.clientWidth);
+    if (over <= 4) return;                    // 放得下：不滚
+    const d   = over + 12;                    // 多走 12px，让文本尾部完全离开右缘
+    const dur = Math.max(4000, d * 35);       // 等速感：距离越长时长按比例拉长
+    const anim = txt.animate(
+      [{transform:'translateX(0)'},
+       {transform:'translateX(0)',       offset:0.12},   // 起点停顿
+       {transform:'translateX(-'+d+'px)', offset:0.88},
+       {transform:'translateX(-'+d+'px)'}],              // 末点停顿
+      {duration:dur, direction:'alternate', iterations:Infinity, easing:'ease-in-out'});
+    const st = scrollState[id];
+    if (st){
+      if (typeof st.t === 'number') anim.currentTime = st.t;
+      if (st.paused) anim.pause();
+    }
+    row.addEventListener('mouseenter', function(){ anim.pause(); if (scrollState[id]) scrollState[id].paused = true; });
+    row.addEventListener('mouseleave', function(){ anim.play();  if (scrollState[id]) scrollState[id].paused = false; });
+  });
+  Object.keys(scrollState).forEach(function(k){ if (!live[k]) delete scrollState[k]; });
+}
+
+// —— 按天分组渲染 ——
+function dayKey(s){
+  const d = new Date(s);
+  const p = function(n){return n<10?'0'+n:''+n;};
+  return d.getFullYear()+'-'+p(d.getMonth()+1)+'-'+p(d.getDate());
+}
+function dayLabel(key){
+  const today = dayKey(new Date());
+  const y = new Date(); y.setDate(y.getDate()-1);
+  if (key === today) return '今天';
+  if (key === dayKey(y)) return '昨天';
+  const d = new Date(key+'T00:00:00');
+  const wd = ['星期日','星期一','星期二','星期三','星期四','星期五','星期六'][d.getDay()];
+  return (d.getMonth()+1)+'月'+d.getDate()+'日 '+wd;
+}
+function render(){
+  if (!tasks.length){
+    el('list').innerHTML='<div class="empty">暂无下载任务。<br>到视频页点「下载该视频」开始</div>';
+    return;
+  }
+  const groups = {}, order = [];
+  tasks.forEach(function(t){
+    const k = dayKey(t.started || Date.now());
+    if (!groups[k]) { groups[k]=[]; order.push(k); }
+    groups[k].push(t);
+  });
+  let html = '';
+  const mk = (viewMode==='compact') ? rowCard : card;
+  order.forEach(function(k){
+    const n = groups[k].length;
+    html += '<div class="daysep"><span class="lb">'+dayLabel(k)+'</span>'
+          + '<span class="ct">'+n+' 个任务</span><span class="ln"></span></div>'
+          + groups[k].map(mk).join('');
+  });
+  if (viewMode==='compact') harvestScroll();   // 重建前保存各行动画进度
+  el('list').innerHTML = html;
+  if (viewMode==='compact') setupScroll();
+}
+
+// —— 操作 ——
+// 反馈用独立 toast（固定悬浮，停留 5s，不随 poll 清除）。
+// 旧实现把错误写进 errline，会被 poll() 每 900ms setErr('') 秒清，用户根本看不到报错。
+var toastTimer=null;
+function toast(msg,isErr){
+  var t=el('toast');
+  t.textContent=msg;
+  t.className='toast'+(isErr?' show err':' show ok');
+  if(toastTimer) clearTimeout(toastTimer);
+  toastTimer=setTimeout(function(){ t.className='toast'; },5000);
+}
+async function call(url, okMsg){
+  lastAction = Date.now();
+  try{
+    const r = await fetch(url,{cache:'no-store'});
+    if(!r.ok){ const t = await r.json().catch(()=>({})); throw new Error(t.error||('HTTP '+r.status)); }
+    if(okMsg) toast(okMsg,false);
+  }catch(e){ toast('操作失败：'+e.message,true); }
+  lastAction = Date.now();
+  lastSig = '';      // 强制下次刷新重建
+  await poll();
+  render();
+}
+function pauseTask(id){ return call('/pause?id='+encodeURIComponent(id),'已暂停'); }
+function resumeTask(id){ return call('/resume?id='+encodeURIComponent(id),'已恢复下载'); }
+function cancelTask(id){
+  if (!confirm('取消后已下载的分片会被删除，确定取消该任务？')) return;
+  return call('/cancel?id='+encodeURIComponent(id),'已取消');
+}
+function removeTask(id){ return call('/remove?id='+encodeURIComponent(id),'已移除记录'); }
+async function openFile(p){
+  try{
+    const r = await fetch('/openfile?path='+encodeURIComponent(p),{cache:'no-store'});
+    if(!r.ok){ const t=await r.json().catch(()=>({})); throw new Error(t.error||('HTTP '+r.status)); }
+    const d=await r.json().catch(()=>({}));
+    toast('已请求打开文件（服务端返回 '+(d&&d.ok?'OK':'?')+'）',false);
+  }catch(e){ toast('打开文件失败：'+e.message,true); }
+}
+async function openFolder(p){
+  try{
+    const r = await fetch('/openfolder?path='+encodeURIComponent(p),{cache:'no-store'});
+    if(!r.ok){ const t=await r.json().catch(()=>({})); throw new Error(t.error||('HTTP '+r.status)); }
+    const d=await r.json().catch(()=>({}));
+    toast('已请求打开文件夹（服务端返回 '+(d&&d.ok?'OK':'?')+'）',false);
+  }catch(e){ toast('打开文件夹失败：'+e.message,true); }
+}
+
+// —— 设置 ——
+async function loadConfig(){
+  try{
+    const r = await fetch('/config',{cache:'no-store'});
+    const d = await r.json();
+    curCfg = d;
+    if (d.uiView && d.uiView !== viewMode) applyViewMode(d.uiView);
+  }catch(e){}
+}
+// 设置独立成页（/settings）：本页不再有弹层，⚙ 直接跳转；保存后回监控页会自动重新加载配置
+el('setbtn').addEventListener('click', function(){ location.href = '/settings'; });
+
+// 页面由服务自身提供，host 即真实端口（设置改端口后从新端口访问，这里自动跟随）
+el('svcaddr').textContent = location.host;
+
+setInterval(poll, 900);
+poll();
+render();
+loadConfig();
+</script>
+</body>
+</html>
