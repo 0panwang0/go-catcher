@@ -1,4 +1,4 @@
-// VideoCatch 单文件入口。
+// GoCatcher 单文件入口。
 //
 // 一个 exe 三种模式，按启动参数分发：
 //   - 无参数        → GUI 客户端（internal/app 外壳 + 进程内 core.Engine 服务）
@@ -16,8 +16,8 @@ import (
 	"os/signal"
 	"syscall"
 
-	"video_catch/internal/app"
-	"video_catch/internal/core"
+	"github.com/0panwang0/go-catcher/internal/app"
+	"github.com/0panwang0/go-catcher/internal/core"
 )
 
 func main() {

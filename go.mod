@@ -1,4 +1,4 @@
-module video_catch
+module github.com/0panwang0/go-catcher
 
 go 1.24
 

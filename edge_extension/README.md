@@ -2,7 +2,7 @@
 
 把之前的 Go 版 m3u8 下载器做成了 Edge（Chromium）扩展。扩展的请求走浏览器自身的网络栈，TLS 指纹天然真实，**不再需要 uTLS 伪装**；代理直接跟随 Edge 的系统代理设置（Clash 开系统代理即可生效）。
 
-**2026-09-05 更新**：项目合并为 **单可执行文件 `video_catch.exe`**（一个 exe 三种模式：GUI 客户端 / `--server` 无头服务 / `--url=` 命令行直下），彻底告别"复制命令到终端"的繁琐步骤：
+**2026-09-05 更新**：项目合并为 **单可执行文件 `go-catcher.exe`**（一个 exe 三种模式：GUI 客户端 / `--server` 无头服务 / `--url=` 命令行直下），彻底告别"复制命令到终端"的繁琐步骤：
 - 视频悬停按钮 → 弹出确认面板（展示链接供核验）
 - 确认 → 浏览器原生 **Save As 对话框**让用户选保存位置
 - 选好位置 → 自动调用本地下载服务下载到指定路径，全程无需终端
@@ -18,16 +18,16 @@
 
 第一次使用前需要启动本地服务，让浏览器能"一键下载"：
 
-1. 双击 `D:\projects\go_practice\workspace\video_catch\video_catch.exe`（VideoCatch 客户端）
+1. 双击 `D:\projects\go_practice\workspace\go-catcher\go-catcher.exe`（GoCatcher 客户端）
 2. 客户端打开后会**自动启动下载服务**（托盘常驻，关窗口只是缩到托盘，下载继续）
 3. 之后所有视频下载都自动通过这个服务完成，无需再手动开终端
 
 > **日常保持**：客户端可一直挂在托盘跑着，开机后再次双击即可。
 > 想停止服务：托盘右键菜单"启动/停止服务"，或退出客户端。
-> 只想要服务不要界面：终端里运行 `video_catch.exe --server`（无头模式）。
+> 只想要服务不要界面：终端里运行 `go-catcher.exe --server`（无头模式）。
 > Clash 必须开着（系统代理模式），下载服务走的是 `http://127.0.0.1:7890`。
 
-服务没启动也能用——扩展会检测到并提示"请先打开 video_catch.exe"，并仍提供"复制命令到终端"兜底。
+服务没启动也能用——扩展会检测到并提示"请先打开 go-catcher.exe"，并仍提供"复制命令到终端"兜底。
 
 ## 使用流程
 
@@ -39,7 +39,7 @@
    - 点 **确认下载** → 浏览器弹出原生 **Save As 对话框**
 4. 在 Save As 对话框选好保存位置（如 `D:\Downloads\视频名_1080P.mp4`）→ 点保存
 5. 浏览器自动从本地 Go 服务拉取视频数据，下载完成后 Chrome 右下角有提示
-6. 下载进度实时显示在 VideoCatch 客户端的任务列表里（或浏览器打开 `http://127.0.0.1:7891/`）
+6. 下载进度实时显示在 GoCatcher 客户端的任务列表里（或浏览器打开 `http://127.0.0.1:7891/`）
 
 > 若该视频是 master playlist（多档位），会先弹出该视频的画质选择面板，选完画质后再进入确认面板。
 
@@ -69,7 +69,7 @@ Go 下载器按以下顺序查找 ffmpeg：`--ffmpeg` 参数指定 → PATH → 
 如果不想启动服务、或服务异常，仍可用旧流程——错误面板会显示完整命令：
 
 ```cmd
-chcp 65001 ; "D:\projects\go_practice\workspace\video_catch\video_catch.exe" --url="..." --referer="..." -o "视频名_1080P.mp4"
+chcp 65001 ; "D:\projects\go_practice\workspace\go-catcher\go-catcher.exe" --url="..." --referer="..." -o "视频名_1080P.mp4"
 ```
 
 粘贴到 PowerShell / Git Bash / cmd 即可（用 `;` 分隔，三终端通用）。
@@ -78,7 +78,7 @@ chcp 65001 ; "D:\projects\go_practice\workspace\video_catch\video_catch.exe" --u
 > PowerShell 5.1 不支持 `&&` 作语句分隔符。
 > exe 路径必须加双引号，否则 Git Bash 会把参数按空白切片。
 
-Go 二进制（`video_catch.exe`）已经预设好：
+Go 二进制（`go-catcher.exe`）已经预设好：
 - uTLS 伪造 Chrome TLS 指纹（解决 JA3 检测）
 - 走 Clash 代理 127.0.0.1:7890
 - 10 并发 + 3 次重试 + 自动合并为 `.mp4`

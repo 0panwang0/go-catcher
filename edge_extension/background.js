@@ -571,7 +571,7 @@ async function downloadViaServer({ m3u8Url, referer, title, filename } = {}) {
   if (!healthy) {
     return {
       ok: false,
-      error: "本地下载服务未启动。请打开 video_catch.exe（VideoCatch 客户端，打开即自动启动下载服务），然后重试。",
+      error: "本地下载服务未启动。请打开 go-catcher.exe（GoCatcher 客户端，打开即自动启动下载服务），然后重试。",
       code: "SERVER_DOWN",
     };
   }

@@ -12,7 +12,7 @@ import "fmt"
 
 func shellHTML() string {
 	return fmt.Sprintf(`<!DOCTYPE html><html lang="zh-CN"><head><meta charset="UTF-8">
-<title>VideoCatch 客户端</title>
+<title>GoCatcher 客户端</title>
 <style>
 :root{
   --bg:#0b1220;--line:#1e293b;--txt:#e2e8f0;--muted:#94a3b8;

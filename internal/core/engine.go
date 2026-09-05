@@ -54,7 +54,7 @@ func (e *Engine) Start() error {
 
 	active, limit := limiter.current()
 	fmt.Println("========================================")
-	fmt.Println("  VideoCatch 本地下载服务")
+	fmt.Println("  GoCatcher 本地下载服务")
 	fmt.Printf("  监听地址: http://%s:%d\n", bindAddr, e.port)
 	fmt.Printf("  最大并发下载: %d / %d 运行\n", active, limit)
 	fmt.Println("========================================")

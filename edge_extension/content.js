@@ -594,7 +594,7 @@
       const serverDownBanner = code === "SERVER_DOWN"
         ? `<div style="background:#fef3c7;border-left:3px solid #f59e0b;padding:10px 14px;border-radius:4px;margin-bottom:14px;font-size:13px;color:#78350f;line-height:1.5;">
              <div style="font-weight:600;margin-bottom:4px;">⚠ 本地下载服务未启动</div>
-             解决办法：打开 <code style="background:#fff;padding:1px 5px;border-radius:2px;font-family:Menlo,Consolas,monospace;">D:\\projects\\go_practice\\workspace\\video_catch\\video_catch.exe</code>（VideoCatch 客户端，打开即自动启动下载服务），之后视频下载就都是一键完成。
+             解决办法：打开 <code style="background:#fff;padding:1px 5px;border-radius:2px;font-family:Menlo,Consolas,monospace;">D:\\projects\\go_practice\\workspace\\go-catcher\\go-catcher.exe</code>（GoCatcher 客户端，打开即自动启动下载服务），之后视频下载就都是一键完成。
            </div>`
         : "";
 
@@ -812,7 +812,7 @@
 
         <div style="margin-top:14px;padding:10px 12px;background:#f0f9ff;border-radius:5px;font-size:12px;color:#0c4a6e;line-height:1.5;">
           💡 点击"确认下载"后会弹出 Windows"选择文件夹"框，选好后由本地 Go 程序直接下载并保存到该文件夹。<br>
-          <span style="color:#0369a1;">首次使用需先打开一次 <code style="background:#fff;padding:1px 4px;border-radius:2px;">video_catch.exe</code>（VideoCatch 客户端，打开即自动启动下载服务）。</span>
+          <span style="color:#0369a1;">首次使用需先打开一次 <code style="background:#fff;padding:1px 4px;border-radius:2px;">go-catcher.exe</code>（GoCatcher 客户端，打开即自动启动下载服务）。</span>
         </div>
       </div>`
     );
@@ -1030,7 +1030,7 @@
   // 路径加双引号：bash 下不加引号会把位置参数按空白切片
   function buildGoCommand(m3u8Url, pageUrl, title) {
     // 直接调用单文件 exe（三种模式之一：--url= 直下，无需先起服务）
-    const goArgs = ['"D:\\projects\\go_practice\\workspace\\video_catch\\video_catch.exe"'];
+    const goArgs = ['"D:\\projects\\go_practice\\workspace\\go-catcher\\go-catcher.exe"'];
     if (m3u8Url) goArgs.push(`--url="${m3u8Url}"`);
     if (pageUrl) goArgs.push(`--referer="${pageUrl}"`);
 

@@ -45,7 +45,7 @@ func ParseCLI(args []string) CLIOptions {
 		Concurrency: concurrency,
 		Port:        DefaultPort,
 	}
-	fs := flag.NewFlagSet("video_catch", flag.ExitOnError)
+	fs := flag.NewFlagSet("go-catcher", flag.ExitOnError)
 	fs.StringVar(&o.URL, "url", o.URL, "m3u8 URL (必填)")
 	fs.StringVar(&o.Referer, "referer", "", "Referer（来源页 URL，部分站点必填）")
 	fs.StringVar(&o.Proxy, "proxy", o.Proxy, "Proxy address（空/direct/none = 直连）")
@@ -62,8 +62,8 @@ func ParseCLI(args []string) CLIOptions {
 
 // PrintUsage 打印 CLI 用法（无参数 GUI 启动的说明一并给出）。
 func PrintUsage() {
-	fmt.Println("用法: video_catch.exe --url=<m3u8地址> [--referer=<来源页>] [--proxy=<代理>] [-c 并发数] [-o 输出文件]")
-	fmt.Println("示例: video_catch.exe --url=https://cdn.example.com/xxx/1080p/video.m3u8 --referer=https://example.com/watch/123 -o \"视频名.mp4\"")
+	fmt.Println("用法: go-catcher.exe --url=<m3u8地址> [--referer=<来源页>] [--proxy=<代理>] [-c 并发数] [-o 输出文件]")
+	fmt.Println("示例: go-catcher.exe --url=https://cdn.example.com/xxx/1080p/video.m3u8 --referer=https://example.com/watch/123 -o \"视频名.mp4\"")
 	fmt.Println("可选: --no-remux 跳过封装 | --ffmpeg=<路径> 指定 ffmpeg | --limit=N 只下前 N 片试片")
 	fmt.Println("其它: --server [--port=7891] 无头服务模式 | 不带任何参数启动 GUI 客户端")
 }

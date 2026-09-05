@@ -1,4 +1,4 @@
-// VideoCatch 桌面客户端的"系统深色标题栏 + 自绘工具条 + 系统托盘 + 关窗缩托盘"实现。
+// GoCatcher 桌面客户端的"系统深色标题栏 + 自绘工具条 + 系统托盘 + 关窗缩托盘"实现。
 //
 // 关键设计：不去掉 WS_CAPTION。系统标题栏让 Windows 自己画（用 DWM 强制深色 + 自定义背景色），
 // 窗口控件（最小化/最大化/关闭）是系统原生的，跟 Clash for Windows / VS Code 等桌面应用
@@ -23,7 +23,7 @@ import (
 	"github.com/jchv/go-webview2"
 	"golang.org/x/sys/windows"
 
-	"video_catch/internal/core"
+	"github.com/0panwang0/go-catcher/internal/core"
 )
 
 // Win32 常量
@@ -100,7 +100,7 @@ func subclassWndProc(hwnd, msg, wp, lp uintptr) uintptr {
 			return 0
 		}
 		procShowWindow.Call(hwnd, swHide)
-		systray.SetTooltip("VideoCatch 下载客户端（已最小化到托盘 · 点此恢复）")
+		systray.SetTooltip("GoCatcher 下载客户端（已最小化到托盘 · 点此恢复）")
 		return 0
 	}
 	r, _, _ := procCallWindowProc.Call(origWndProc, hwnd, msg, wp, lp)
@@ -134,7 +134,7 @@ func showMainWindow() {
 	}
 	procShowWindow.Call(mainHwnd, swShow)
 	procSetForeground.Call(mainHwnd)
-	systray.SetTooltip("VideoCatch 下载客户端")
+	systray.SetTooltip("GoCatcher 下载客户端")
 }
 
 // ============================================================
@@ -183,9 +183,9 @@ func realQuit() {
 func initTray(w webview2.WebView, eng *core.Engine) {
 	systray.Register(func() {
 		systray.SetIcon(iconPNG)
-		systray.SetTooltip("VideoCatch 下载客户端")
+		systray.SetTooltip("GoCatcher 下载客户端")
 
-		mShow := systray.AddMenuItem("📺 显示主窗口", "恢复 VideoCatch 主窗口")
+		mShow := systray.AddMenuItem("📺 显示主窗口", "恢复 GoCatcher 主窗口")
 		systray.AddSeparator()
 		mToggle := systray.AddMenuItem("⏯ 启动 / 停止服务", "按当前状态切换下载服务")
 		systray.AddSeparator()
@@ -201,11 +201,11 @@ func initTray(w webview2.WebView, eng *core.Engine) {
 				case <-mToggle.ClickedCh:
 					if eng.Running() {
 						eng.Stop()
-						systray.SetTooltip("VideoCatch 下载客户端 · 服务已停止")
+						systray.SetTooltip("GoCatcher 下载客户端 · 服务已停止")
 					} else if err := eng.Start(); err != nil {
-						systray.SetTooltip(fmt.Sprintf("VideoCatch: 启动失败 %v", err))
+						systray.SetTooltip(fmt.Sprintf("GoCatcher: 启动失败 %v", err))
 					} else {
-						systray.SetTooltip("VideoCatch 下载客户端 · 服务运行中")
+						systray.SetTooltip("GoCatcher 下载客户端 · 服务运行中")
 					}
 				case <-mBrowse.ClickedCh:
 					_ = openBrowser()

@@ -1,4 +1,4 @@
-// VideoCatch 桌面客户端（GUI 外壳）。
+// GoCatcher 桌面客户端（GUI 外壳）。
 //
 // 单进程架构：下载服务不再是独立进程，由本进程内的 core.Engine 承载。
 //   - 主窗 = iframe 内嵌 7891 监控页（任务列表/暂停/继续/设置）铺满窗口，无工具条——
@@ -17,7 +17,7 @@ import (
 	"github.com/jchv/go-webview2"
 	"golang.org/x/sys/windows"
 
-	"video_catch/internal/core"
+	"github.com/0panwang0/go-catcher/internal/core"
 )
 
 // monitorURL 监控页地址（与 core.DefaultPort 对应；外壳 HTML 内的硬编码同源）。
@@ -54,7 +54,7 @@ func Run() {
 		},
 	})
 	if w == nil {
-		title, _ := windows.UTF16PtrFromString("VideoCatch")
+		title, _ := windows.UTF16PtrFromString("GoCatcher")
 		text, _ := windows.UTF16PtrFromString("无法创建窗口（需要 Edge/WebView2 运行时）")
 		windows.MessageBox(0, text, title, windows.MB_ICONERROR)
 		os.Exit(1)

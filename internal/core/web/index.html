@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>VideoCatch 下载监控</title>
+<title>GoCatcher 下载监控</title>
 <style>
   :root{--bg:#0f172a;--card:#1e293b;--line:#334155;--txt:#e2e8f0;--muted:#94a3b8;--ok:#22c55e;--run:#3b82f6;--err:#ef4444;--warn:#f59e0b;}
   *{box-sizing:border-box;margin:0;padding:0}
@@ -117,7 +117,7 @@
 </head>
 <body>
 <div class="wrap">
-  <div class="hd"><span class="dot" id="dot"></span><h1>VideoCatch 下载监控</h1></div>
+  <div class="hd"><span class="dot" id="dot"></span><h1>GoCatcher 下载监控</h1></div>
   <div class="sub">本地服务 127.0.0.1:7891 · 边下边写无合并 · 支持暂停续传</div>
 
   <div class="stats" id="stats"></div>
@@ -171,7 +171,7 @@ async function poll() {
       render();
     }
   } catch(e) {
-    setErr('无法连接本地服务，请确认 video_catch.exe 已启动');
+    setErr('无法连接本地服务，请确认 go-catcher.exe 已启动');
   }
 }
 function el(id){return document.getElementById(id)}

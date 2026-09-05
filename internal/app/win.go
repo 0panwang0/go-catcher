@@ -11,7 +11,7 @@ import (
 )
 
 // 主窗口标题（webview2 创建窗口与 FindWindow 唤起共用）
-const mainWindowTitle = "VideoCatch 下载客户端"
+const mainWindowTitle = "GoCatcher 下载客户端"
 
 func hiddenProcAttr() *syscall.SysProcAttr {
 	return &syscall.SysProcAttr{
@@ -42,7 +42,7 @@ var instanceMutex windows.Handle
 func acquireSingleInstance() bool {
 	kernel32 := windows.NewLazySystemDLL("kernel32.dll")
 	createMutex := kernel32.NewProc("CreateMutexW")
-	name, _ := windows.UTF16PtrFromString("VideoCatch_SingleInstance")
+	name, _ := windows.UTF16PtrFromString("GoCatcher_SingleInstance")
 	r1, _, e1 := createMutex.Call(0, 0, uintptr(unsafe.Pointer(name)))
 	if r1 == 0 {
 		return true // 创建失败不阻止启动（比拒绝运行体验好）
