@@ -1,0 +1,25 @@
+# 编译产物（发布到 GitHub Releases，不进仓库）
+*.exe
+*.exe~
+
+# 用户运行时数据（含任务历史、文件路径，不上传）
+videocatch_config.json
+videocatch_state.json
+client_run.log
+
+# Go 构建缓存
+*.test
+*.out
+*.test.exe
+*.test.log
+
+# IDE / 编辑器
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# 系统
+.DS_Store
+Thumbs.db
