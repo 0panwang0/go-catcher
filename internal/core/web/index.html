@@ -118,7 +118,7 @@
 <body>
 <div class="wrap">
   <div class="hd"><span class="dot" id="dot"></span><h1>GoCatcher 下载监控</h1></div>
-  <div class="sub">本地服务 127.0.0.1:7891 · 边下边写无合并 · 支持暂停续传</div>
+  <div class="sub">本地服务 <span id="svcaddr">127.0.0.1:…</span> · 边下边写无合并 · 支持暂停续传</div>
 
   <div class="stats" id="stats"></div>
   <div id="list"></div>
@@ -144,6 +144,11 @@
       <label><b>分片失败重试</b><span>0 – 10</span></label>
       <input id="f_retry" type="number" min="0" max="10" value="3">
     </div>
+    <div class="field">
+      <label><b>服务端口</b><span>1 – 65535</span></label>
+      <input id="f_port" type="number" min="1" max="65535" value="7891">
+      <div class="desc" style="margin-bottom:0">改动端口需重启服务生效：托盘右键「启动 / 停止服务」切换一次，或重启客户端。浏览器扩展需同步改为新端口。</div>
+    </div>
     <div class="mrow">
       <button class="ghost" onclick="closeSettings()">取消</button>
       <button onclick="saveSettings()">保存</button>
@@ -156,7 +161,7 @@
 var tasks = [];
 var lastAction = 0;   // 操作后短暂停止重建 DOM，避免按钮被刷新打断
 var lastSig = '';
-var curCfg = {maxConcurrent:3, segConcurrency:10, maxRetries:3}; // 当前服务端配置
+var curCfg = {maxConcurrent:3, segConcurrency:10, maxRetries:3, port:7891}; // 当前服务端配置
 
 async function poll() {
   try {
@@ -368,27 +373,30 @@ function openSettings(){
   el('f_maxc').value = curCfg.maxConcurrent;
   el('f_segc').value = curCfg.segConcurrency;
   el('f_retry').value = curCfg.maxRetries;
+  el('f_port').value = curCfg.port;
   el('modal').className = 'show';
 }
 function closeSettings(){ el('modal').className = ''; }
 // 点击遮罩空白处关闭
 el('modal').addEventListener('click', function(e){ if(e.target===this) closeSettings(); });
+function cfgText(d){ return '并发任务 '+d.maxConcurrent+' · 分片并发 '+d.segConcurrency+' · 重试 '+d.maxRetries+' · 端口 '+d.port; }
 async function loadConfig(){
   try{
     const r = await fetch('/config',{cache:'no-store'});
     const d = await r.json();
     curCfg = d;
-    el('cfgcur').textContent = '并发任务 '+d.maxConcurrent+' · 分片并发 '+d.segConcurrency+' · 重试 '+d.maxRetries;
+    el('cfgcur').textContent = cfgText(d);
   }catch(e){ el('cfgcur').textContent = '无法读取服务端配置'; }
 }
 async function saveSettings(){
   const v = {
     maxConcurrent:  parseInt(el('f_maxc').value, 10),
     segConcurrency: parseInt(el('f_segc').value, 10),
-    maxRetries:     parseInt(el('f_retry').value, 10)
+    maxRetries:     parseInt(el('f_retry').value, 10),
+    port:           parseInt(el('f_port').value, 10)
   };
-  if(isNaN(v.maxConcurrent)||isNaN(v.segConcurrency)||isNaN(v.maxRetries)){
-    toast('请填写有效的数字', true); return;
+  if(isNaN(v.maxConcurrent)||isNaN(v.segConcurrency)||isNaN(v.maxRetries)||isNaN(v.port)||v.port<1||v.port>65535){
+    toast('请填写有效的数字（端口 1 – 65535）', true); return;
   }
   try{
     const r = await fetch('/config',{method:'POST',headers:{'Content-Type':'application/json'},
@@ -396,13 +404,20 @@ async function saveSettings(){
     if(!r.ok){ const t=await r.json().catch(()=>({})); throw new Error(t.error||('HTTP '+r.status)); }
     const d = await r.json();
     curCfg = d;
-    el('cfgcur').textContent = '并发任务 '+d.maxConcurrent+' · 分片并发 '+d.segConcurrency+' · 重试 '+d.maxRetries;
+    el('cfgcur').textContent = cfgText(d);
     closeSettings();
-    toast('设置已保存并生效', false);
+    if(d.restartRequired){
+      toast('已保存。新端口 '+d.port+' 需重启服务生效：托盘右键「启动 / 停止服务」切换一次', false);
+    }else{
+      toast('设置已保存并生效', false);
+    }
     lastSig=''; render();  // 排队文案里的数字刷新
   }catch(e){ toast('保存失败：'+e.message, true); }
 }
 el('setbtn').addEventListener('click', openSettings);
+
+// 页面由服务自身提供，host 即真实端口（设置改端口后从新端口访问，这里自动跟随）
+el('svcaddr').textContent = location.host;
 
 setInterval(poll, 900);
 poll();

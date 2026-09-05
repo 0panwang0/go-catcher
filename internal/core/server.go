@@ -22,7 +22,7 @@ func newMux(e *Engine) *http.ServeMux {
 	mux.HandleFunc("/remove", handleRemove)
 	mux.HandleFunc("/openfolder", handleOpenFolder)
 	mux.HandleFunc("/openfile", handleOpenFile)
-	mux.HandleFunc("/config", handleConfig)
+	mux.HandleFunc("/config", func(w http.ResponseWriter, r *http.Request) { handleConfig(w, r, e) })
 	mux.HandleFunc("/", handleHomePage) // 下载监控页
 	registerSvcRoutes(mux, e)           // /svc/stop（工具条"停止服务"按钮 / 扩展兜底）
 	return mux
@@ -45,7 +45,7 @@ func handleDownload(w http.ResponseWriter, r *http.Request) {
 	filename := strings.TrimSpace(q.Get("filename"))
 	mode := strings.ToLower(q.Get("mode"))
 	if filename == "" {
-		filename = "video.mp4"
+		filename = "video.ts"
 	}
 	if m3u8URL == "" {
 		http.Error(w, "missing required query param: m3u8", http.StatusBadRequest)
@@ -70,9 +70,9 @@ func handleDownload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	fname := sanitizeFilename(filename)
-	if !strings.HasSuffix(strings.ToLower(fname), ".mp4") &&
-		!strings.HasSuffix(strings.ToLower(fname), ".ts") {
-		fname += ".mp4"
+	// 不强改扩展名：调用方给什么就用什么；完全没扩展名的（TS 原始流）补 .ts
+	if filepath.Ext(fname) == "" {
+		fname += ".ts"
 	}
 
 	id := newTaskID()

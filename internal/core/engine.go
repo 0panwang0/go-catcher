@@ -17,18 +17,17 @@ const DefaultPort = 7891
 
 type Engine struct {
 	mu       sync.Mutex
-	port     int
+	override int           // --port 命令行覆盖；0 = 跟随 gocatcher_config.json
+	port     int           // 本次实际监听的端口（供 Port() 与日志使用）
 	running  bool
 	srv      *http.Server
 	done     chan struct{} // Start 时创建，Stop 时关闭；无头模式据此退出
 	initOnce sync.Once
 }
 
+// NewEngine 创建引擎。port 为命令行覆盖值（--port），0 表示跟随配置文件。
 func NewEngine(port int) *Engine {
-	if port <= 0 {
-		port = DefaultPort
-	}
-	return &Engine{port: port}
+	return &Engine{override: port}
 }
 
 // Start 启动 HTTP 服务（幂等：已在运行直接返回 nil）。
@@ -43,10 +42,16 @@ func (e *Engine) Start() error {
 		initRuntimeConfig()
 		loadState()
 	})
-	ln, err := net.Listen("tcp", fmt.Sprintf("%s:%d", bindAddr, e.port))
-	if err != nil {
-		return fmt.Errorf("监听 %s:%d 失败（端口被占用？）: %w", bindAddr, e.port, err)
+	// 端口解析：--port 覆盖 > 配置文件；端口只在本方法和 Port() 里读，改动即时生效于下次 Start
+	port := e.override
+	if port <= 0 {
+		port = ConfiguredPort()
 	}
+	ln, err := net.Listen("tcp", fmt.Sprintf("%s:%d", bindAddr, port))
+	if err != nil {
+		return fmt.Errorf("监听 %s:%d 失败（端口被占用？）: %w", bindAddr, port, err)
+	}
+	e.port = port
 	e.srv = &http.Server{Handler: newMux(e)}
 	e.done = make(chan struct{})
 	e.running = true
@@ -55,7 +60,7 @@ func (e *Engine) Start() error {
 	active, limit := limiter.current()
 	fmt.Println("========================================")
 	fmt.Println("  GoCatcher 本地下载服务")
-	fmt.Printf("  监听地址: http://%s:%d\n", bindAddr, e.port)
+	fmt.Printf("  监听地址: http://%s:%d\n", bindAddr, port)
 	fmt.Printf("  最大并发下载: %d / %d 运行\n", active, limit)
 	fmt.Println("========================================")
 	return nil
@@ -91,6 +96,21 @@ func (e *Engine) Running() bool {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	return e.running
+}
+
+// Port 返回服务当前监听的端口；未运行时返回下次 Start 将使用的端口
+// （--port 覆盖优先）。GUI 外壳据此更新 iframe 地址，端口改动重启服务后自动跟上。
+func (e *Engine) Port() int {
+	e.mu.Lock()
+	running, port, override := e.running, e.port, e.override
+	e.mu.Unlock()
+	if running {
+		return port
+	}
+	if override > 0 {
+		return override
+	}
+	return ConfiguredPort()
 }
 
 // Done 在服务停止后可读（无头模式 select 它决定进程退出）。未 Start 过时为 nil。

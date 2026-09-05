@@ -7,10 +7,11 @@
 ## 功能特性
 
 - **单文件三模式**：GUI 客户端 / 无头服务 / 命令行直下，一个 exe 全搞定
-- **m3u8/HLS 流媒体**：自动解析 master playlist、多码率选择、边下边写（无需合并）
+- **m3u8/HLS 流媒体**：自动解析 master playlist、多码率选择、边下边写（无需合并），原始 TS 流直接落盘
 - **断点续传**：任务状态持久化到本地，服务重启后自动恢复未完成任务
 - **并发与重试**：分片并发下载、失败自动重试、`--limit` 试片模式
 - **代理支持**：`--proxy` 指定 HTTP/SOCKS5 代理
+- **端口可配置**：监控页设置里可改服务端口（解决端口冲突），重启服务生效
 - **Edge 浏览器扩展**：网页内一键发起下载，自动回填页面 URL 作为 Referer
 - **本地优先**：服务只监听 `127.0.0.1`，监控页与 API 不对外暴露
 
@@ -25,13 +26,13 @@
 | 模式 | 启动方式 | 说明 |
 |---|---|---|
 | GUI 客户端 | 双击 `go-catcher.exe` | 打开即自动启动服务，托盘右键可停止/重启服务、退出 |
-| 无头服务 | `go-catcher.exe --server [--port=7891]` | 只有下载服务，无界面；访问 `http://127.0.0.1:7891/` 管理任务 |
+| 无头服务 | `go-catcher.exe --server [--port=端口]` | 只有下载服务，无界面；用浏览器访问监控页管理任务 |
 | 命令行直下 | `go-catcher.exe --url=<地址> [选项]` | 单任务直接下载，不依赖服务，适合脚本调用 |
 
 ### CLI 直下示例
 
 ```powershell
-go-catcher.exe --url="https://cdn.example.com/video/1080p/video.m3u8" --referer="https://example.com/watch/123" -o "视频名.mp4"
+go-catcher.exe --url="https://cdn.example.com/video/1080p/video.m3u8" --referer="https://example.com/watch/123" -o "视频名.ts"
 ```
 
 ## 命令行参数
@@ -42,11 +43,10 @@ go-catcher.exe --url="https://cdn.example.com/video/1080p/video.m3u8" --referer=
 | `--referer` | 来源页 URL，部分站点必填 |
 | `--proxy` | 代理地址，如 `http://127.0.0.1:7890`（空/direct/none = 直连） |
 | `-c` | 分片并发数，默认 10 |
-| `-o` | 输出文件名，不指定则按标题自动命名 |
+| `-o` | 输出文件名（默认 output.ts；HLS 原始流直接落盘，不做封装转换） |
 | `--limit` | 只下载前 N 个分片（0 = 全部，用于试片） |
-| `--ffmpeg` | 指定 ffmpeg 路径（不指定则自动查找） |
 | `--server` | 无头服务模式 |
-| `--port` | 服务监听端口，默认 7891 |
+| `--port` | 服务监听端口（仅 `--server` 时有效；不指定则用监控页设置里配置的端口） |
 
 ## Edge 浏览器扩展
 

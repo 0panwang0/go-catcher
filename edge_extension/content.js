@@ -402,7 +402,7 @@
     const parts = await downloadSegments(segments, log, playlistURL, pageUrl, title);
     log("分片下载完成，正在合并…");
     const blob = new Blob(parts, { type: "video/mp2t" });
-    const filename = makeFilename(playlistURL, title, quality, ".mp4");
+    const filename = makeFilename(playlistURL, title, quality, ".ts");
     saveBlob(blob, filename);
     log(`已保存: ${filename}`);
     setTimeout(closePanel, 1200);
@@ -663,7 +663,7 @@
       );
     } else if (state === "initiated") {
       // Go server 正在把视频直接落盘到所选目录
-      const fn = (payload && payload.filename) || "video.mp4";
+      const fn = (payload && payload.filename) || "video.ts";
       const dir = (payload && payload.dir) || "";
       panel.innerHTML = panelShell(
         "下载该视频",
@@ -682,7 +682,7 @@
         </div>`
       );
     } else if (state === "completed") {
-      const fn = (payload && payload.filename) || "video.mp4";
+      const fn = (payload && payload.filename) || "video.ts";
       panel.innerHTML = panelShell(
         "下载该视频",
         `<div style="padding:32px 28px;text-align:center;">
@@ -777,7 +777,7 @@
     const url = source.url || "";
     const title = source.title || document.title || "";
     const quality = source.quality || "";
-    const filename = buildOutputName(url, title) || "video.mp4";
+    const filename = buildOutputName(url, title) || "video.ts";
 
     panel.innerHTML = panelShell(
       "下载该视频",
@@ -1044,7 +1044,7 @@
     ].join(" ; ");
   }
 
-  // 拼输出文件名：<标题>_<画质>.mp4
+  // 拼输出文件名：<标题>_<画质>.ts
   // 画质从 m3u8 URL 里推断（.../1080p/video.m3u8 或 xxx_720p.m3u8）
   function buildOutputName(m3u8Url, title) {
     let name = String(title || "").trim();
@@ -1085,9 +1085,9 @@
       .slice(0, 80);
     if (!name) return "";
 
-    // 画质后缀（输出 mp4：Go 侧检测到 ffmpeg 会做无损重封装，没装也能播）
+    // 画质后缀（输出 .ts：HLS 原始流直接落盘，Go 侧不做封装，PotPlayer/VLC 可播）
     const q = qualityFromUrl(m3u8Url);
-    return name + (q ? `_${q}` : "") + ".mp4";
+    return name + (q ? `_${q}` : "") + ".ts";
   }
 
   // 从 URL 里抠画质档位：优先路径里的 /1080p/，其次 xxx_720p.m3u8

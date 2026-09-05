@@ -37,39 +37,30 @@
    - 显示视频名称、画质、资源链接（可复制核验）
    - 显示建议的保存文件名
    - 点 **确认下载** → 浏览器弹出原生 **Save As 对话框**
-4. 在 Save As 对话框选好保存位置（如 `D:\Downloads\视频名_1080P.mp4`）→ 点保存
+4. 在 Save As 对话框选好保存位置（如 `D:\Downloads\视频名_1080P.ts`）→ 点保存
 5. 浏览器自动从本地 Go 服务拉取视频数据，下载完成后 Chrome 右下角有提示
 6. 下载进度实时显示在 GoCatcher 客户端的任务列表里（或浏览器打开 `http://127.0.0.1:7891/`）
 
 > 若该视频是 master playlist（多档位），会先弹出该视频的画质选择面板，选完画质后再进入确认面板。
 
-## 输出格式说明（MP4）
+## 输出格式说明（TS）
 
-合并后的 HLS 流保存为 `.mp4`。这里分两种情况：
+HLS 分片按序拼接的原始流直接保存为 `.ts`（MPEG-TS），**不做任何封装转换、不依赖 ffmpeg**：
 
-- **未安装 ffmpeg（默认）**：文件是 MPEG-TS 流套 `.mp4` 扩展名。
-  PotPlayer / VLC 靠内容嗅探能正常播放；但剪辑软件、手机相册、Windows 自带播放器可能不识别。
-- **已安装 ffmpeg**：Go 下载器会自动调用它做一次 **`-c copy` 无损重封装**（不重新编码，秒级完成），
-  产出标准 MP4 容器，兼容性最好。封装失败会自动回退，不会中断交付。
-
-Go 下载器按以下顺序查找 ffmpeg：`--ffmpeg` 参数指定 → PATH → 常见安装位置
-（WinGet Links / scoop / chocolatey / `C:\ffmpeg\bin` / `D:\ffmpeg\bin`）。
+- PotPlayer / VLC 靠内容嗅探可正常播放
+- 需要标准 MP4 容器时，自行用 ffmpeg 转封装：`ffmpeg -i 视频.ts -c copy -movflags +faststart 视频.mp4`（秒级完成，不重新编码）
 
 相关参数：
-- `-o <文件名>`：输出路径，默认 `output.mp4`；不带扩展名时自动补 `.mp4`；显式写 `.ts` 则输出 `.ts`
-- `--no-remux`：跳过 ffmpeg 封装，TS 流直接写入输出文件
-- `--ffmpeg=<路径>`：手动指定 ffmpeg
+- `-o <文件名>`：输出路径，默认 `output.ts`；不带扩展名时自动补 `.ts`；显式写其它扩展名则原样使用
 - `-limit N`：只下载前 N 个分片（试片/调试用）
-- `--server`：以无头 HTTP 服务模式运行（不带界面，仅服务；GUI 客户端打开时无需此参数）
-
-> 重封装期间需要临时双份磁盘空间（3GB 视频会短暂占用约 6GB）。
+- `--server [--port=端口]`：以无头 HTTP 服务模式运行（不带界面，仅服务；GUI 客户端打开时无需此参数）
 
 ## 兜底：手动下载（命令）
 
 如果不想启动服务、或服务异常，仍可用旧流程——错误面板会显示完整命令：
 
 ```cmd
-chcp 65001 ; "D:\projects\go_practice\workspace\go-catcher\go-catcher.exe" --url="..." --referer="..." -o "视频名_1080P.mp4"
+chcp 65001 ; "D:\projects\go_practice\workspace\go-catcher\go-catcher.exe" --url="..." --referer="..." -o "视频名_1080P.ts"
 ```
 
 粘贴到 PowerShell / Git Bash / cmd 即可（用 `;` 分隔，三终端通用）。
@@ -81,7 +72,7 @@ chcp 65001 ; "D:\projects\go_practice\workspace\go-catcher\go-catcher.exe" --url
 Go 二进制（`go-catcher.exe`）已经预设好：
 - uTLS 伪造 Chrome TLS 指纹（解决 JA3 检测）
 - 走 Clash 代理 127.0.0.1:7890
-- 10 并发 + 3 次重试 + 自动合并为 `.mp4`
+- 10 并发 + 3 次重试 + 自动合并为 `.ts`
 - 已端到端验证可下载 2.7GB 1080p 视频（约 1 分钟）
 
 ## 代理说明（重要）
@@ -110,7 +101,7 @@ Go 二进制（`go-catcher.exe`）已经预设好：
 | `referer` / `userAgent` 伪造 | `declarativeNetRequest` 按来源页注入 Referer；UA 即浏览器本身 |
 | 10 worker 并发 + 3 次重试 | 8 并发 + 3 次重试 |
 | master playlist 选最高码率 | 同样支持 |
-| 合并为 output.mp4 | 合并后浏览器保存为 `.mp4`，文件名自动从 URL/标题生成 |
+| 合并为 output.ts | 合并后浏览器保存为 `.ts`，文件名自动从 URL/标题生成 |
 
 ## 文件结构
 

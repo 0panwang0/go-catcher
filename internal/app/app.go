@@ -1,7 +1,7 @@
 // GoCatcher 桌面客户端（GUI 外壳）。
 //
 // 单进程架构：下载服务不再是独立进程，由本进程内的 core.Engine 承载。
-//   - 主窗 = iframe 内嵌 7891 监控页（任务列表/暂停/继续/设置）铺满窗口，无工具条——
+//   - 主窗 = iframe 内嵌本地监控页（任务列表/暂停/继续/设置）铺满窗口，无工具条——
 //     服务随程序启动自动运行、退出自动停止，窗口内不放冗余控件；
 //     服务被手动停止时外壳自动切换为居中降级提示。
 //   - 系统托盘：左键点图标直接显示主窗口，右键弹菜单（启停服务/浏览器打开/退出）。
@@ -11,6 +11,7 @@
 package app
 
 import (
+	"fmt"
 	"os"
 	"os/exec"
 
@@ -20,11 +21,13 @@ import (
 	"github.com/0panwang0/go-catcher/internal/core"
 )
 
-// monitorURL 监控页地址（与 core.DefaultPort 对应；外壳 HTML 内的硬编码同源）。
-const monitorURL = "http://127.0.0.1:7891"
+// monitorBase 监控页地址前缀（端口跟随引擎/配置，运行时动态取）。
+func monitorURL(eng *core.Engine) string {
+	return fmt.Sprintf("http://127.0.0.1:%d", eng.Port())
+}
 
-func openBrowser() error {
-	cmd := exec.Command("rundll32", "url.dll,FileProtocolHandler", monitorURL+"/")
+func openBrowser(url string) error {
+	cmd := exec.Command("rundll32", "url.dll,FileProtocolHandler", url)
 	cmd.SysProcAttr = hiddenProcAttr()
 	return cmd.Start()
 }
@@ -38,10 +41,10 @@ func Run() {
 	}
 	enablePerMonitorDPI()
 
-	eng := core.NewEngine(core.DefaultPort)
-
-	// 打开客户端即自动拉起下载服务（沿用旧双进程版行为，浏览器扩展依赖 7891 常驻）。
-	// 失败不阻断 GUI：外壳轮询显示"未运行"，用户点"启动服务"能看到具体错误。
+	// 打开客户端即自动拉起下载服务（沿用旧双进程版行为，浏览器扩展依赖本地服务常驻）。
+	// 失败不阻断 GUI：外壳轮询显示"未运行"，用户从托盘重启能看到具体错误。
+	// 端口不再固定 7891：跟随 gocatcher_config.json（可在监控页设置里改）。
+	eng := core.NewEngine(0)
 	_ = eng.Start()
 
 	w := webview2.NewWithOptions(webview2.WebViewOptions{
@@ -61,12 +64,14 @@ func Run() {
 	}
 	defer w.Destroy()
 
-	// 外壳唯一需要的绑定：服务是否在运行（决定显示 iframe 还是降级提示）。
+	// 外壳需要的两个绑定：服务是否在运行（iframe vs 降级提示）、当前端口
+	// （设置里改端口 + 托盘重启服务后，外壳据此把 iframe 切到新地址）。
 	// 启停控制都在托盘菜单；服务随程序启动自动运行、退出自动停止。
 	w.Bind("vc_running", func() bool { return eng.Running() })
+	w.Bind("vc_port", func() int { return eng.Port() })
 
-	// 加载外壳：iframe 内嵌 7891 监控页铺满窗口，无工具条。
-	// 外壳的 JS 自己轮询 vc_running 决定显示 iframe 还是降级提示，无需 Go 端切换。
+	// 加载外壳：iframe 内嵌监控页铺满窗口，无工具条。
+	// 外壳的 JS 轮询 vc_running/vc_port 自行决定 iframe 地址与降级提示，无需 Go 端切换。
 	w.SetHtml(shellHTML())
 
 	// 注册托盘 + 子类化主窗(拦 WM_CLOSE 缩托盘)

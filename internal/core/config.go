@@ -106,6 +106,7 @@ type appConfig struct {
 	MaxConcurrent  int `json:"maxConcurrent"`  // 同时下载的任务数
 	SegConcurrency int `json:"segConcurrency"` // 单个任务内分片并发数
 	MaxRetries     int `json:"maxRetries"`     // 分片/HTTP 失败重试次数
+	Port           int `json:"port"`           // 服务监听端口（改后需重启服务生效）
 }
 
 func defaultConfig() appConfig {
@@ -113,6 +114,7 @@ func defaultConfig() appConfig {
 		MaxConcurrent:  3,
 		SegConcurrency: 10,
 		MaxRetries:     3,
+		Port:           DefaultPort,
 	}
 }
 
@@ -146,6 +148,10 @@ func loadConfig() {
 			clamp(&fileC.MaxConcurrent, 1, 16)
 			clamp(&fileC.SegConcurrency, 1, 32)
 			clamp(&fileC.MaxRetries, 0, 10)
+			// 旧配置文件没有 port 字段（反序列化为 0）：回退默认而不是夹取到 1
+			if fileC.Port <= 0 || fileC.Port > 65535 {
+				fileC.Port = c.Port
+			}
 			c = fileC
 		}
 	}
@@ -189,9 +195,21 @@ func saveConfigLocked() {
 }
 
 // initRuntimeConfig 服务启动时调用：建限制器并装载持久化配置。
+// once 保护：GUI 外壳可能在 Engine.Start 之前就调 ConfiguredPort 问端口，
+// 这里保证配置只从磁盘装载一次，之后仅经 /config 端点修改。
+var configInitOnce sync.Once
+
 func initRuntimeConfig() {
-	if limiter == nil {
+	configInitOnce.Do(func() {
 		limiter = newResizableSem(cfg.MaxConcurrent)
-	}
-	loadConfig()
+		loadConfig()
+	})
+}
+
+// ConfiguredPort 返回配置文件里的服务端口（GUI 外壳在引擎启动前用它拼监控页地址）。
+func ConfiguredPort() int {
+	initRuntimeConfig()
+	cfgMu.Lock()
+	defer cfgMu.Unlock()
+	return cfg.Port
 }

@@ -304,20 +304,20 @@ func handleOpenFolder(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleConfig GET 返回当前配置，POST 更新配置（越界自动夹取后应用并落盘）。
-// 更新并发数即时生效：已经在跑的任务不受影响，新进/排队任务按新上限调度。
-
-func handleConfig(w http.ResponseWriter, r *http.Request) {
+// 并发/重试即时生效；端口只写入配置，下次服务启动（托盘重启 / 重开程序）才生效——
+// 服务正跑着时改端口，响应带 restartRequired=true 提示前端弹"需重启服务"。
+func handleConfig(w http.ResponseWriter, r *http.Request, e *Engine) {
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
-	writeCfg := func() {
+	writeCfg := func(restartRequired bool) {
 		cfgMu.Lock()
 		cur := cfg
 		cfgMu.Unlock()
-		fmt.Fprintf(w, `{"maxConcurrent":%d,"segConcurrency":%d,"maxRetries":%d}`,
-			cur.MaxConcurrent, cur.SegConcurrency, cur.MaxRetries)
+		fmt.Fprintf(w, `{"maxConcurrent":%d,"segConcurrency":%d,"maxRetries":%d,"port":%d,"restartRequired":%t}`,
+			cur.MaxConcurrent, cur.SegConcurrency, cur.MaxRetries, cur.Port, restartRequired)
 	}
 	if r.Method == http.MethodGet {
-		writeCfg()
+		writeCfg(false)
 		return
 	}
 	if r.Method != http.MethodPost {
@@ -335,11 +335,18 @@ func handleConfig(w http.ResponseWriter, r *http.Request) {
 	clamp(&in.MaxRetries, 0, 10)
 
 	cfgMu.Lock()
+	// 端口：0/缺失 = 保持现值（兼容只改并发的旧调用方），越界夹取到 1-65535
+	if in.Port == 0 {
+		in.Port = cfg.Port
+	} else {
+		clamp(&in.Port, 1, 65535)
+	}
+	portChanged := in.Port != cfg.Port
 	cfg = in
 	applyConfigLocked()
 	saveConfigLocked()
 	cfgMu.Unlock()
-	fmt.Printf("[config] 已更新: 并发任务=%d 分片并发=%d 重试=%d\n",
-		in.MaxConcurrent, in.SegConcurrency, in.MaxRetries)
-	writeCfg()
+	fmt.Printf("[config] 已更新: 并发任务=%d 分片并发=%d 重试=%d 端口=%d\n",
+		in.MaxConcurrent, in.SegConcurrency, in.MaxRetries, in.Port)
+	writeCfg(e.Running() && portChanged)
 }

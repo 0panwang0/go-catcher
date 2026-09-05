@@ -24,7 +24,7 @@ type taskState struct {
 	// 本次任务的文件元信息（任务开始即填充，失败/成功后保留）
 	m3u8URL  string // 来源 m3u8
 	referer  string // 来源页（恢复下载时需要）
-	filename string // 目标文件名（如 xxx.mp4）
+	filename string // 目标文件名（如 xxx.ts）
 	saveDir  string // 用户选的目标保存目录
 	// 分片下载进度（运行时由 dlJob 的原子计数刷新）
 	segDone  int64

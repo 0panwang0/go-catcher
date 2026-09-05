@@ -147,7 +147,7 @@ async function setRefererRules(tabId, pairs) {
     let origin = "";
     try {
       origin = new URL(referer).origin;
-    } catch {}
+    } catch { }
     if (!origin) continue;
     rules.push({
       id: id++,
@@ -272,17 +272,17 @@ async function getVideoOptions(tab) {
 
   // 排序：TS 优先，同画质按码率从高到低
   const qualityRank = (q) =>
-    ({
-      "4K": 8,
-      "2K": 7,
-      "1080P": 6,
-      "720P": 5,
-      "480P": 4,
-      "360P": 3,
-      "240P": 2,
-      "未知画质": 1,
-      "": 0,
-    }[String(q).toUpperCase()] || 0);
+  ({
+    "4K": 8,
+    "2K": 7,
+    "1080P": 6,
+    "720P": 5,
+    "480P": 4,
+    "360P": 3,
+    "240P": 2,
+    "未知画质": 1,
+    "": 0,
+  }[String(q).toUpperCase()] || 0);
 
   filtered.sort((a, b) => {
     if (a.type !== b.type) return a.type === "ts" ? -1 : 1;
@@ -500,7 +500,7 @@ function qualityFromURL(u) {
     if (m) return m[1].toUpperCase();
     const q = new URL(u).searchParams.get("quality");
     if (q) return q;
-  } catch {}
+  } catch { }
   return "";
 }
 
@@ -509,7 +509,7 @@ function qualityFromURL(u) {
 // ============================================================
 // 嗅探列表里 master 和各变体（或 ad 预热片）混在一起。
 // 按 URL 形态判断"是不是 master 候选"——变体通常带 _240p/_720p 等后缀，
-// master 则一般是 /ID.m3u8。这种启发式足够处理常见 CDN（surrit/growcdn/alibaba 等）。
+// master 则一般是 /ID.m3u8。这种启发式足够处理常见 CDN（growcdn/alibaba 等）。
 function isMasterCandidateM3U8(url) {
   try {
     const path = new URL(url).pathname;

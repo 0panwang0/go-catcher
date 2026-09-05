@@ -189,7 +189,7 @@ func initTray(w webview2.WebView, eng *core.Engine) {
 		systray.AddSeparator()
 		mToggle := systray.AddMenuItem("⏯ 启动 / 停止服务", "按当前状态切换下载服务")
 		systray.AddSeparator()
-		mBrowse := systray.AddMenuItem("↗ 在浏览器打开监控", "用默认浏览器打开 http://127.0.0.1:7891/")
+		mBrowse := systray.AddMenuItem("↗ 在浏览器打开监控", "用默认浏览器打开本地监控页")
 		systray.AddSeparator()
 		mQuit := systray.AddMenuItem("❌ 退出客户端", "退出客户端并停止下载服务")
 
@@ -208,7 +208,7 @@ func initTray(w webview2.WebView, eng *core.Engine) {
 						systray.SetTooltip("GoCatcher 下载客户端 · 服务运行中")
 					}
 				case <-mBrowse.ClickedCh:
-					_ = openBrowser()
+					_ = openBrowser(monitorURL(eng) + "/")
 				case <-mQuit.ClickedCh:
 					w.Dispatch(func() { realQuit() })
 					return

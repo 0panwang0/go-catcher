@@ -294,7 +294,7 @@ async function startDownload(m3u8URL, pageURL, videoName, forcedPlaylistURL = ""
     // 5. 合并保存
     log("下载完成，正在合并…");
     const blob = new Blob(parts, { type: "video/mp2t" });
-    const filename = makeFilename(playlistURL, videoName, qualityShort, "mp4");
+    const filename = makeFilename(playlistURL, videoName, qualityShort, "ts");
     saveBlob(blob, filename);
     const secs = (performance.now() - t0) / 1000;
     log(`已保存 ${filename}（${(bytes / 1024 / 1024).toFixed(1)} MB，耗时 ${secs.toFixed(0)}s）`, "ok");
@@ -456,8 +456,8 @@ function showProgress(done, total, bytes, secs) {
 }
 
 // 文件名：优先 "视频名称_画质.扩展名"
-// 默认 mp4：TS 流落 .mp4 后 PotPlayer/VLC 可正常播放
-function makeFilename(m3u8URL, videoName, quality, ext = "mp4") {
+// 默认 ts：HLS 原始流直接落盘（Go 侧不做封装），PotPlayer/VLC 可正常播放
+function makeFilename(m3u8URL, videoName, quality, ext = "ts") {
   const suffix = quality ? `_${quality}` : "";
   if (videoName) {
     let clean = videoName
