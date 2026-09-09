@@ -125,16 +125,25 @@ func handleCancel(w http.ResponseWriter, r *http.Request) {
 	te.intent = intentCancel
 	te.st.stage = "取消中"
 	cancel := te.cancel
-	queued := te.st.queued && !te.st.running
-	part := te.st.finalPath + ".part"
 	te.mu.Unlock()
 
 	if cancel != nil {
 		cancel()
 	}
-	// 排队中的任务没有 goroutine 在跑（或正卡在等并发槽），
-	// cancel 只能打断 sem 等待、不会走 finishInterrupt，这里兜底清理
-	if queued {
+
+	// 二次确认：cancel() 后既没有 worker 在跑（排队等并发槽 / 已暂停——
+	// 暂停任务的 cancel 早已随上一轮 pipeline 结束而失效），也没有 goroutine
+	// 会执行 finishInterrupt。请求线程直接终态化，否则任务永远停在
+	// 「取消中」——取消按钮点了没反应。仍在跑的交给 pipeline 自己收尾。
+	te.mu.Lock()
+	idle := !te.st.running && !te.st.done
+	part := ""
+	if te.st.finalPath != "" {
+		part = te.st.finalPath + ".part"
+	}
+	te.mu.Unlock()
+	if idle {
+		// 与 finishInterrupt 的取消路径语义一致：不可恢复 + 清理半成品
 		te.mu.Lock()
 		te.st.canceled = true
 		te.st.done = true
@@ -142,9 +151,12 @@ func handleCancel(w http.ResponseWriter, r *http.Request) {
 		te.st.running = false
 		te.st.queued = false
 		te.st.stage = "已取消"
+		te.st.errorMsg = ""
+		te.st.finalPath = ""
 		te.mu.Unlock()
 		if part != "" {
 			_ = os.Remove(part)
+			_ = os.Remove(part + ".meta")
 		}
 		markDirty()
 	}
@@ -345,8 +357,9 @@ func handleConfig(w http.ResponseWriter, r *http.Request, e *Engine) {
 		cfgMu.Lock()
 		cur := cfg
 		cfgMu.Unlock()
-		fmt.Fprintf(w, `{"maxConcurrent":%d,"segConcurrency":%d,"maxRetries":%d,"port":%d,"uiView":%q,"restartRequired":%t}`,
-			cur.MaxConcurrent, cur.SegConcurrency, cur.MaxRetries, cur.Port, cur.UIView, restartRequired)
+		// systemProxy：当前检测到的 Windows 系统代理（设置页「跟随系统」模式的回显提示）
+		fmt.Fprintf(w, `{"maxConcurrent":%d,"segConcurrency":%d,"maxRetries":%d,"port":%d,"uiView":%q,"proxy":%q,"systemProxy":%q,"restartRequired":%t}`,
+			cur.MaxConcurrent, cur.SegConcurrency, cur.MaxRetries, cur.Port, cur.UIView, cur.Proxy, systemProxyAddr(), restartRequired)
 	}
 	if r.Method == http.MethodGet {
 		writeCfg(false)
@@ -363,10 +376,26 @@ func handleConfig(w http.ResponseWriter, r *http.Request, e *Engine) {
 		MaxRetries     *int    `json:"maxRetries"`
 		Port           *int    `json:"port"`
 		UIView         *string `json:"uiView"`
+		Proxy          *string `json:"proxy"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
 		http.Error(w, "bad json body: "+err.Error(), http.StatusBadRequest)
 		return
+	}
+	// 代理先于锁校验：非法值 400 拒绝，不落任何配置
+	if in.Proxy != nil {
+		p := strings.TrimSpace(*in.Proxy)
+		switch {
+		case p == "":
+			p = "direct" // 空输入语义 = 直连；落盘为显式 direct，重载时不被当旧配置回退默认
+		case strings.EqualFold(p, "system"):
+			p = "system"
+		case isDirectStr(p), validProxyAddr(p):
+		default:
+			http.Error(w, `{"error":"代理地址无效：应为 http://host:port、system 跟随系统或 direct 直连"}`, http.StatusBadRequest)
+			return
+		}
+		in.Proxy = &p
 	}
 	cfgMu.Lock()
 	if in.MaxConcurrent != nil {
@@ -390,11 +419,14 @@ func handleConfig(w http.ResponseWriter, r *http.Request, e *Engine) {
 	if in.UIView != nil && (*in.UIView == "detail" || *in.UIView == "compact") {
 		cfg.UIView = *in.UIView
 	}
+	if in.Proxy != nil {
+		cfg.Proxy = *in.Proxy
+	}
 	applyConfigLocked()
 	saveConfigLocked()
 	out := cfg
 	cfgMu.Unlock()
-	fmt.Printf("[config] 已更新: 并发任务=%d 分片并发=%d 重试=%d 端口=%d 视图=%s\n",
-		out.MaxConcurrent, out.SegConcurrency, out.MaxRetries, out.Port, out.UIView)
+	fmt.Printf("[config] 已更新: 并发任务=%d 分片并发=%d 重试=%d 端口=%d 视图=%s 代理=%s\n",
+		out.MaxConcurrent, out.SegConcurrency, out.MaxRetries, out.Port, out.UIView, out.Proxy)
 	writeCfg(e.Running() && portChanged)
 }

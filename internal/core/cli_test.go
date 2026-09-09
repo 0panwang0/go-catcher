@@ -5,9 +5,9 @@ import "testing"
 
 // TestParseCLI 全参数解析与默认值回退。
 func TestParseCLI(t *testing.T) {
-	oldProxy, oldOutput, oldConc := proxyAddr, outputFile, concurrency
-	t.Cleanup(func() { proxyAddr, outputFile, concurrency = oldProxy, oldOutput, oldConc })
-	proxyAddr = "http://127.0.0.1:7890"
+	oldProxy, oldOutput, oldConc := getProxyAddr(), outputFile, concurrency
+	t.Cleanup(func() { setProxyAddr(oldProxy); outputFile, concurrency = oldOutput, oldConc })
+	setProxyAddr("http://127.0.0.1:7890")
 	outputFile = "output.ts"
 	concurrency = 10
 

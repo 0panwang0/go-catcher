@@ -51,6 +51,7 @@ func Run() {
 		Debug: false,
 		WindowOptions: webview2.WindowOptions{
 			Title:  mainWindowTitle,
+			IconId: 1, // 窗口类图标取 exe 资源 #1（winres/winres.json），否则 go-webview2 用通用 IDI_APPLICATION
 			Width:  1080,
 			Height: 780,
 			Center: true,

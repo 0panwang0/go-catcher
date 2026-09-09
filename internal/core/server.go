@@ -16,6 +16,7 @@ func newMux(e *Engine) *http.ServeMux {
 	mux.HandleFunc("/pickdir", handlePickDir)
 	mux.HandleFunc("/status", handleStatus)
 	mux.HandleFunc("/download", handleDownload)
+	mux.HandleFunc("/probe", handleProbe) // 扩展预检：服务端代拉 m3u8 文本（绕浏览器 CORS 限制）
 	mux.HandleFunc("/pause", handlePause)
 	mux.HandleFunc("/resume", handleResume)
 	mux.HandleFunc("/cancel", handleCancel)

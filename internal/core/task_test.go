@@ -77,12 +77,12 @@ func TestSnapshotReadsJobProgress(t *testing.T) {
 	}
 }
 
-// TestFailTask 失败状态转换：保留元信息、清 finalPath。
+// TestFailTask 失败状态转换：保留元信息与 finalPath（重试的 pipeline 靠它定位 .part）。
 func TestFailTask(t *testing.T) {
 	te := &taskEntry{st: taskState{running: true, queued: true, finalPath: "x.mp4"}}
 	failTask(te, "网络错误")
 	s := te.st
-	if !s.done || s.running || s.queued || s.stage != "失败" || s.errorMsg != "网络错误" || s.finalPath != "" {
+	if !s.done || s.running || s.queued || s.stage != "失败" || s.errorMsg != "网络错误" || s.finalPath != "x.mp4" {
 		t.Fatalf("failTask 后状态异常: %+v", s)
 	}
 }

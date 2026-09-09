@@ -39,12 +39,9 @@ type taskState struct {
 
 	// containerID 探测到的容器 ID（断点续传恢复规范化等格式相关行为）
 	containerID string
-	// fmp4Baseline fMP4 tfdt 基准（trackID->tfdt；断点续传沿用同一基准）
-	fmp4Baseline map[string]uint64
-	// fmp4End fMP4 各轨累计结束时间（trackID->相对结束时间；续传后继续累计，完成时回填 mehd）
-	fmp4End map[string]uint64
-	// fmp4Init fMP4 init 段解析结果（mehd/mvhd 回填位置与 timescale；续传恢复用）
-	fmp4Init *fmp4InitInfo
+	// normState 跨分片规范化状态的持久化字节（NormState.snapshot 导出；
+	// 续传时 restore 恢复：tfdt 基准/结束时间/init 信息全包）
+	normState []byte
 }
 
 // 任务是否还能恢复（暂停或意外中断，且还没下完）
@@ -107,7 +104,9 @@ func fileExists(p string) bool {
 	return err == nil && !fi.IsDir()
 }
 
-// failTask 标记任务失败结束（保留 .part 与文件元信息，供"重试"断点续传）
+// failTask 标记任务失败结束（保留 .part 与文件元信息，供"重试"断点续传）。
+// finalPath 绝不能清：重试的 pipeline 靠它定位 .part，清了会把续传数据
+// 写到工作目录下的游离 ".part" 且收尾必失败（暂停路径 finishInterrupt 就不清）。
 func failTask(te *taskEntry, msg string) {
 	te.mu.Lock()
 	te.st.running = false
@@ -115,7 +114,6 @@ func failTask(te *taskEntry, msg string) {
 	te.st.done = true
 	te.st.stage = "失败"
 	te.st.errorMsg = msg
-	te.st.finalPath = ""
 	te.mu.Unlock()
 }
 
@@ -171,7 +169,8 @@ func taskStateJSON(t taskState) string {
 	}
 	// 已完成但成品文件已不在磁盘（被移动/删除）：前端显示"已失效"而不是"完成 · 已保存"。
 	// snapshot 已按磁盘实况计算 openPath（文件存在时 == finalPath），据此判断无需再 Stat 一次。
-	fileMissing := t.done && t.finalPath != "" && t.openPath != t.finalPath
+	// 失败/取消任务不算失效：它们的成品本来就不存在（openPath 指向 .part），语义是"失败"。
+	fileMissing := t.done && t.errorMsg == "" && !t.canceled && t.finalPath != "" && t.openPath != t.finalPath
 	return fmt.Sprintf(
 		`{"id":%q,"queued":%v,"running":%v,"paused":%v,"canceled":%v,"stage":%q,"done":%v,"live":%v,"fileMissing":%v,"pct":%.1f,"segDone":%d,"segTot":%d,"finalPath":%q,"openPath":%q,"error":%q,"m3u8URL":%q,"referer":%q,"filename":%q,"saveDir":%q,"started":%q,"finished":%q}`,
 		t.id, t.queued, t.running, t.paused, t.canceled, t.stage, t.done, t.live, fileMissing, pct,

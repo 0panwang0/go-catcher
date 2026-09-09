@@ -4,8 +4,11 @@ package core
 import (
 	"context"
 	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -188,10 +191,11 @@ func TestClamp(t *testing.T) {
 func saveRestoreConfig(t *testing.T, p string) {
 	t.Helper()
 	oldPath, oldLimiter, oldCfg := configPath, limiter, cfg
-	oldConc, oldRetries := concurrency, maxRetries
+	oldConc, oldRetries, oldProxy := concurrency, maxRetries, getProxyAddr()
 	t.Cleanup(func() {
 		configPath, limiter, cfg = oldPath, oldLimiter, oldCfg
 		concurrency, maxRetries = oldConc, oldRetries
+		setProxyAddr(oldProxy)
 	})
 	configPath = p
 	limiter = newResizableSem(defaultConfig().MaxConcurrent)
@@ -201,7 +205,7 @@ func saveRestoreConfig(t *testing.T, p string) {
 func TestLoadConfigFromFile(t *testing.T) {
 	dir := t.TempDir()
 	p := filepath.Join(dir, "gocatcher_config.json")
-	os.WriteFile(p, []byte(`{"maxConcurrent":5,"segConcurrency":20,"maxRetries":7,"port":8899,"uiView":"compact"}`), 0644)
+	os.WriteFile(p, []byte(`{"maxConcurrent":5,"segConcurrency":20,"maxRetries":7,"port":8899,"uiView":"compact","proxy":"http://192.168.1.2:8888"}`), 0644)
 	saveRestoreConfig(t, p)
 
 	loadConfig()
@@ -214,9 +218,12 @@ func TestLoadConfigFromFile(t *testing.T) {
 	if concurrency != 20 || maxRetries != 7 {
 		t.Fatalf("concurrency=%d maxRetries=%d want 20,7", concurrency, maxRetries)
 	}
+	if cfg.Proxy != "http://192.168.1.2:8888" || getProxyAddr() != "http://192.168.1.2:8888" {
+		t.Fatalf("proxy cfg=%q 运行时=%q", cfg.Proxy, getProxyAddr())
+	}
 }
 
-// TestLoadConfigFallsBack 损坏 JSON / 越界值 / 非法 port 与 uiView 回退默认。
+// TestLoadConfigFallsBack 损坏 JSON / 越界值 / 非法 port、uiView 与 proxy 回退默认。
 func TestLoadConfigFallsBack(t *testing.T) {
 	dir := t.TempDir()
 	p := filepath.Join(dir, "gocatcher_config.json")
@@ -228,7 +235,7 @@ func TestLoadConfigFallsBack(t *testing.T) {
 		t.Fatalf("损坏 JSON 应回退默认: %+v", cfg)
 	}
 
-	os.WriteFile(p, []byte(`{"maxConcurrent":99,"segConcurrency":0,"maxRetries":-1,"port":0,"uiView":"bogus"}`), 0644)
+	os.WriteFile(p, []byte(`{"maxConcurrent":99,"segConcurrency":0,"maxRetries":-1,"port":0,"uiView":"bogus","proxy":"socks5://x:1080"}`), 0644)
 	loadConfig()
 	if cfg.MaxConcurrent != 16 || cfg.SegConcurrency != 1 || cfg.MaxRetries != 0 {
 		t.Fatalf("越界值应被 clamp: %+v", cfg)
@@ -239,6 +246,52 @@ func TestLoadConfigFallsBack(t *testing.T) {
 	if cfg.UIView != "detail" {
 		t.Fatalf("非法 uiView 应回退 detail, got %q", cfg.UIView)
 	}
+	if cfg.Proxy != defaultConfig().Proxy {
+		t.Fatalf("非法 proxy 应回退默认 %q, got %q", defaultConfig().Proxy, cfg.Proxy)
+	}
+
+	// 旧配置文件无 proxy 字段（空串）= 未配置过，回退默认而不是直连
+	os.WriteFile(p, []byte(`{"proxy":""}`), 0644)
+	loadConfig()
+	if cfg.Proxy != defaultConfig().Proxy {
+		t.Fatalf("空 proxy 应回退默认 %q, got %q", defaultConfig().Proxy, cfg.Proxy)
+	}
+
+	// direct 关键字显式直连，跨重启保持
+	os.WriteFile(p, []byte(`{"proxy":"direct"}`), 0644)
+	loadConfig()
+	if cfg.Proxy != "direct" || getProxyAddr() != "direct" {
+		t.Fatalf("direct 应保持直连: cfg=%q 运行时=%q", cfg.Proxy, getProxyAddr())
+	}
+
+	// system 关键字跟随系统代理（新默认），跨重启保持；大小写不敏感
+	os.WriteFile(p, []byte(`{"proxy":"System"}`), 0644)
+	loadConfig()
+	if cfg.Proxy != "system" || getProxyAddr() != "system" {
+		t.Fatalf("system 应保持跟随系统: cfg=%q 运行时=%q", cfg.Proxy, getProxyAddr())
+	}
+}
+
+// TestValidProxyAddr 代理地址校验：仅 http://host[:port]（CONNECT 隧道）。
+func TestValidProxyAddr(t *testing.T) {
+	cases := []struct {
+		p    string
+		want bool
+	}{
+		{"http://127.0.0.1:7890", true},
+		{"http://proxy.example.com", true},
+		{"http://proxy.example.com:8080", true},
+		{"127.0.0.1:7890", false},   // 缺 scheme：url.Parse 会把 host 当 scheme
+		{"socks5://x:1080", false},  // 不支持 SOCKS
+		{"https://x:8443", false},   // 不支持 TLS-to-proxy
+		{"", false},
+		{"http://", false},
+	}
+	for _, c := range cases {
+		if got := validProxyAddr(c.p); got != c.want {
+			t.Fatalf("validProxyAddr(%q)=%v want %v", c.p, got, c.want)
+		}
+	}
 }
 
 // TestSaveConfigLocked 落盘为可解析的 JSON，字段与 cfg 一致。
@@ -247,7 +300,7 @@ func TestSaveConfigLocked(t *testing.T) {
 	p := filepath.Join(dir, "gocatcher_config.json")
 	saveRestoreConfig(t, p)
 
-	cfg = appConfig{MaxConcurrent: 4, SegConcurrency: 12, MaxRetries: 2, Port: 7000, UIView: "compact"}
+	cfg = appConfig{MaxConcurrent: 4, SegConcurrency: 12, MaxRetries: 2, Port: 7000, UIView: "compact", Proxy: "direct"}
 	saveConfigLocked()
 	data, err := os.ReadFile(p)
 	if err != nil {
@@ -259,5 +312,82 @@ func TestSaveConfigLocked(t *testing.T) {
 	}
 	if got != cfg {
 		t.Fatalf("落盘=%+v want %+v", got, cfg)
+	}
+}
+
+// postConfig 向 /config 提交 JSON 补丁，返回响应码。
+func postConfig(t *testing.T, body string) int {
+	t.Helper()
+	w := httptest.NewRecorder()
+	r := httptest.NewRequest(http.MethodPost, "/config", strings.NewReader(body))
+	handleConfig(w, r, &Engine{})
+	return w.Code
+}
+
+// TestConfigProxyPatch 设置页提交代理：合法值即时生效并落盘；
+// 空输入归一化为 direct；非法值 400 拒绝且不落任何配置。
+func TestConfigProxyPatch(t *testing.T) {
+	dir := t.TempDir()
+	p := filepath.Join(dir, "gocatcher_config.json")
+	saveRestoreConfig(t, p)
+	cfg = defaultConfig()
+
+	if code := postConfig(t, `{"proxy":"http://10.0.0.1:8080"}`); code != 200 {
+		t.Fatalf("合法代理 HTTP %d", code)
+	}
+	if cfg.Proxy != "http://10.0.0.1:8080" || getProxyAddr() != "http://10.0.0.1:8080" {
+		t.Fatalf("代理未即时生效: cfg=%q 运行时=%q", cfg.Proxy, getProxyAddr())
+	}
+	var saved appConfig
+	data, _ := os.ReadFile(p)
+	if err := json.Unmarshal(data, &saved); err != nil || saved.Proxy != "http://10.0.0.1:8080" {
+		t.Fatalf("代理未落盘: %s err=%v", data, err)
+	}
+
+	// 空输入 = 直连，落盘为显式 direct（重载时不会被当旧配置回退默认）
+	if code := postConfig(t, `{"proxy":""}`); code != 200 {
+		t.Fatalf("空代理 HTTP %d", code)
+	}
+	if cfg.Proxy != "direct" || !isDirectProxy() {
+		t.Fatalf("空输入应归一化为 direct: cfg=%q", cfg.Proxy)
+	}
+
+	// system 模式合法：切回跟随系统代理
+	if code := postConfig(t, `{"proxy":"system"}`); code != 200 {
+		t.Fatalf("system 模式 HTTP %d", code)
+	}
+	if cfg.Proxy != "system" || getProxyAddr() != "system" {
+		t.Fatalf("system 未生效: cfg=%q 运行时=%q", cfg.Proxy, getProxyAddr())
+	}
+
+	// 非法值 400：不修改任何配置
+	if code := postConfig(t, `{"proxy":"socks5://x:1080","port":1234}`); code != 400 {
+		t.Fatalf("非法代理应 400, got %d", code)
+	}
+	if cfg.Proxy != "system" || cfg.Port != defaultConfig().Port {
+		t.Fatalf("非法值不应落任何配置: %+v", cfg)
+	}
+}
+
+// TestConfigProxyGet GET /config 返回 proxy 与 systemProxy 字段（设置页回显用）。
+// systemProxy 注入 stub 保证断言不依赖本机真实注册表状态。
+func TestConfigProxyGet(t *testing.T) {
+	dir := t.TempDir()
+	p := filepath.Join(dir, "gocatcher_config.json")
+	saveRestoreConfig(t, p)
+	cfg = appConfig{Proxy: "http://127.0.0.1:7890"}
+	oldSys := systemProxyAddr
+	systemProxyAddr = func() string { return "http://127.0.0.1:7890" }
+	t.Cleanup(func() { systemProxyAddr = oldSys })
+
+	w := httptest.NewRecorder()
+	r := httptest.NewRequest(http.MethodGet, "/config", nil)
+	handleConfig(w, r, &Engine{})
+	body := w.Body.String()
+	if !strings.Contains(body, `"proxy":"http://127.0.0.1:7890"`) {
+		t.Fatalf("GET 响应缺 proxy 字段: %s", body)
+	}
+	if !strings.Contains(body, `"systemProxy":"http://127.0.0.1:7890"`) {
+		t.Fatalf("GET 响应缺 systemProxy 字段: %s", body)
 	}
 }

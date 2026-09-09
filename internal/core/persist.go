@@ -34,9 +34,7 @@ type persistedTask struct {
 	Live      bool              `json:"live"`             // 直播跟随任务（播放列表无 ENDLIST）
 	SeenURLs  []string          `json:"seenURLs,omitempty"` // 直播已录分片 URL 窗口（断点恢复去重）
 	ContainerID string          `json:"containerID,omitempty"` // 探测到的容器 ID（续传恢复规范化）
-	FMP4Baseline map[string]uint64 `json:"fmp4Baseline,omitempty"` // fMP4 tfdt 基准（续传沿用）
-	FMP4End      map[string]uint64 `json:"fmp4End,omitempty"`      // fMP4 各轨结束时间（续传继续累计，完成回填 mehd）
-	FMP4Init     *persistFMP4InitInfo  `json:"fmp4Init,omitempty"`     // fMP4 init 段解析结果（回填位置与 timescale）
+	NormState json.RawMessage   `json:"normState,omitempty"`   // 跨分片状态字节（NormState.snapshot 导出，续传 restore 恢复）
 }
 
 type stateFile struct {
@@ -65,6 +63,9 @@ func getStatePath() string {
 	return statePath
 }
 
+// stateSaveDelay 去抖间隔：进度每帧都变，合并高频更新避免疯狂写盘（测试可调短）。
+var stateSaveDelay = 1200 * time.Millisecond
+
 // markDirty 标记状态已变更，触发一次延迟落盘（合并高频进度更新，避免疯狂写盘）
 
 func markDirty() {
@@ -78,7 +79,7 @@ func markDirty() {
 	stateMu.Unlock()
 
 	go func() {
-		time.Sleep(1200 * time.Millisecond) // debounce：进度每帧都变，1.2s 存一次足够
+		time.Sleep(stateSaveDelay) // debounce
 		stateMu.Lock()
 		stateDirty = false
 		stateMu.Unlock()
@@ -121,9 +122,9 @@ func collectPersisted() []persistedTask {
 			pt.SeenURLs = te.seenURLs()
 		}
 		pt.ContainerID = s.containerID
-		pt.FMP4Baseline = s.fmp4Baseline
-		pt.FMP4End = s.fmp4End
-		pt.FMP4Init = s.fmp4Init.persist()
+		if len(s.normState) > 0 {
+			pt.NormState = json.RawMessage(s.normState)
+		}
 		out = append(out, pt)
 	}
 	// 稳定的排序，避免 map 遍历顺序导致文件内容每次都变
@@ -188,12 +189,10 @@ func loadState() {
 			saveDir: pt.SaveDir, segDone: pt.SegDone, segTot: pt.SegTot,
 			started: pt.Started, finished: pt.Finished,
 			live: pt.Live, seen: pt.SeenURLs,
-			containerID: pt.ContainerID, fmp4Baseline: pt.FMP4Baseline,
-			fmp4End: pt.FMP4End,
+			containerID: pt.ContainerID,
 		}
-		if pt.FMP4Init != nil {
-			te.st.fmp4Init = &fmp4InitInfo{}
-			te.st.fmp4Init.restore(pt.FMP4Init)
+		if len(pt.NormState) > 0 {
+			te.st.normState = append([]byte(nil), pt.NormState...)
 		}
 		// 已取消的任务没有任何成品文件，清掉 finalPath（防御旧版本状态文件残留）
 		if pt.Canceled {

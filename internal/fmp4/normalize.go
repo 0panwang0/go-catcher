@@ -11,11 +11,12 @@
 // 并把裸 NAL 样本改写为长度前缀形式，同时重写 trun 样本大小与 mdat 尺寸。
 //
 // 该函数对任何结构异常/非 fMP4 数据一律原样放行，保证下载管线不受影响。
-package core
+package fmp4
 
 import (
 	"bytes"
 	"encoding/binary"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strconv"
@@ -28,15 +29,19 @@ import (
 // trackVideo 记录各轨是否为视频轨（来自 init 段 stsd）：仅视频轨做
 // 裸 NAL→AVCC 转换，音频轨永不转换（AAC 帧头与 H.264 NAL 头存在位冲突，
 // 特征猜测会误伤音频样本导致声音断续）。
+// 状态同时承担数据变换（normalize）：实现 NormState 接口，pipeline 只面对接口。
 type normState struct {
 	mu         sync.Mutex
 	baseline   map[uint32]uint64 // trackID -> 首个分片中该轨的 tfdt
 	end        map[uint32]uint64 // trackID -> 该轨累计最大相对结束时间（track timescale 单位）
 	trackVideo map[uint32]bool   // trackID -> 是否视频轨（未知轨道默认按视频处理）
-	init       *fmp4InitInfo     // init 段解析结果（mehd/mvhd 回填位置；Backfill 收尾用）
+	init       *fmp4InitInfo     // init 段解析结果（mehd/mvhd 回填位置；finish 收尾用）
 }
 
-func newNormState() *normState {
+// NewState 创建 fMP4 规范化状态（core 容器注册表的状态工厂）。
+// 返回具体类型：core 侧经 func() NormState 包装装配进注册表，
+// 编译期即验证方法集满足 core.NormState 接口。
+func NewState() *normState {
 	return &normState{
 		baseline:   make(map[uint32]uint64),
 		end:        make(map[uint32]uint64),
@@ -44,42 +49,108 @@ func newNormState() *normState {
 	}
 }
 
-// newFMP4State 注册表用的 fMP4 状态工厂（接口返回，供 Container.NewState）。
-func newFMP4State() NormState { return newNormState() }
-
-// applyTrackVideo 把 init 段解析的轨道类型写入规范化状态。
-// 仅 fMP4 的 normState 支持（其它状态忽略，未知轨道保持默认按视频处理）。
-func applyTrackVideo(n NormState, m map[uint32]bool) {
-	if ns, ok := n.(*normState); ok {
-		ns.setTrackVideo(m)
-	}
+// normPersist snapshot/restore 的持久化字节格式（JSON）：全部跨分片状态。
+// Init 字段复用 fmp4InitInfo.persist() 的字节。
+type normPersist struct {
+	Baseline map[string]uint64 `json:"baseline,omitempty"` // trackID -> tfdt 基准
+	End      map[string]uint64 `json:"end,omitempty"`      // trackID -> 累计结束时间
+	Init     json.RawMessage   `json:"init,omitempty"`     // init 段解析结果（mehd/mvhd 回填位置）
 }
 
-// normInitInfo 返回状态持有的 init 段解析结果。
-// 仅 fMP4 的 normState 支持；其它状态返回 nil。
-func normInitInfo(n NormState) *fmp4InitInfo {
-	if ns, ok := n.(*normState); ok {
-		return ns.initInfo()
-	}
-	return nil
+// Normalize 实现 NormState：处理一段写入前的数据（内联 init 或 fMP4 分片）。
+// 内部直接访问具体字段，无需经过接口中转。
+func (n *normState) Normalize(data []byte) ([]byte, error) {
+	return normalizeFMP4Segment(data, n)
 }
 
-// normSetInit 把 init 段解析结果写入规范化状态（Backfill 收尾回填用）。
-// 仅 fMP4 的 normState 支持；其它状态忽略。
-func normSetInit(n NormState, info *fmp4InitInfo) {
-	if ns, ok := n.(*normState); ok {
-		ns.setInit(info)
-	}
-}
-
-// 编译期断言：normState 实现 NormState 接口。
-var _ NormState = (*normState)(nil)
-
-// setTrackVideo 载入 init 段解析出的轨道类型（nil 时清空，回退特征猜测）。
-func (n *normState) setTrackVideo(m map[uint32]bool) {
+// Snapshot 导出全部跨分片状态（tfdt 基准 + 每轨结束时间 + init 段解析结果）。
+func (n *normState) Snapshot() []byte {
 	n.mu.Lock()
 	defer n.mu.Unlock()
-	n.trackVideo = m
+	p := normPersist{Baseline: n.baselineStrings(), End: n.endStrings()}
+	if n.init != nil {
+		if b, err := json.Marshal(n.init.persist()); err == nil {
+			p.Init = b
+		}
+	}
+	out, err := json.Marshal(p)
+	if err != nil {
+		return nil
+	}
+	return out
+}
+
+// Restore 载入持久化的全部状态（断点续传）；未知/损坏字节静默忽略。
+func (n *normState) Restore(b []byte) {
+	if len(b) == 0 {
+		return
+	}
+	var p normPersist
+	if err := json.Unmarshal(b, &p); err != nil {
+		return
+	}
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	for ks, v := range p.Baseline {
+		if k, err := strconv.ParseUint(ks, 10, 32); err == nil {
+			n.baseline[uint32(k)] = v
+		}
+	}
+	for ks, v := range p.End {
+		if k, err := strconv.ParseUint(ks, 10, 32); err == nil {
+			n.end[uint32(k)] = v
+		}
+	}
+	if len(p.Init) > 0 {
+		var pi persistFMP4InitInfo
+		if err := json.Unmarshal(p.Init, &pi); err == nil {
+			info := &fmp4InitInfo{trackTS: map[uint32]uint32{}}
+			info.restore(&pi)
+			n.init = info
+			if len(info.trackVideo) > 0 {
+				n.trackVideo = info.trackVideo
+			}
+		}
+	}
+}
+
+// baselineStrings 导出基准（持久化，续传恢复用）。
+func (n *normState) baselineStrings() map[string]uint64 {
+	out := make(map[string]uint64, len(n.baseline))
+	for k, v := range n.baseline {
+		out[strconv.FormatUint(uint64(k), 10)] = v
+	}
+	return out
+}
+
+// endStrings 导出各轨结束时间（持久化，续传后继续累计）。
+func (n *normState) endStrings() map[string]uint64 {
+	out := make(map[string]uint64, len(n.end))
+	for k, v := range n.end {
+		out[strconv.FormatUint(uint64(k), 10)] = v
+	}
+	return out
+}
+
+// endSnapshot 导出各轨结束时间（私有：mehd 回填换算与测试用）。
+func (n *normState) endSnapshot() map[string]uint64 {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	return n.endStrings()
+}
+
+// restoreEnd 载入持久化的各轨结束时间（私有：测试与内部恢复用）。
+func (n *normState) restoreEnd(m map[string]uint64) {
+	if len(m) == 0 {
+		return
+	}
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	for ks, v := range m {
+		if k, err := strconv.ParseUint(ks, 10, 32); err == nil {
+			n.end[uint32(k)] = v
+		}
+	}
 }
 
 // isVideoTrack 判断轨道是否应做视频样本转换：
@@ -94,68 +165,25 @@ func (n *normState) isVideoTrack(trackID uint32) bool {
 	return v
 }
 
-// setInit 写入 init 段解析结果（Backfill 收尾回填 mehd/mvhd 时使用）。
-func (n *normState) setInit(info *fmp4InitInfo) {
+// normTfdt 按跨分片基准归一化 tfdt（首个分片记基准）并累计该轨结束时间，
+// 返回归一化值。基准/结束时间跨分片共享（断点续传沿用同一基准），原子更新。
+func (n *normState) normTfdt(id uint32, raw, dur uint64) uint64 {
 	n.mu.Lock()
 	defer n.mu.Unlock()
-	n.init = info
-}
-
-// initInfo 返回 init 段解析结果（nil = 尚未解析/非 fMP4）。
-func (n *normState) initInfo() *fmp4InitInfo {
-	n.mu.Lock()
-	defer n.mu.Unlock()
-	return n.init
-}
-
-// snapshot 导出基准（持久化，续传恢复用）。
-func (n *normState) snapshot() map[string]uint64 {
-	n.mu.Lock()
-	defer n.mu.Unlock()
-	out := make(map[string]uint64, len(n.baseline))
-	for k, v := range n.baseline {
-		out[strconv.FormatUint(uint64(k), 10)] = v
+	var nv uint64
+	if base, ok := n.baseline[id]; ok {
+		if raw > base {
+			nv = raw - base
+		}
+	} else {
+		n.baseline[id] = raw
 	}
-	return out
-}
-
-// restore 载入持久化的基准（断点续传）。
-func (n *normState) restore(m map[string]uint64) {
-	if len(m) == 0 {
-		return
-	}
-	n.mu.Lock()
-	defer n.mu.Unlock()
-	for ks, v := range m {
-		if k, err := strconv.ParseUint(ks, 10, 32); err == nil {
-			n.baseline[uint32(k)] = v
+	if dur > 0 {
+		if end := nv + dur; end > n.end[id] {
+			n.end[id] = end
 		}
 	}
-}
-
-// endSnapshot 导出各轨结束时间（持久化，续传后继续累计）。
-func (n *normState) endSnapshot() map[string]uint64 {
-	n.mu.Lock()
-	defer n.mu.Unlock()
-	out := make(map[string]uint64, len(n.end))
-	for k, v := range n.end {
-		out[strconv.FormatUint(uint64(k), 10)] = v
-	}
-	return out
-}
-
-// restoreEnd 载入持久化的各轨结束时间（断点续传）。
-func (n *normState) restoreEnd(m map[string]uint64) {
-	if len(m) == 0 {
-		return
-	}
-	n.mu.Lock()
-	defer n.mu.Unlock()
-	for ks, v := range m {
-		if k, err := strconv.ParseUint(ks, 10, 32); err == nil {
-			n.end[uint32(k)] = v
-		}
-	}
+	return nv
 }
 
 // trafInfo 一个 traf（单轨分片）的解析结果。
@@ -344,27 +372,12 @@ func parseTraf(moof []byte, pos, size int, moofAbs int, prevDataEnd int, firstTr
 }
 
 // normalizeTraf 用跨分片基准把 tfdt 归零并原位写回 moof 字节，
-// 同时把该轨相对结束时间（归一化 tfdt + 样本总时长）累计进 normState。
-func normalizeTraf(moof []byte, ti *trafInfo, st *normState) {
+// 同时把该轨相对结束时间（归一化 tfdt + 样本总时长）累计进状态。
+func normalizeTraf(moof []byte, ti *trafInfo, n *normState) {
 	if ti.tfdtOff < 0 {
 		return
 	}
-	st.mu.Lock()
-	var nv uint64
-	if base, ok := st.baseline[ti.trackID]; ok {
-		if ti.tfdtVal > base {
-			nv = ti.tfdtVal - base
-		}
-	} else {
-		st.baseline[ti.trackID] = ti.tfdtVal
-	}
-	if ti.durTotal > 0 {
-		end := nv + ti.durTotal
-		if end > st.end[ti.trackID] {
-			st.end[ti.trackID] = end
-		}
-	}
-	st.mu.Unlock()
+	nv := n.normTfdt(ti.trackID, ti.tfdtVal, ti.durTotal)
 	if ti.tfdtWide {
 		binary.BigEndian.PutUint64(moof[ti.tfdtOff:], nv)
 	} else {
@@ -529,7 +542,7 @@ func sum(u []uint32) uint32 {
 // 仅视频轨（init 段 stsd 判定）参与转换；音频轨原样复制，防止
 // AAC 帧头被误判为视频 NAL 而损坏。
 // 返回新的 mdat box 与每轨新样本大小（nil 表示该轨未转换）；无转换时原样返回。
-func rebuildMdat(mdat []byte, mdatAbs int, infos []*trafInfo, st *normState) ([]byte, map[int][]uint32, error) {
+func rebuildMdat(mdat []byte, mdatAbs int, infos []*trafInfo, n *normState) ([]byte, map[int][]uint32, error) {
 	hdr := 8
 	if len(mdat) >= 8 && binary.BigEndian.Uint32(mdat) == 1 {
 		hdr = 16
@@ -553,7 +566,7 @@ func rebuildMdat(mdat []byte, mdatAbs int, infos []*trafInfo, st *normState) ([]
 		out.Write(payload[cursor:rel])
 		cursor = rel
 
-		if !st.isVideoTrack(ti.trackID) {
+		if !n.isVideoTrack(ti.trackID) {
 			// 音频/其它轨：样本原样复制，不做封装猜测与转换
 			for _, sz := range ti.sizes {
 				if cursor+int(sz) > len(payload) {
@@ -625,13 +638,17 @@ func rebuildMdat(mdat []byte, mdatAbs int, infos []*trafInfo, st *normState) ([]
 
 // normalizeFMP4Segment 规范化一个 fMP4 分片（或整段拼接文件）：
 // 时间戳归零（跨分片基准）+ 裸 NAL→AVCC。
-// 非 fMP4 / 结构异常 / 状态类型不符的数据原样返回（不报错），保证下载管线不受影响。
-func normalizeFMP4Segment(data []byte, st NormState) ([]byte, error) {
-	if len(data) < 16 {
+// 分片开头若内联 init（ftyp/moov）则先经 consumeInit 补 mehd 占位、解析轨道类型
+// 与回填位置；非 fMP4 / 结构异常的数据原样返回（不报错），保证下载管线不受影响。
+// 由 normState.Normalize 调用（接口入口），内部直接访问具体字段。
+func normalizeFMP4Segment(data []byte, n *normState) ([]byte, error) {
+	if len(data) < 16 || n == nil {
 		return data, nil
 	}
-	ns, ok := st.(*normState)
-	if !ok || ns == nil {
+	// 内联 init 在分片首部：补 mehd 占位、解析轨道类型与回填位置
+	// （consumeInit 内部完成；已持有 init 或数据无 moov 时原样返回）
+	data = n.consumeInit(data)
+	if len(data) < 16 {
 		return data, nil
 	}
 	out := make([]byte, 0, len(data)+len(data)/16)
@@ -657,13 +674,13 @@ func normalizeFMP4Segment(data []byte, st NormState) ([]byte, error) {
 			moofCopy := make([]byte, sz)
 			copy(moofCopy, data[pos:pos+sz])
 			for _, ti := range infos {
-				normalizeTraf(moofCopy, ti, ns)
+				normalizeTraf(moofCopy, ti, n)
 			}
 			pending = &pendingMoof{orig: moofCopy, infos: infos}
 			pos += sz
 		case "mdat":
-			if pending != nil {
-				newMdat, newSizes, rerr := rebuildMdat(data[pos:pos+sz], pos, pending.infos, ns)
+				if pending != nil {
+					newMdat, newSizes, rerr := rebuildMdat(data[pos:pos+sz], pos, pending.infos, n)
 				if rerr != nil {
 					// 转换失败：保留 tfdt 归一化，mdat 原样放行
 					out = append(out, buildMoof(pending, nil)...)
@@ -681,14 +698,6 @@ func normalizeFMP4Segment(data []byte, st NormState) ([]byte, error) {
 			if pending != nil {
 				out = append(out, buildMoof(pending, nil)...)
 				pending = nil
-			}
-			if typ == "moov" {
-				// 内联 init（首片自带 ftyp/moov）：解析轨道类型，仅视频轨做 NAL 转换
-				info := &fmp4InitInfo{trackTS: map[uint32]uint32{}}
-				parseTimescales(data[pos:pos+sz], info)
-				if len(info.trackVideo) > 0 {
-					ns.setTrackVideo(info.trackVideo)
-				}
 			}
 			out = append(out, data[pos:pos+sz]...)
 			pos += sz

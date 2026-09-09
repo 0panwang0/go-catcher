@@ -1,4 +1,4 @@
-package core
+package fmp4
 
 import (
 	"encoding/binary"
@@ -7,7 +7,7 @@ import (
 )
 
 // TestValidateMehdE2E 端到端验证：真实录制文件 → 拆 init → 插 mehd → 规范化累计
-// → 回填总时长。手动运行：GOCATCHER_SAMPLE=路径 go test -run TestValidateMehdE2E ./internal/core
+// → 回填总时长。手动运行：GOCATCHER_SAMPLE=路径 go test -run TestValidateMehdE2E ./internal/fmp4
 func TestValidateMehdE2E(t *testing.T) {
 	p := os.Getenv("GOCATCHER_SAMPLE")
 	if p == "" {
@@ -46,7 +46,7 @@ func TestValidateMehdE2E(t *testing.T) {
 	t.Logf("mehdOff=%d movieTS=%d trackTS=%v mvhdOff=%d", info.mehdOff, info.movieTS, info.trackTS, info.mvhdOff)
 
 	// 3. 分片规范化（累计每轨结束时间）——旧文件已归一化，此步幂等
-	st := newNormState()
+	st := NewState()
 	normFrags, err := normalizeFMP4Segment(frags, st)
 	if err != nil {
 		t.Fatal(err)
@@ -59,8 +59,7 @@ func TestValidateMehdE2E(t *testing.T) {
 	if err := os.WriteFile(tmp, out, 0644); err != nil {
 		t.Fatal(err)
 	}
-	st.setInit(info)
-	if err := backfillDurations(tmp, st); err != nil {
+	if err := backfillDurations(tmp, info, st); err != nil {
 		t.Fatal(err)
 	}
 	got, _ := os.ReadFile(tmp)

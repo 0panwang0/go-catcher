@@ -7,11 +7,11 @@
 //
 // prepareInit 在 init 段落盘前给 mvex 插入一个占位 mehd（version=1，
 // duration=0），录制/下载过程中 normState 跨分片累计每轨的最大结束时间，
-// 任务完成时把总时长回填到 mehd 的 duration 字段（见 dlJob.finalizeMehd）。
+// 任务完成时把总时长回填到 mehd 的 duration 字段（见 normState.Finish）。
 // 插入发生在文件生成之初，后续分片追加在其后，无需移动任何已写数据。
 //
 // 对没有 moov/mvex 的 init 段（或普通 MP4）原样返回，不影响其它格式。
-package core
+package fmp4
 
 import (
 	"encoding/binary"
@@ -356,12 +356,12 @@ func mdhdTimescale(mdia []byte) (uint32, bool) {
 }
 
 // mehdDuration 把每轨累计结束时间换算为 movie timescale 单位，取全局最大。
-func mehdDuration(st NormState, info *fmp4InitInfo) uint64 {
+func mehdDuration(n *normState, info *fmp4InitInfo) uint64 {
 	if info == nil || info.movieTS == 0 {
 		return 0
 	}
 	var max uint64
-	for ks, end := range st.endSnapshot() {
+	for ks, end := range n.endSnapshot() {
 		trackID, err := strconv.ParseUint(ks, 10, 32)
 		if err != nil {
 			continue
@@ -436,21 +436,59 @@ func (i *fmp4InitInfo) restore(p *persistFMP4InitInfo) {
 	}
 }
 
-// backfillDurations 任务完成后把各轨累计结束时间换算为总时长，写回文件：
-// mehd.fragment_duration（fMP4 标准总时长声明，播放器据此识别结束时间/支持拖动）
-// + mvhd.duration（兼容只读 mvhd 的播放器）。
-// init 段解析结果从规范化状态内获取（setInit 写入）；非 fMP4 / 无 init、
-// mehd、mvhd / 时长不可用时静默跳过。
-func backfillDurations(path string, st NormState) error {
-	ns, ok := st.(*normState)
-	if !ok || ns == nil {
-		return nil
+// ---- 状态方法（init 段消费与收尾；normalize/finish 内部调用）----
+
+// hasInit 是否已持有 init 段解析结果（consumeInit 幂等判断用）。
+func (n *normState) hasInit() bool {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	return n.init != nil
+}
+
+// consumeInit 消费一段可能的 init 段字节：补 mehd 占位、解析轨道类型与回填位置。
+// 已持有 init / 数据不含 moov 时原样返回（幂等：重放同一 init 不会重复插入）。
+func (n *normState) consumeInit(data []byte) []byte {
+	if n.hasInit() {
+		return data
 	}
-	info := ns.initInfo()
+	nd, info := prepareInit(data, true)
+	if len(info.trackVideo) > 0 {
+		n.mu.Lock()
+		n.trackVideo = info.trackVideo
+		n.mu.Unlock()
+	}
+	if info.mehdOff < 0 {
+		return data // 无 mvex/mehd 可回填（非 fMP4 init），不持有解析结果
+	}
+	n.mu.Lock()
+	n.init = info
+	n.mu.Unlock()
+	return nd
+}
+
+// Finish 任务完成/暂停收尾：把各轨累计结束时间回填为 mehd/mvhd 总时长
+// （无 init 解析结果时静默跳过，非 fMP4 容器不受影响）。
+// 实现 core.NormState 接口（方法名导出，供注册表跨包装配）。
+func (n *normState) Finish(path string) error {
+	n.mu.Lock()
+	info := n.init
+	n.mu.Unlock()
 	if info == nil {
 		return nil
 	}
-	dur := mehdDuration(st, info)
+	return backfillDurations(path, info, n)
+}
+
+// backfillDurations 任务完成后把各轨累计结束时间换算为总时长，写回文件：
+// mehd.fragment_duration（fMP4 标准总时长声明，播放器据此识别结束时间/支持拖动）
+// + mvhd.duration（兼容只读 mvhd 的播放器）。
+// init 段解析结果由调用方传入（来自 normState.finish）；无 mehd/mvhd 可写位置
+// 或时长不可用时静默跳过。
+func backfillDurations(path string, info *fmp4InitInfo, n *normState) error {
+	if info == nil {
+		return nil
+	}
+	dur := mehdDuration(n, info)
 	if dur == 0 {
 		return nil
 	}

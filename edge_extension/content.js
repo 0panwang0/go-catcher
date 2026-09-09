@@ -8,12 +8,23 @@
 
   const MIN_W = 200;
   const MIN_H = 120;
+  const BTN_GAP = 8; // 按钮与视频边缘的间距
+  const SRC_RECHECK_MS = 2000; // "暂无链接"视频的重复检查间隔（播放后嗅探需要时间）
   const SEGMENT_WINDOW_MS = 15000;
   const CONCURRENCY = 8;
   const MAX_RETRIES = 3;
 
   let currentBtn = null;
-  let currentVideo = null;
+  // currentTarget 悬停目标：{el, src, pageUrl}。
+  //   video 场景：本 frame 内的 video 元素，pageUrl = location.href
+  //   iframe 场景：跨域播放器 iframe（video 在 frame 内，本 frame 拿不到），
+  //     pageUrl = iframe.src —— 恰好等于后台嗅探记录的 frameUrl（发起请求的
+  //     frame 文档 URL），可直接按 frameUrl 匹配候选
+  let currentTarget = null;
+  let deniedEl = null; // 最近一次判定"暂无链接"的目标元素（节流重查用）
+  let deniedAt = 0;
+  let gateToken = 0; // 悬停检查令牌：仅最新一次悬停的结果生效
+  let gatePending = null; // 正在检查链接的目标元素
   let panel = null;
   let activeTaskId = null; // 多任务并发：本次下载的 server 任务 id，轮询用
   let activePaused = false; // 当前任务是否处于暂停态（控制按钮切换用）
@@ -67,12 +78,19 @@
 
   function onHover(e) {
     if (currentBtn && (e.target === currentBtn || currentBtn.contains(e.target))) return;
-    const video = findVideoAtPoint(e.clientX, e.clientY);
-    if (video) showButton(video);
+    // 按钮位于目标外部上方：光标在「目标矩形向上扩展的条带」内时保持按钮，
+    // 否则鼠标一离开目标边界按钮就会消失，根本来不及点
+    if (inButtonZone(e.clientX, e.clientY)) return;
+    const target = findMediaTargetAtPoint(e.clientX, e.clientY);
+    if (target) showButtonIfSniffed(target);
     else hideButton();
   }
 
-  function findVideoAtPoint(x, y) {
+  // findMediaTargetAtPoint 坐标处找可下载目标：优先 video 元素（本 frame 内，
+  // src 直链 + 分片目录信号都可用）；没有 video 再找大尺寸 iframe（跨域播放器，
+  // video 在 frame 内拿不到，但 iframe.src 就是后台记录的 frameUrl，可直接匹配）。
+  // 广告/统计类小 iframe 被尺寸门槛（MIN_W×MIN_H）挡掉。
+  function findMediaTargetAtPoint(x, y) {
     let stack = [];
     try {
       stack = document.elementsFromPoint(x, y) || [];
@@ -80,12 +98,23 @@
       return null;
     }
     for (const el of stack) {
-      if (!(el instanceof HTMLVideoElement)) continue;
+      if (el instanceof HTMLVideoElement) {
+        const rect = el.getBoundingClientRect();
+        if (rect.width < MIN_W || rect.height < MIN_H) continue;
+        const style = getComputedStyle(el);
+        if (style.display === "none" || style.visibility === "hidden") continue;
+        return { el, src: el.currentSrc || el.src || "", pageUrl: location.href };
+      }
+    }
+    for (const el of stack) {
+      if (!(el instanceof HTMLIFrameElement)) continue;
       const rect = el.getBoundingClientRect();
       if (rect.width < MIN_W || rect.height < MIN_H) continue;
       const style = getComputedStyle(el);
       if (style.display === "none" || style.visibility === "hidden") continue;
-      return el;
+      // 只认 http(s) 的 iframe（about:blank/javascript: 等无匹配价值）
+      if (!/^https?:/i.test(el.src || "")) continue;
+      return { el, src: "", pageUrl: el.src };
     }
     return null;
   }
@@ -97,10 +126,47 @@
   // ============================================================
   // 悬浮按钮
   // ============================================================
-  function showButton(video) {
-    if (currentVideo === video) return;
+  // showButtonIfSniffed 先确认已嗅探到该目标（video 或 iframe 播放器）的链接再
+  // 显示按钮：没有链接就不显示（而不是点了才报"暂未嗅探到该视频"）。
+  // 判定用 getVideoSource 的候选匹配（与列表数据同源于同站嗅探记录）：
+  //   video  → pageUrl = 本 frame URL（含跨域解析页 frame 内直接命中）
+  //   iframe → pageUrl = iframe.src（顶层 frame，匹配后台记录的 frameUrl）
+  async function showButtonIfSniffed(target) {
+    if (currentTarget && currentTarget.el === target.el) return;
+    if (gatePending === target.el) return; // 同一目标的检查在途
+    if (deniedEl === target.el && Date.now() - deniedAt < SRC_RECHECK_MS) return;
+
+    const token = ++gateToken;
+    gatePending = target.el;
+    let found = false;
+    try {
+      if (chrome?.runtime?.id) {
+        const resp = await chrome.runtime.sendMessage({
+          type: "getVideoSource",
+          src: target.src,
+          pageUrl: target.pageUrl,
+          segmentDir: target.src ? recentSegmentDir() : "",
+          title: document.title || "",
+        });
+        found = !!(resp && resp.ok && resp.source);
+      }
+    } catch {
+      // 扩展上下文失效等异常：按无链接处理
+    }
+    if (gatePending === target.el) gatePending = null;
+    if (token !== gateToken) return; // 期间鼠标已移到别的目标
+    if (found) {
+      showButton(target);
+    } else {
+      deniedEl = target.el;
+      deniedAt = Date.now();
+    }
+  }
+
+  function showButton(target) {
+    if (currentTarget && currentTarget.el === target.el) return;
     hideButton();
-    currentVideo = video;
+    currentTarget = target;
 
     const btn = document.createElement("div");
     btn.className = "m3u8-catcher-btn";
@@ -111,27 +177,28 @@
       display: "flex",
       alignItems: "center",
       gap: "4px",
-      padding: "4px 10px",
-      background: "linear-gradient(180deg, #4caf50, #2e9e44)",
+      padding: "7px 13px",
+      background: "#3b82f6",
       color: "#fff",
-      fontSize: "12px",
+      fontSize: "12.5px",
       fontFamily: `"Segoe UI","Microsoft YaHei",sans-serif`,
       fontWeight: "600",
-      borderRadius: "3px",
+      borderRadius: "9px",
       boxShadow: "0 2px 6px rgba(0,0,0,0.3)",
       cursor: "pointer",
       userSelect: "none",
       lineHeight: "1.4",
       pointerEvents: "auto",
       whiteSpace: "nowrap",
+      transition: "filter .15s",
     });
 
-    btn.addEventListener("mouseenter", () => (btn.style.filter = "brightness(1.1)"));
+    btn.addEventListener("mouseenter", () => (btn.style.filter = "brightness(1.15)"));
     btn.addEventListener("mouseleave", () => (btn.style.filter = ""));
     btn.addEventListener("click", async (e) => {
       e.preventDefault();
       e.stopPropagation();
-      await onDownloadClick(video);
+      await onDownloadClick(target);
     });
 
     document.body.appendChild(btn);
@@ -144,18 +211,41 @@
       currentBtn.remove();
       currentBtn = null;
     }
-    currentVideo = null;
+    currentTarget = null;
   }
 
   function repositionButton() {
-    if (!currentBtn || !currentVideo) return;
-    const rect = currentVideo.getBoundingClientRect();
+    if (!currentBtn || !currentTarget) return;
+    const rect = currentTarget.el.getBoundingClientRect();
     if (rect.width === 0 || rect.height === 0) {
       hideButton();
       return;
     }
-    currentBtn.style.top = `${Math.max(rect.top, 0) + 8}px`;
-    currentBtn.style.left = `${Math.max(rect.left, 0) + 8}px`;
+    // 首选：视频左上角正上方（视频外部），不遮挡画面
+    const btnH = currentBtn.offsetHeight || 0;
+    const outsideTop = Math.max(rect.top, 0) - btnH - BTN_GAP;
+    if (outsideTop >= 0) {
+      currentBtn.style.top = `${outsideTop}px`;
+      currentBtn.style.left = `${Math.max(rect.left, 0)}px`;
+      return;
+    }
+    // 上方空间不足（视频贴近视口顶端）：回退到视频内部左上角
+    currentBtn.style.top = `${Math.max(rect.top, 0) + BTN_GAP}px`;
+    currentBtn.style.left = `${Math.max(rect.left, 0) + BTN_GAP}px`;
+  }
+
+  // inButtonZone 光标是否处于「目标矩形向上扩展一个按钮高度的条带」内。
+  // 按钮放在目标外部上方后，这是鼠标从目标移到按钮的必经之路。
+  function inButtonZone(x, y) {
+    if (!currentBtn || !currentTarget) return false;
+    const rect = currentTarget.el.getBoundingClientRect();
+    const btnH = currentBtn.offsetHeight || 0;
+    return (
+      x >= rect.left - BTN_GAP &&
+      x <= rect.right + BTN_GAP &&
+      y >= rect.top - btnH - BTN_GAP * 2 &&
+      y <= rect.bottom + BTN_GAP
+    );
   }
 
   window.addEventListener("scroll", repositionButton, true);
@@ -164,12 +254,10 @@
   // ============================================================
   // 点击下载：只分析"这个视频"
   // ============================================================
-  async function onDownloadClick(video) {
+  async function onDownloadClick(target) {
     if (analyzing) return;
     analyzing = true;
     showPanel("loading");
-
-    let source = null; // hoisted: try/catch 是不同的块作用域，catch 里要读 source
 
     // Defensive: Extension context can be invalidated if user reloaded the
     // extension while this page is already open. Detect and bail with a
@@ -188,39 +276,41 @@
     }
 
     try {
-      const src = video.currentSrc || video.src || "";
-      const pageUrl = location.href;
-      const segmentDir = recentSegmentDir();
+      const src = target.src;
+      const pageUrl = target.pageUrl;
 
+      // IDM 式：取"该视频"的全部候选链接，再在页面主世界解析出各画质/格式
       const resp = await chrome.runtime.sendMessage({
-        type: "getVideoSource",
+        type: "getVideoSources",
         src,
         pageUrl,
-        segmentDir,
-        title: document.title || "",
       });
-
-      if (!resp || !resp.ok || !resp.source) {
-        showPanel("error", resp && resp.error ? resp.error : "未能识别该视频，请先播放一会儿再试。");
+      if (!resp || !resp.ok || !Array.isArray(resp.sources) || !resp.sources.length) {
+        showPanel("error", (resp && resp.error) || "未能识别该视频，请先播放一会儿再试。");
         return;
       }
 
-      source = resp.source;
-
-      if (source.variants && source.variants.length > 1) {
-        renderVariantsPanel(source);
+      // iframe 场景拿不到 frame 内的 video 元素，画质特征匹配自动跳过
+      const el = target.src ? target.el : null;
+      const options = await expandVideoOptions(resp.sources, pageUrl, el);
+      if (!options.length) {
+        showPanel("error", "候选链接均无法解析（可能被 CDN 阻断），请稍后重试。");
         return;
       }
 
-      // 单画质：直接进确认面板
-      renderConfirmPanel(source);
+      // 单链接直接确认面板；多链接展示 IDM 式列表
+      if (options.length === 1) {
+        renderConfirmPanel(options[0]);
+      } else {
+        renderLinksPanel(options);
+      }
     } catch (e) {
       console.error("M3U8 Video Catcher analyze error:", e);
       showPanel("error", {
         message: String(e && e.message ? e.message : e),
-        m3u8Url: source && source.url ? source.url : "",
-        pageUrl: source && source.pageUrl ? source.pageUrl : location.href,
-        title: (source && source.title) || document.title || "",
+        m3u8Url: "",
+        pageUrl: location.href,
+        title: document.title || "",
       });
     } finally {
       analyzing = false;
@@ -238,11 +328,59 @@
     }
   }
 
+  // activeSegmentDirs 取最近 SEGMENT_WINDOW_MS 内仍在拉分片的流目录集合（去重，上限 20）。
+  // 主播放器持续拉分片 → 其目录在集合内，作为"正在播放的流"的强信号。
+  function activeSegmentDirs() {
+    try {
+      const now = performance.now();
+      const entries = performance.getEntriesByType("resource");
+      const isPageAsset = /\.(m3u8|css|js|mjs|png|gif|webp|svg|ico|woff2?|ttf|json|html?|txt|xml)(\?|#|$)/i;
+      const dirs = new Set();
+      for (const e of entries) {
+        if (!/^https?:/i.test(e.name)) continue;
+        if (isPageAsset.test(e.name)) continue;
+        if (now - e.startTime > SEGMENT_WINDOW_MS) continue;
+        const m = e.name.match(/^(https?:\/\/[^?#]*\/)/);
+        if (m) dirs.add(m[1]);
+      }
+      return [...dirs].slice(0, 20);
+    } catch {
+      return [];
+    }
+  }
+
+  // recentSegmentDir 最近一条分片请求的目录（悬停门控的单选优先信号）。
   function recentSegmentDir() {
     try {
       const now = performance.now();
       const entries = performance.getEntriesByType("resource");
       const isPageAsset = /\.(m3u8|css|js|mjs|png|gif|webp|svg|ico|woff2?|ttf|json|html?|txt|xml)(\?|#|$)/i;
+      let latest = null;
+      for (const e of entries) {
+        if (!/^https?:/i.test(e.name)) continue;
+        if (isPageAsset.test(e.name)) continue;
+        if (now - e.startTime > SEGMENT_WINDOW_MS) continue;
+        if (!latest || e.startTime > latest.startTime) latest = e;
+      }
+      if (!latest) return "";
+      const m = latest.name.match(/^(https?:\/\/[^?#]*\/)/);
+      return m ? m[1] : "";
+    } catch {
+      return "";
+    }
+  }
+
+  // latestMediaDir 最近 SEGMENT_WINDOW_MS 内**最新一条**媒体请求的目录
+  //（分片 .ts/.m4s/.flv 或 .m3u8 均算——B 站直播的变体 playlist 持续刷新且与
+  // 分片同目录，刷新请求本身也是"当前流"的可靠信号）。
+  // 与 activeSegmentDirs 的区别：旧流切走后的"余波"请求（B 站切直播间时旧流
+  // 会再拉几秒）落在活跃集合里会让旧流误判为正在播放；最新一条一定是
+  // 当前正在播放的流。
+  function latestMediaDir() {
+    try {
+      const now = performance.now();
+      const entries = performance.getEntriesByType("resource");
+      const isPageAsset = /\.(css|js|mjs|png|gif|webp|svg|ico|woff2?|ttf|json|html?|txt|xml)(\?|#|$)/i;
       let latest = null;
       for (const e of entries) {
         if (!/^https?:/i.test(e.name)) continue;
@@ -329,6 +467,281 @@
     if (resolution) parts.push(resolution);
     if (bandwidth) parts.push(`${(bandwidth / 1000).toFixed(0)} kbps`);
     return parts.join(" · ");
+  }
+
+  function qualityFromURL(url) {
+    const m = String(url).match(/(2160p|1440p|1080p|720p|480p|360p|240p)/i);
+    return m ? m[1].toUpperCase() : "";
+  }
+
+  function qualityRank(q) {
+    return (
+      {
+        "4K": 8,
+        "2K": 7,
+        "1080P": 6,
+        "720P": 5,
+        "480P": 4,
+        "360P": 3,
+        "240P": 2,
+      }[String(q).toUpperCase()] || 0
+    );
+  }
+
+  // ============================================================
+  // IDM 式候选展开：全部候选 → 每个可下载的画质/格式选项
+  // master m3u8 展开为各变体；媒体 playlist 补时长/分片数；mp4 透传。
+  // 列表限定"悬停的那个视频"：src 直链隔离 → 分辨率/时长特征匹配 →
+  // 活跃分片目录过滤，逐级空回退（宁多勿漏）。
+  // playlist 解析优先走本地 Go 服务 /probe（服务端带 Referer），
+  // 服务未启动时回退页面主世界 fetch。
+  // ============================================================
+  async function expandVideoOptions(candidates, pageUrl, video) {
+    const fallbackTitle = document.title || "";
+    // 预检优先走本地 Go 服务 /probe：浏览器对无 CORS 头的 CDN 只能拿到 opaque
+    // 空响应（"未预检"的根源），服务端带 Referer 直连（uTLS 指纹）能拿到。
+    // 本地服务未启动时回退页面主世界 fetch。
+    let serverBase = null;
+    try {
+      const cfg = await chrome.storage.local.get({ port: 7891 });
+      serverBase = `http://127.0.0.1:${cfg.port || 7891}`;
+    } catch {
+      serverBase = null;
+    }
+    const probeFetch = async (url) => {
+      if (!serverBase) return null;
+      try {
+        const resp = await fetch(
+          `${serverBase}/probe?url=${encodeURIComponent(url)}&referer=${encodeURIComponent(pageUrl)}`
+        );
+        if (!resp.ok) return null;
+        return (await resp.text()) || null;
+      } catch {
+        return null;
+      }
+    };
+    const textCache = new Map(); // url → playlist 文本（null = 拉取失败）
+    const fetchPlaylist = async (url) => {
+      if (!textCache.has(url)) {
+        let text = await probeFetch(url);
+        if (text == null) {
+          try {
+            text = await pageFetch(url, "text");
+          } catch {
+            text = null;
+          }
+        }
+        textCache.set(url, text);
+      }
+      return textCache.get(url);
+    };
+
+    // url → ts 选项元数据；group 标识"同一视频"（master 的全部变体同组）。
+    // 嗅探到的变体与 master 展开的变体在此去重合并
+    const tsMeta = new Map();
+    const mp4Options = [];
+    for (const c of candidates) {
+      if (c.type === "mp4") {
+        if (!mp4Options.some((o) => o.url === c.url)) {
+          mp4Options.push({
+            type: "mp4",
+            url: c.url,
+            title: c.title || fallbackTitle,
+            pageUrl: c.pageUrl || pageUrl,
+            quality: qualityFromURL(c.url),
+            size: c.size || 0,
+            group: c.url,
+            fromSrc: !!c.fromSrc,
+          });
+        }
+        continue;
+      }
+      if (!tsMeta.has(c.url)) {
+        tsMeta.set(c.url, {
+          type: "ts",
+          url: c.url,
+          title: c.title || fallbackTitle,
+          pageUrl: c.pageUrl || pageUrl,
+          quality: qualityFromURL(c.url),
+          resolution: "",
+          bandwidth: 0,
+          group: c.url,
+        });
+      }
+    }
+
+    // master playlist → 用变体条目替代 master 本身（master 不可直接下载）
+    await Promise.all(
+      [...tsMeta.entries()].map(async ([url, meta]) => {
+        const text = await fetchPlaylist(url);
+        if (!text || !text.includes("#EXT-X-STREAM-INF")) return;
+        const variants = parseVariants(text, url);
+        if (!variants.length) return;
+        for (const v of variants) {
+          const existing = tsMeta.get(v.url);
+          if (existing) {
+            existing.quality = v.quality;
+            existing.resolution = v.resolution;
+            existing.bandwidth = v.bandwidth;
+            existing.group = url; // 独立嗅探的变体并入 master 的组
+          } else {
+            tsMeta.set(v.url, {
+              type: "ts",
+              url: v.url,
+              title: meta.title,
+              pageUrl: meta.pageUrl,
+              quality: v.quality,
+              resolution: v.resolution,
+              bandwidth: v.bandwidth,
+              group: url,
+            });
+          }
+        }
+        tsMeta.delete(url);
+      })
+    );
+
+    // 悬停视频自带 http src 时，其余 mp4 是页面上其他视频（推荐流卡片）的
+    // 嗅探条目——全部剔除，列表只保留选中视频（IDM 同行为）
+    const videoSrc = video ? String(video.currentSrc || video.src || "") : "";
+    if (/^https?:/i.test(videoSrc)) {
+      for (let i = mp4Options.length - 1; i >= 0; i--) {
+        if (!mp4Options[i].fromSrc) mp4Options.splice(i, 1);
+      }
+    }
+
+    // 每个媒体 playlist 补时长与分片数（预检提前到过滤前，过滤要用时长信号）。
+    // 预检失败（页面 fetch 被 CDN 防盗链拦截）不代表下载失败——本地 Go 服务
+    // 下载时带 Referer 仍可能成功，所以条目保留，仅标记"未预检"。
+    const tsOptions = await Promise.all(
+      [...tsMeta.values()].map(async (m) => {
+        const text = await fetchPlaylist(m.url);
+        if (!text) return { ...m, duration: 0, segments: 0, live: false, unchecked: true };
+        let duration = 0;
+        let segments = 0;
+        let live = false;
+        if (!text.includes("#EXT-X-STREAM-INF")) {
+          duration = parseDuration(text);
+          segments = parseSegments(text, m.url).length;
+          live = !text.includes("#EXT-X-ENDLIST");
+        }
+        return { ...m, duration, segments, live };
+      })
+    );
+
+    // 悬停视频自身的特征匹配：解码分辨率对应变体 RESOLUTION、video.duration
+    // 对应 playlist 总时长（直播 duration=Infinity 跳过）。命中组即"选中视频"，
+    // 两个信号都有时取交集（交集空退并集），剔光回退——宁多勿漏。
+    const wantW = video ? video.videoWidth || 0 : 0;
+    const wantH = video ? video.videoHeight || 0 : 0;
+    const wantDur = video && isFinite(video.duration) ? video.duration : 0;
+    if (wantW || wantDur) {
+      const resGroups = new Set();
+      if (wantW && wantH) {
+        for (const m of tsOptions) {
+          const [w, h] = String(m.resolution || "").split("x").map(Number);
+          if (w === wantW && h === wantH) resGroups.add(m.group);
+        }
+      }
+      const durGroups = new Set();
+      if (wantDur) {
+        for (const m of tsOptions) {
+          if (m.duration && Math.abs(m.duration - wantDur) <= 3) durGroups.add(m.group);
+        }
+      }
+      let featureGroups = null;
+      if (resGroups.size && durGroups.size) {
+        featureGroups = new Set([...resGroups].filter((g) => durGroups.has(g)));
+        if (!featureGroups.size) featureGroups = new Set([...resGroups, ...durGroups]);
+      } else if (resGroups.size) featureGroups = resGroups;
+      else if (durGroups.size) featureGroups = durGroups;
+      if (featureGroups) {
+        const backupTS = tsOptions.slice();
+        const backupMP4 = mp4Options.slice();
+        for (let i = tsOptions.length - 1; i >= 0; i--) {
+          if (!featureGroups.has(tsOptions[i].group)) tsOptions.splice(i, 1);
+        }
+        for (let i = mp4Options.length - 1; i >= 0; i--) {
+          if (!mp4Options[i].fromSrc && !featureGroups.has(mp4Options[i].group)) {
+            mp4Options.splice(i, 1);
+          }
+        }
+        if (!tsOptions.length && !mp4Options.length) {
+          tsOptions.push(...backupTS);
+          mp4Options.push(...backupMP4);
+        }
+      }
+    }
+
+    // 只保留"正在播放的流"，三级严格→宽松→全集（每级剔光即回退）：
+    // 1. 最新媒体目录严格匹配：真正在播放的流必然刚拉过 .ts/.m3u8/.flv，
+    //    旧流切走后的余波请求（B 站切直播间旧流再拉几秒）目录更旧，被挤掉。
+    // 2. 全部活跃目录宽松匹配：最新目录与候选 URL 前缀不一致（CDN 目录分属
+    //    不同路径层级）或暂停播放时兜底。
+    // 3. 无任何活跃信号（暂停）回退全集，宁多勿漏。
+    const applyKeep = (groups) => {
+      const backupTS = tsOptions.slice();
+      const backupMP4 = mp4Options.slice();
+      for (let i = tsOptions.length - 1; i >= 0; i--) {
+        if (!groups.has(tsOptions[i].group)) tsOptions.splice(i, 1);
+      }
+      for (let i = mp4Options.length - 1; i >= 0; i--) {
+        // video 元素自身的 src 直链必属于选中视频，豁免过滤
+        if (!mp4Options[i].fromSrc && !groups.has(mp4Options[i].group)) {
+          mp4Options.splice(i, 1);
+        }
+      }
+      if (!tsOptions.length && !mp4Options.length) {
+        tsOptions.push(...backupTS);
+        mp4Options.push(...backupMP4);
+        return false;
+      }
+      return true;
+    };
+
+    const latestDir = latestMediaDir();
+    if (latestDir) {
+      const latestGroups = new Set();
+      for (const m of tsOptions) {
+        if (m.url.startsWith(latestDir)) latestGroups.add(m.group);
+      }
+      for (const o of mp4Options) {
+        if (o.url.startsWith(latestDir)) latestGroups.add(o.group);
+      }
+      if (latestGroups.size) applyKeep(latestGroups);
+    }
+
+    const activeDirs = activeSegmentDirs();
+    if (activeDirs.length) {
+      const isActiveURL = (url) => activeDirs.some((d) => url.startsWith(d));
+      const activeGroups = new Set();
+      for (const m of tsOptions) {
+        if (isActiveURL(m.url)) activeGroups.add(m.group);
+      }
+      for (const o of mp4Options) {
+        if (isActiveURL(o.url)) activeGroups.add(o.group);
+      }
+      if (activeGroups.size) applyKeep(activeGroups);
+    }
+
+    const options = [...tsOptions, ...mp4Options];
+    // 组聚拢：同一视频（组）的条目相邻展示；
+    // 组内直播优先，TS 次之，画质高→低，未预检垫底
+    const groupOrder = new Map();
+    options.forEach((o) => {
+      if (!groupOrder.has(o.group)) groupOrder.set(o.group, groupOrder.size);
+    });
+    options.sort((a, b) => {
+      const gd = groupOrder.get(a.group) - groupOrder.get(b.group);
+      if (gd) return gd;
+      if (!!a.unchecked !== !!b.unchecked) return a.unchecked ? 1 : -1;
+      if (!!a.live !== !!b.live) return a.live ? -1 : 1;
+      if (a.type !== b.type) return a.type === "ts" ? -1 : 1;
+      const rank = qualityRank(a.quality) - qualityRank(b.quality);
+      if (rank) return -rank;
+      return (b.bandwidth || 0) - (a.bandwidth || 0) || (b.duration || 0) - (a.duration || 0);
+    });
+    return options;
   }
 
   // ============================================================
@@ -610,8 +1023,8 @@
            <div style="background:#1f2937;color:#e5e7eb;padding:12px;border-radius:6px;font-family:Menlo,Consolas,monospace;font-size:12px;line-height:1.6;word-break:break-all;white-space:pre-wrap;" id="go-cmd-text">${escapeHtml(goCmd)}</div>
            <div style="margin-top:6px;color:#9ca3af;font-size:11.5px;line-height:1.5;">exe 路径由本地服务运行时自动检测；显示为裸文件名时，先打开一次 GoCatcher 客户端即可，或在扩展设置里手动配置。</div>
            <div style="margin-top:10px;display:flex;gap:8px;align-items:center;">
-             <button id="copy-go-cmd" style="padding:6px 14px;font-size:13px;border:none;background:#1652f0;color:#fff;border-radius:4px;cursor:pointer;font-weight:600;">复制命令</button>
-             <span id="copy-feedback" style="color:#10b981;font-size:12px;display:none;">✓ 已复制到剪贴板</span>
+             <button id="copy-go-cmd" style="padding:6px 14px;font-size:13px;border:none;background:#3b82f6;color:#fff;border-radius:4px;cursor:pointer;font-weight:600;">复制命令</button>
+             <span id="copy-feedback" style="color:#22c55e;font-size:12px;display:none;">✓ 已复制到剪贴板</span>
            </div>
          </div>`
       );
@@ -637,7 +1050,7 @@
         `<div style="padding:24px 28px;">
           <div id="m3u8-catcher-progress-text" style="margin-bottom:12px;color:#374151;font-size:13px;">${escapeHtml(p.text || "准备中…")}</div>
           <div style="width:100%;height:8px;background:#e5e7eb;border-radius:4px;overflow:hidden;">
-            <div id="m3u8-catcher-progress-fill" style="width:0%;height:100%;background:#1652f0;transition:width .2s;"></div>
+            <div id="m3u8-catcher-progress-fill" style="width:0%;height:100%;background:#3b82f6;transition:width .2s;"></div>
           </div>
           <div id="m3u8-catcher-progress-cancel" style="margin-top:14px;text-align:right;">
             <button style="padding:4px 12px;font-size:12px;border:1px solid #d1d5db;background:#fff;border-radius:4px;cursor:pointer;">取消</button>
@@ -657,7 +1070,7 @@
         "下载该视频",
         `<div style="padding:36px 28px;text-align:center;">
           <div style="font-size:14px;color:#374151;margin-bottom:14px;">正在准备…</div>
-          <div style="display:inline-block;width:14px;height:14px;border:2px solid #1652f0;border-right-color:transparent;border-radius:50%;animation:m3u8spin 0.8s linear infinite;"></div>
+          <div style="display:inline-block;width:14px;height:14px;border:2px solid #3b82f6;border-right-color:transparent;border-radius:50%;animation:m3u8spin 0.8s linear infinite;"></div>
           <div style="margin-top:16px;font-size:12px;color:#6b7280;">即将弹出文件夹选择框，请选择保存位置</div>
         </div>
         <style>@keyframes m3u8spin { to { transform: rotate(360deg); } }</style>`
@@ -669,14 +1082,14 @@
       panel.innerHTML = panelShell(
         "下载该视频",
         `<div style="padding:22px 28px;">
-          <div style="color:#10b981;font-weight:600;font-size:14px;margin-bottom:10px;">✓ 已开始下载，由本地 Go 服务保存到所选文件夹</div>
+          <div style="color:#22c55e;font-weight:600;font-size:14px;margin-bottom:10px;">✓ 已开始下载，由本地 Go 服务保存到所选文件夹</div>
           ${dir ? `<div style="font-size:12px;color:#6b7280;margin-bottom:12px;word-break:break-all;">保存位置：${escapeHtml(dir)}</div>` : ""}
           <div style="background:#f3f4f6;padding:8px 10px;border-radius:4px;font-size:12px;color:#374151;margin-bottom:14px;">
             文件：<code style="font-family:Menlo,Consolas,monospace;">${escapeHtml(fn)}</code>
           </div>
           <div id="initiated-progress-text" style="margin-bottom:10px;color:#374151;font-size:13px;">正在连接本地 Go 服务…</div>
           <div style="width:100%;height:8px;background:#e5e7eb;border-radius:4px;overflow:hidden;">
-            <div id="initiated-progress-fill" style="width:0%;height:100%;background:#10b981;transition:width .2s;"></div>
+            <div id="initiated-progress-fill" style="width:0%;height:100%;background:#3b82f6;transition:width .2s;"></div>
           </div>
           <div id="initiated-controls" style="margin-top:14px;display:flex;gap:8px;align-items:center;justify-content:flex-end;"></div>
           <div style="margin-top:8px;font-size:11px;color:#9ca3af;">下载过程不经过浏览器下载栏，可在此暂停/继续或取消。</div>
@@ -688,10 +1101,10 @@
         "下载该视频",
         `<div style="padding:32px 28px;text-align:center;">
           <div style="font-size:32px;margin-bottom:10px;">🎉</div>
-          <div style="color:#10b981;font-weight:600;font-size:16px;margin-bottom:8px;">下载完成</div>
+          <div style="color:#22c55e;font-weight:600;font-size:16px;margin-bottom:8px;">下载完成</div>
           <div style="font-size:13px;color:#374151;margin-bottom:6px;">文件名：<code style="background:#f3f4f6;padding:2px 6px;border-radius:3px;font-family:Menlo,Consolas,monospace;">${escapeHtml(fn)}</code></div>
           ${payload && payload.finalPath ? `<div style="font-size:12px;color:#6b7280;margin-bottom:14px;word-break:break-all;">位置：${escapeHtml(payload.finalPath)}</div>` : ""}
-          <button id="completed-close" style="margin-top:10px;padding:8px 20px;font-size:13px;border:none;background:#1652f0;color:#fff;border-radius:5px;cursor:pointer;">完成</button>
+          <button id="completed-close" style="margin-top:10px;padding:8px 20px;font-size:13px;border:none;background:#3b82f6;color:#fff;border-radius:5px;cursor:pointer;">完成</button>
         </div>`
       );
       const doneBtn = panel.querySelector("#completed-close");
@@ -725,6 +1138,82 @@
     el.style.width = `${Math.max(0, Math.min(1, ratio)) * 100}%`;
   }
 
+  // ============================================================
+  // IDM 式链接列表面板：多候选时列出全部可选链接（格式/画质/码率/时长）
+  // ============================================================
+  function optionMeta(o) {
+    const parts = [];
+    if (o.unchecked) parts.push("未预检");
+    if (o.live) parts.push("直播");
+    if (o.quality) parts.push(o.quality);
+    if (o.resolution) parts.push(o.resolution);
+    if (o.bandwidth) parts.push(`${(o.bandwidth / 1000).toFixed(0)} kbps`);
+    if (o.duration) parts.push(`时长 ${fmtDur(o.duration)}`);
+    else if (o.type === "ts" && o.segments) parts.push(`${o.segments} 分片`);
+    if (o.size) {
+      parts.push(`${(o.size / 1024 / 1024).toFixed(1)} MB`);
+    } else if (o.bandwidth && o.duration) {
+      // 变体码率 × 时长估算流量（bps × s / 8 = 字节）
+      parts.push(`≈${((o.bandwidth * o.duration) / 8 / 1024 / 1024).toFixed(1)} MB`);
+    }
+    return parts.join(" · ") || "无附加信息";
+  }
+
+  // optionURLLabel：host + 路径（长路径中间省略），帮助用户区分不同 CDN/线路。
+  function optionURLLabel(url) {
+    try {
+      const u = new URL(url);
+      let path = u.pathname;
+      try {
+        path = decodeURIComponent(path);
+      } catch {
+        /* 保留原样 */
+      }
+      if (path.length > 40) path = path.slice(0, 19) + "…" + path.slice(-19);
+      return u.hostname + path;
+    } catch {
+      return url.length > 72 ? url.slice(0, 34) + "…" + url.slice(-34) : url;
+    }
+  }
+
+  function renderLinksPanel(options) {
+    if (!panel) createPanel();
+
+    const rows = options
+      .map(
+        (o, idx) => `
+        <div class="m3u8-catcher-row" data-idx="${idx}" style="display:flex;align-items:center;padding:10px 14px;border-bottom:1px solid #f3f4f6;cursor:pointer;${o.unchecked ? "opacity:0.55;" : ""}">
+          <div style="flex:none;width:44px;margin-right:12px;padding:3px 0;text-align:center;border-radius:4px;font-size:11px;font-weight:700;color:#fff;background:${o.type === "ts" ? "#3b82f6" : "#64748b"};">${o.type === "ts" ? "TS" : "MP4"}</div>
+          <div style="flex:1;min-width:0;">
+            <div style="font-size:13.5px;color:#111;font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${escapeHtml(o.title || "(无标题)")}</div>
+            <div style="font-size:11px;color:#9ca3af;margin-top:2px;">${escapeHtml(optionMeta(o))}</div>
+            <div style="font-size:10.5px;color:#c3cad4;margin-top:1px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${escapeHtml(optionURLLabel(o.url))}</div>
+          </div>
+          <div style="margin-left:10px;padding:4px 10px;background:#3b82f6;color:#fff;font-size:12px;border-radius:4px;font-weight:600;">下载</div>
+        </div>`
+      )
+      .join("");
+
+    panel.innerHTML = panelShell(
+      `下载该视频 - ${escapeHtml(options[0].title || document.title || "")}`,
+      `<div style="overflow-y:auto;max-height:60vh;">${rows}</div>
+       <div style="padding:12px 18px;border-top:1px solid #e5e7eb;background:#f8f9fb;color:#6b7280;font-size:12px;">共 ${options.length} 个链接，点击任一行选择该画质下载。</div>`
+    );
+
+    bindClose();
+    panel.querySelectorAll(".m3u8-catcher-row").forEach((row) => {
+      row.addEventListener("mouseenter", () => (row.style.background = "#f0f7ff"));
+      row.addEventListener("mouseleave", () => (row.style.background = "transparent"));
+      row.addEventListener("click", () => {
+        const o = options[parseInt(row.dataset.idx, 10)];
+        if (o) {
+          // 选中链接 → 进入确认面板核验 URL，再触发下载
+          renderConfirmPanel(o);
+        }
+      });
+    });
+  }
+
   function renderVariantsPanel(source) {
     if (!panel) createPanel();
 
@@ -736,7 +1225,7 @@
             <div style="font-size:14px;color:#111;font-weight:600;">${escapeHtml(v.label)}</div>
             <div style="font-size:11px;color:#9ca3af;margin-top:2px;">${escapeHtml(v.codec)}</div>
           </div>
-          <div style="margin-left:10px;padding:4px 10px;background:#1652f0;color:#fff;font-size:12px;border-radius:4px;font-weight:600;">下载</div>
+          <div style="margin-left:10px;padding:4px 10px;background:#3b82f6;color:#fff;font-size:12px;border-radius:4px;font-weight:600;">下载</div>
         </div>
       `;
       })
@@ -797,7 +1286,7 @@
           <div style="font-size:12px;color:#6b7280;margin-bottom:3px;">资源链接</div>
           <div style="background:#f3f4f6;padding:10px;border-radius:4px;font-family:Menlo,Consolas,monospace;font-size:11px;line-height:1.5;word-break:break-all;max-height:90px;overflow-y:auto;color:#1f2937;">${escapeHtml(url)}</div>
           <button id="confirm-copy-url" style="margin-top:6px;padding:5px 12px;font-size:12px;border:1px solid #d1d5db;background:#fff;border-radius:4px;cursor:pointer;color:#374151;">📋 复制链接</button>
-          <span id="confirm-copy-feedback" style="margin-left:8px;color:#10b981;font-size:12px;display:none;">✓ 已复制</span>
+          <span id="confirm-copy-feedback" style="margin-left:8px;color:#22c55e;font-size:12px;display:none;">✓ 已复制</span>
         </div>
 
         <div style="margin-bottom:18px;">
@@ -808,7 +1297,7 @@
 
         <div style="display:flex;gap:10px;">
           <button id="confirm-cancel" style="flex:1;padding:11px;border:1px solid #d1d5db;background:#fff;border-radius:5px;cursor:pointer;font-size:14px;color:#374151;">取消</button>
-          <button id="confirm-go" style="flex:2;padding:11px;border:none;background:#10b981;color:#fff;border-radius:5px;cursor:pointer;font-size:14px;font-weight:600;">⬇ 确认下载</button>
+          <button id="confirm-go" style="flex:2;padding:11px;border:none;background:#3b82f6;color:#fff;border-radius:5px;cursor:pointer;font-size:14px;font-weight:600;">⬇ 确认下载</button>
         </div>
 
         <div style="margin-top:14px;padding:10px 12px;background:#f0f9ff;border-radius:5px;font-size:12px;color:#0c4a6e;line-height:1.5;">
@@ -947,7 +1436,7 @@
     if (!wrap) return;
     if (activePaused) {
       wrap.innerHTML =
-        '<button data-ctl="resume" style="padding:6px 16px;font-size:13px;border:none;background:#10b981;color:#fff;border-radius:5px;cursor:pointer;font-weight:600;">▶ 继续下载</button>' +
+        '<button data-ctl="resume" style="padding:6px 16px;font-size:13px;border:none;background:#3b82f6;color:#fff;border-radius:5px;cursor:pointer;font-weight:600;">▶ 继续下载</button>' +
         '<button data-ctl="cancel" style="padding:6px 16px;font-size:13px;border:1px solid #e5e7eb;background:#fff;color:#374151;border-radius:5px;cursor:pointer;">✕ 取消</button>';
     } else {
       wrap.innerHTML =

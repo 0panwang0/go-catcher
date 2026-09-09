@@ -6,8 +6,10 @@ package core
 import (
 	"context"
 	"encoding/json"
+	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 )
 
@@ -108,6 +110,7 @@ type appConfig struct {
 	MaxRetries     int    `json:"maxRetries"`     // 分片/HTTP 失败重试次数
 	Port           int    `json:"port"`           // 服务监听端口（改后需重启服务生效）
 	UIView         string `json:"uiView"`         // 监控页任务列表详略：detail=卡片 / compact=单行（纯展示偏好，无运行时影响）
+	Proxy          string `json:"proxy"`          // system=跟随系统代理（默认）；http://host:port 手动；direct/none/off = 直连
 }
 
 func defaultConfig() appConfig {
@@ -117,6 +120,7 @@ func defaultConfig() appConfig {
 		MaxRetries:     3,
 		Port:           DefaultPort,
 		UIView:         "detail",
+		Proxy:          "system", // 跟随 Windows 系统代理（Clash 等开箱即用），与包级默认一致
 	}
 }
 
@@ -158,6 +162,14 @@ func loadConfig() {
 			if fileC.UIView != "compact" {
 				fileC.UIView = c.UIView
 			}
+			// proxy：空串 = 旧配置文件没有该字段，回退默认（与端口同理）；
+			// system / direct 关键字或 http://host:port 之外的非法值也回退默认
+			fileC.Proxy = strings.TrimSpace(fileC.Proxy)
+			if strings.EqualFold(fileC.Proxy, "system") {
+				fileC.Proxy = "system"
+			} else if fileC.Proxy == "" || (!isDirectStr(fileC.Proxy) && !validProxyAddr(fileC.Proxy)) {
+				fileC.Proxy = c.Proxy
+			}
 			c = fileC
 		}
 	}
@@ -179,11 +191,19 @@ func clamp(v *int, lo, hi int) bool {
 	return ok
 }
 
+// validProxyAddr 校验代理地址：仅支持 http://host[:port]（dialTLSContext 走
+// HTTP CONNECT 隧道，socks5/https 代理无法工作）。
+func validProxyAddr(p string) bool {
+	u, err := url.Parse(p)
+	return err == nil && u.Scheme == "http" && u.Host != ""
+}
+
 // applyConfigLocked 把 cfg 写入全局运行时变量（调用方须持 cfgMu）。
 func applyConfigLocked() {
 	limiter.setLimit(cfg.MaxConcurrent)
 	concurrency = cfg.SegConcurrency
 	maxRetries = cfg.MaxRetries
+	setProxyAddr(cfg.Proxy)
 }
 
 // saveConfig 把当前 cfg 原子写盘（调用方须持 cfgMu）。

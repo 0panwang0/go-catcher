@@ -2,21 +2,28 @@
 *.exe
 *.exe~
 
+# Windows 资源对象（make build 由 winres/ 自动生成）
+rsrc_windows_*.syso
+
 # 用户运行时数据（含任务历史、文件路径，不上传）
 gocatcher_config.json
 gocatcher_state.json
 client_run.log
+status.json
+*.tmp
 
 # Go 构建缓存
 *.test
 *.out
 *.test.exe
 *.test.log
+cover
 
 # IDE / 编辑器
 .idea/
 .vscode/
 .trae/
+.workbuddy/
 *.swp
 *.swo
 *~

@@ -1,5 +1,5 @@
 // fMP4 分片规范化测试：时间戳归一化 + 裸 NAL→AVCC。
-package core
+package fmp4
 
 import (
 	"bytes"
@@ -162,7 +162,7 @@ func collectMoofs(t *testing.T, data []byte) [][]byte {
 // TestNormalizeFMP4RawNAL 裸 NAL 分片：tfdt 归零 + NAL 转 AVCC + 样本表/尺寸重写。
 func TestNormalizeFMP4RawNAL(t *testing.T) {
 	seg := buildSegment(7792000, 7792128, true) // 直播已进行 7792 秒
-	st := newNormState()
+	st := NewState()
 	out, err := normalizeFMP4Segment(seg, st)
 	if err != nil {
 		t.Fatalf("normalize: %v", err)
@@ -219,7 +219,7 @@ func TestNormalizeFMP4RawNAL(t *testing.T) {
 	}
 
 	// 6. 基准已记录（视频 7792000 / 音频 7792128）
-	snap := st.snapshot()
+	snap := st.baselineStrings()
 	if snap["1"] != 7792000 || snap["2"] != 7792128 {
 		t.Fatalf("基准=%v", snap)
 	}
@@ -228,7 +228,7 @@ func TestNormalizeFMP4RawNAL(t *testing.T) {
 // TestNormalizeFMP4BaselineAcrossSegments 第二分片沿用同一基准，
 // 且基准可持久化/恢复（断点续传场景）。
 func TestNormalizeFMP4BaselineAcrossSegments(t *testing.T) {
-	st := newNormState()
+	st := NewState()
 	seg0 := buildSegment(7792000, 7792128, true)
 	if _, err := normalizeFMP4Segment(seg0, st); err != nil {
 		t.Fatalf("seg0: %v", err)
@@ -248,8 +248,8 @@ func TestNormalizeFMP4BaselineAcrossSegments(t *testing.T) {
 	}
 
 	// 模拟断点续传：持久化基准 → 新状态恢复 → 结果一致
-	st2 := newNormState()
-	st2.restore(st.snapshot())
+	st2 := NewState()
+	st2.Restore(st.Snapshot())
 	out2, err := normalizeFMP4Segment(seg1, st2)
 	if err != nil {
 		t.Fatalf("restore 后 normalize: %v", err)
@@ -264,7 +264,7 @@ func TestNormalizeFMP4BaselineAcrossSegments(t *testing.T) {
 // TestNormalizeFMP4AVCCPassthrough 已是 AVCC 的样本不被改动，仅时间戳归一化。
 func TestNormalizeFMP4AVCCPassthrough(t *testing.T) {
 	seg := buildSegment(2000, 2012, false)
-	st := newNormState()
+	st := NewState()
 	out, err := normalizeFMP4Segment(seg, st)
 	if err != nil {
 		t.Fatal(err)
@@ -286,7 +286,7 @@ func TestNormalizeFMP4AVCCPassthrough(t *testing.T) {
 // 每个样本补 4 字节长度前缀转为 AVCC。
 func TestNormalizeFMP4BareNAL(t *testing.T) {
 	seg := buildSegmentBare(7792000, 7792128)
-	st := newNormState()
+	st := NewState()
 	out, err := normalizeFMP4Segment(seg, st)
 	if err != nil {
 		t.Fatal(err)
@@ -320,7 +320,7 @@ func TestNormalizeFMP4MixedNAL(t *testing.T) {
 	v0 := []byte{0, 0, 0, 1, 0x65, 0x11, 0x22, 0x33, 0, 0, 1, 0x67, 0xaa, 0xbb}
 	v1 := []byte{0x21, 0x44, 0x55, 0x66, 0x77}
 	seg := buildSegmentN(7792000, 7792128, v0, v1)
-	st := newNormState()
+	st := NewState()
 	out, err := normalizeFMP4Segment(seg, st)
 	if err != nil {
 		t.Fatal(err)
@@ -343,7 +343,7 @@ func TestNormalizeFMP4WholeFile(t *testing.T) {
 	seg1 := buildSegment(7792000+96000, 7792128+96000, true)
 	full := append(append(append([]byte{}, init...), seg0...), seg1...)
 
-	st := newNormState()
+	st := NewState()
 	out, err := normalizeFMP4Segment(full, st)
 	if err != nil {
 		t.Fatal(err)
@@ -367,7 +367,7 @@ func TestNormalizeFMP4Styp(t *testing.T) {
 	seg := buildSegment(5000, 5012, true)
 	full := append(append([]byte{}, styp...), seg...)
 
-	st := newNormState()
+	st := NewState()
 	out, err := normalizeFMP4Segment(full, st)
 	if err != nil {
 		t.Fatal(err)
@@ -384,7 +384,7 @@ func TestNormalizeFMP4Styp(t *testing.T) {
 
 // TestNormalizeFMP4Passthrough 非 fMP4 / 结构异常数据原样放行、不报错。
 func TestNormalizeFMP4Passthrough(t *testing.T) {
-	st := newNormState()
+	st := NewState()
 	cases := [][]byte{
 		nil,
 		[]byte("GENERIC-BINARY-NOT-MP4"),
@@ -408,7 +408,7 @@ func TestNormalizeFMP4Passthrough(t *testing.T) {
 // 旧版 classifySample 特征猜测会把整条音频轨加上 4 字节长度前缀 → 声音断续。
 func TestNormalizeFMP4AudioUntouched(t *testing.T) {
 	init := buildInit(1000, map[uint32]uint32{1: 90000, 2: 48000})
-	st := newNormState()
+	st := NewState()
 	if _, err := normalizeFMP4Segment(init, st); err != nil {
 		t.Fatal(err)
 	}
@@ -448,8 +448,9 @@ func TestNormalizeFMP4AudioUntouched(t *testing.T) {
 }
 
 // TestNormalizeRealFile 用真实录制的 fMP4 文件验证规范化。
-// 手动运行：GOCATCHER_SAMPLE=路径 go test -run TestNormalizeRealFile ./internal/core
-func TestNormalizeRealFile(t *testing.T) {	p := os.Getenv("GOCATCHER_SAMPLE")
+// 手动运行：GOCATCHER_SAMPLE=路径 go test -run TestNormalizeRealFile ./internal/fmp4
+func TestNormalizeRealFile(t *testing.T) {
+	p := os.Getenv("GOCATCHER_SAMPLE")
 	if p == "" {
 		t.Skip("设置 GOCATCHER_SAMPLE 指向真实 fMP4 文件后手动运行")
 	}
@@ -457,12 +458,12 @@ func TestNormalizeRealFile(t *testing.T) {	p := os.Getenv("GOCATCHER_SAMPLE")
 	if err != nil {
 		t.Fatal(err)
 	}
-	st := newNormState()
+	st := NewState()
 	out, err := normalizeFMP4Segment(data, st)
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Logf("基准: %v", st.snapshot())
+	t.Logf("基准: %v", st.baselineStrings())
 	t.Logf("原始 %d 字节 → 规范化 %d 字节（+%d）", len(data), len(out), len(out)-len(data))
 	moofs := collectMoofs(t, out)
 	t.Logf("含 %d 个 moof", len(moofs))

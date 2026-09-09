@@ -1,20 +1,25 @@
-// 任务状态持久化测试：saveState/loadState 往返、运行中→暂停转换、fmp4 状态恢复、取消清理。
+// 任务状态持久化测试：saveState/loadState 往返、运行中→暂停转换、规范化状态字节恢复、取消清理。
 package core
 
 import (
+	"bytes"
+	"encoding/json"
 	"os"
 	"path/filepath"
-	"reflect"
 	"testing"
 	"time"
 )
 
 // saveRestoreState 固定状态文件路径并保存/恢复 tasks 与 seqID 全局。
+// 去抖间隔调短并在清理前等待落盘 goroutine 结束，防止它泄漏到后续测试
+// （拿着已恢复的全局 statePath/tasks 继续写，构成数据竞争）。
 func saveRestoreState(t *testing.T) string {
 	t.Helper()
-	oldPath, oldTasks, oldSeq := statePath, tasks, seqID
+	oldPath, oldTasks, oldSeq, oldDelay := statePath, tasks, seqID, stateSaveDelay
+	stateSaveDelay = 5 * time.Millisecond
 	t.Cleanup(func() {
-		statePath, tasks, seqID = oldPath, oldTasks, oldSeq
+		waitStateIdle(t)
+		statePath, tasks, seqID, stateSaveDelay = oldPath, oldTasks, oldSeq, oldDelay
 		stateDirty, stateSaving = false, false
 	})
 	getStatePath() // 触发 once，之后直接覆盖 statePath
@@ -25,24 +30,41 @@ func saveRestoreState(t *testing.T) string {
 	return statePath
 }
 
-// TestSaveLoadRoundTrip 任务完整往返：done 任务原样恢复（含 fmp4 状态），
+// waitStateIdle 轮询等待去抖保存 goroutine 完全结束（无脏标记、无在途保存）。
+func waitStateIdle(t *testing.T) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		stateMu.Lock()
+		idle := !stateDirty && !stateSaving
+		stateMu.Unlock()
+		if idle {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("等待状态落盘超时")
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+}
+
+// TestSaveLoadRoundTrip 任务完整往返：done 任务原样恢复（含规范化状态字节包），
 // running/queued 残留转「已暂停」，seqID 推进避免撞号。
 func TestSaveLoadRoundTrip(t *testing.T) {
 	p := saveRestoreState(t)
 
-	initData, info := prepareInit(buildInit(1000, map[uint32]uint32{1: 90000, 2: 48000}), true)
-	if info.mehdOff < 0 {
-		t.Fatal("buildInit 应解析出 mehd 位置")
-	}
-	_ = initData
+	// normState 对持久化层是不透明字节包：schema 归容器实现自有测试
+	// （internal/fmp4/normstate_test.go），这里只验证逐字节保真。
+	// 约束仅为合法 JSON（persist 信封以 json.RawMessage 携带），
+	// 内容结构 core 一无所知——用未知字段 + 嵌套值模拟任意容器格式。
+	nsBytes := []byte(`{"opaque":{"baseline":[100,9000],"binary":[0,255,128]}}`)
 
 	now := time.Now()
 	tasks["t1"] = &taskEntry{st: taskState{
 		id: "t1", done: true, finalPath: filepath.Join(t.TempDir(), "a.mp4"),
 		filename: "a.mp4", m3u8URL: "https://x/a.m3u8", stage: "已保存",
 		started: now, finished: now, containerID: "fmp4",
-		fmp4Baseline: map[string]uint64{"1": 100}, fmp4End: map[string]uint64{"1": 9000},
-		fmp4Init: info,
+		normState: nsBytes,
 	}}
 	tasks["t2"] = &taskEntry{st: taskState{
 		id: "t2", running: true, stage: "下载分片中", filename: "b.ts",
@@ -68,11 +90,9 @@ func TestSaveLoadRoundTrip(t *testing.T) {
 	if !t1.st.done || t1.st.containerID != "fmp4" || t1.st.stage != "已保存" {
 		t.Fatalf("t1 状态损坏: %+v", t1.st)
 	}
-	if !reflect.DeepEqual(t1.st.fmp4Baseline, map[string]uint64{"1": 100}) {
-		t.Fatalf("fmp4Baseline=%v", t1.st.fmp4Baseline)
-	}
-	if t1.st.fmp4Init == nil || t1.st.fmp4Init.mehdOff != info.mehdOff {
-		t.Fatalf("fmp4Init 未恢复: %+v", t1.st.fmp4Init)
+	// 验证 normState 字节包内容保真（持久化层不解析内容，仅可能重排空白）
+	if !jsonEqual(t1.st.normState, nsBytes) {
+		t.Fatalf("normState 字节包往返失真: %s want %s", t1.st.normState, nsBytes)
 	}
 
 	for _, id := range []string{"t2", "t3"} {
@@ -147,4 +167,17 @@ func idsOfPT(list []persistedTask) []string {
 		out[i] = pt.ID
 	}
 	return out
+}
+
+// jsonEqual 比较两段 JSON 字节内容是否等价（忽略空白差异）：
+// 持久化信封以 MarshalIndent 写出会重排内嵌 RawMessage 的缩进。
+func jsonEqual(a, b []byte) bool {
+	var ca, cb bytes.Buffer
+	if err := json.Compact(&ca, a); err != nil {
+		return false
+	}
+	if err := json.Compact(&cb, b); err != nil {
+		return false
+	}
+	return bytes.Equal(ca.Bytes(), cb.Bytes())
 }

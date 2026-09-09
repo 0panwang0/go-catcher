@@ -46,6 +46,13 @@ func runDiskPipeline(te *taskEntry) {
 	te.st.paused = false
 	te.st.stage = "解析视频源"
 	st := te.st
+	// 兼容旧版状态文件：失败任务曾把 finalPath 清空（v0.2 bug），重试/续传时
+	// 按 filename+saveDir 拼回，否则 .part 会写到工作目录下的游离 ".part"。
+	// 不走 uniquePath：.part 就在原路径上，查重反而会错开到 "xxx (1).ts"。
+	if st.finalPath == "" && st.filename != "" {
+		st.finalPath = filepath.Join(st.saveDir, st.filename)
+		te.st.finalPath = st.finalPath
+	}
 	te.mu.Unlock()
 	markDirty()
 
@@ -60,51 +67,18 @@ func runDiskPipeline(te *taskEntry) {
 	te.job = job
 	te.mu.Unlock()
 
-	// 进度回调：每写入一批分片就刷新任务状态（持久化时以它为准）
+	// 进度回调：每写入一批分片就刷新任务状态（持久化时以它为准）。
+	// 跨分片规范化状态也在此同步回任务（暂停/重启续传沿用，一个不透明字节包）：
+	// progress 由 streamWriter 在"已按序写入"后触发，状态与断点严格一致。
 	job.progress = func(stage string, done, tot int64) {
 		te.mu.Lock()
 		te.st.stage = stage
 		te.st.segDone = done
 		te.st.segTot = tot
-		te.mu.Unlock()
-	}
-
-	// 规范化状态由容器工厂创建（见下方容器探测分支），此处仅声明回调。
-	// 分片写入前的规范化回调：时间戳归一化 + NAL 封装转换（仅 fMP4 容器生效），
-	// 内联 init（首片自带 ftyp/moov）在此补 mehd 占位；
-	// 并把基准/结束时间/init 信息同步回任务状态（暂停/重启后续传仍沿用）
-	job.normFn = func(d []byte) []byte {
-		if job.container == nil || job.container.Normalize == nil || job.norm == nil {
-			return d
-		}
-		// 含 moov 的分片（无 #EXT-X-MAP 时 init 内联在首片）→ 补 mehd 占位并记录回填位置；
-		// 同时解析轨道类型，仅视频轨做 NAL→AVCC 转换（音频轨特征与 NAL 头有冲突，不可猜测）
-		if normInitInfo(job.norm) == nil {
-			nd2, info := prepareInit(d, true)
-			if info.mehdOff >= 0 {
-				d = nd2
-				normSetInit(job.norm, info)
-			}
-			if len(info.trackVideo) > 0 {
-				applyTrackVideo(job.norm, info.trackVideo)
-			}
-		}
-		nd, err := job.container.Normalize(d, job.norm)
-		if err != nil {
-			fmt.Printf("[norm] 分片规范化失败（原样写入）: %v\n", err)
-			return d
-		}
-		if len(nd) != len(d) {
-			fmt.Printf("[norm] 分片规范化: %d → %d 字节\n", len(d), len(nd))
-		}
-		te.mu.Lock()
-		te.st.fmp4Baseline = job.norm.snapshot()
-		te.st.fmp4End = job.norm.endSnapshot()
-		if info := normInitInfo(job.norm); info != nil {
-			te.st.fmp4Init = info
+		if job.norm != nil {
+			te.st.normState = job.norm.Snapshot()
 		}
 		te.mu.Unlock()
-		return nd
 	}
 
 	fail := func(msg string) {
@@ -182,6 +156,12 @@ func runDiskPipeline(te *taskEntry) {
 		fail("播放列表中没有找到任何媒体分片（响应可能被加密或压缩）")
 		return
 	}
+	// 加密流装配解密器（拉取 key 并按 METHOD 建解密器）；失败任务即失败。
+	// 续传/重试路径同样会走到这里重建解密器（key 只存于播放列表声明中）。
+	if kerr := job.ensureDecryptor(ctx, pl.key); kerr != nil {
+		fail(kerr.Error())
+		return
+	}
 	isLive := !pl.hasEndList
 	fmt.Printf("[disk] id=%s segments: %d live=%v\n", st.id, len(pl.segments), isLive)
 
@@ -201,9 +181,22 @@ func runDiskPipeline(te *taskEntry) {
 			fail("探测视频格式失败（首个分片）: " + perr.Error())
 			return
 		}
+		// 加密流：探测分片先解密（容器魔数在密文上看不出，识别必须基于明文）
+		if pre, perr = job.decryptSegmentIfAny(pl.mediaSeq, pre); perr != nil {
+			fail("解密首个分片失败: " + perr.Error())
+			return
+		}
 		job.pre = pre
+		job.preURL = pl.segments[0]
 
 		container := detectContainer(pre, pl.hasMap)
+		// 加密流误判守卫：识别为 generic 但播放列表声明了加密时，
+		// 解密后的首片若无媒体特征，判为"解密失败/源被加扰"，中止下载，
+		// 避免把仍处密文的流静默存成不可播文件（此前会报"已保存"成功）。
+		if gerr := guardGenericMedia(container, pl.key, pre); gerr != nil {
+			fail(gerr.Error())
+			return
+		}
 		job.container = container
 		// 规范化状态由容器工厂创建（generic 等无状态容器为 nil）
 		if container.NewState != nil {
@@ -230,14 +223,14 @@ func runDiskPipeline(te *taskEntry) {
 				fail("获取 fMP4 init 段失败: " + ferr.Error())
 				return
 			}
-			// 补 mehd 占位（fMP4 总时长声明）并记录回填位置与 timescale；
-			// 同时解析轨道类型，仅视频轨做 NAL→AVCC 转换
-			initData, info := prepareInit(initData, true)
-			normSetInit(job.norm, info)
-			if len(info.trackVideo) > 0 {
-				applyTrackVideo(job.norm, info.trackVideo)
+			// 补 mehd 占位（fMP4 总时长声明）并解析轨道类型与回填位置
+			// （Normalize 对含 moov 的数据自动走 init 消费，幂等）
+			nd, nerr := job.norm.Normalize(initData)
+			if nerr != nil {
+				fail("处理 fMP4 init 段失败: " + nerr.Error())
+				return
 			}
-			if werr := writeInitSegment(partPath, initData); werr != nil {
+			if werr := writeInitSegment(partPath, nd); werr != nil {
 				fail("写入 init 段失败: " + werr.Error())
 				return
 			}
@@ -246,9 +239,9 @@ func runDiskPipeline(te *taskEntry) {
 		te.st.filename = st.filename
 		te.st.finalPath = st.finalPath
 		te.st.containerID = container.ID
-		if info := normInitInfo(job.norm); info != nil {
-			te.st.fmp4Init = info
-		}
+			if job.norm != nil {
+				te.st.normState = job.norm.Snapshot()
+			}
 		te.mu.Unlock()
 		markDirty()
 	} else {
@@ -263,29 +256,15 @@ func runDiskPipeline(te *taskEntry) {
 				job.norm = job.container.NewState()
 			}
 		}
-		// fMP4 续传：恢复 mehd 回填所需信息；旧版本任务（未持久化 init 信息）
-		// 回退为从 .part 文件头重新解析（mehd 占位已在首次运行时写入）。
-		// 只有声明了 Backfill（有收尾回填需求）的容器才需要 init 信息。
-		if job.container != nil && job.container.Backfill != nil && normInitInfo(job.norm) == nil {
-			if info := te.st.fmp4Init; info != nil {
-				normSetInit(job.norm, info)
+		// 恢复全部跨分片状态（tfdt 基准 + 结束时间 + init 信息，一个不透明字节包）。
+		// 旧版本任务（未持久化 normState）回退为从 .part 文件头重新解析 init
+		// （mehd 占位已在首次运行时写入，Normalize 内 consumeInit 幂等不会重复插入）
+		if job.norm != nil {
+			if b := te.st.normState; len(b) > 0 {
+				job.norm.Restore(b)
 			} else if head, herr := readHead(partPath, 64<<10); herr == nil && len(head) > 8 {
-				_, info := prepareInit(head, false)
-				normSetInit(job.norm, info)
+				job.norm.Normalize(head)
 			}
-		}
-		if info := normInitInfo(job.norm); info != nil && len(info.trackVideo) > 0 {
-			applyTrackVideo(job.norm, info.trackVideo)
-		}
-	}
-
-	// 规范化状态统一恢复持久化的跨分片状态（tfdt 基准 + 每轨结束时间，断点续传沿用）
-	if job.norm != nil {
-		if len(st.fmp4Baseline) > 0 {
-			job.norm.restore(st.fmp4Baseline)
-		}
-		if len(st.fmp4End) > 0 {
-			job.norm.restoreEnd(st.fmp4End)
 		}
 	}
 
@@ -303,8 +282,15 @@ func runDiskPipeline(te *taskEntry) {
 	var next int
 	if isLive {
 		next, err = job.liveDownload(ctx, partPath, from)
+	} else if from >= len(pl.segments) {
+		// 断点已达/超过列表总数（含旧版本重复续传遗留的脏断点）：分片已齐，直接收尾。
+		// streamDownload 未运行，job 计数需手动同步（snapshot 的进度读 job 原子值）
+		next = from
+		job.setSeg(int64(len(pl.segments)), int64(len(pl.segments)))
 	} else {
-		next, err = streamDownload(ctx, job, pl.segments, from, partPath)
+		// 点播续传只下剩余分片：segURLs[0] 对应写入序号 from，重复传全量会把
+		// 整个列表重下一遍追加到断点后（内容重复 + segDone 超过 segTot）
+		next, err = streamDownload(ctx, job, pl.segments[from:], from, pl.mediaSeq+uint64(from), partPath)
 	}
 
 	te.mu.Lock()

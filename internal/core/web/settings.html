@@ -99,6 +99,20 @@
       <label><b>服务端口</b><span>1 – 65535</span></label>
       <input id="f_port" type="number" min="1" max="65535">
     </div>
+    <div class="field">
+      <div class="segrow">
+        <span class="lb">代理模式<span class="hb">下载请求经由的出口</span></span>
+        <span class="seg" id="proxyseg">
+          <button type="button" data-v="system">跟随系统</button><button type="button" data-v="direct">直连</button><button type="button" data-v="manual">手动</button>
+        </span>
+      </div>
+      <div class="desc" id="syshint"></div>
+    </div>
+    <div class="field" id="proxyaddr" style="display:none">
+      <label><b>代理地址</b><span>http://host:port</span></label>
+      <input id="f_proxy" type="text" placeholder="http://127.0.0.1:7890" spellcheck="false">
+      <div class="desc">HTTP 代理（CONNECT 隧道），如 Clash 默认 <em>http://127.0.0.1:7890</em>。保存后所有新请求（含进行中任务的后续分片）立即走新代理，正在传输的请求在旧代理收尾。</div>
+    </div>
   </div>
 
   <div class="card">
@@ -141,6 +155,27 @@ el('viewseg').addEventListener('click', function(e){
   var b = e.target.closest('button');
   if (b){ segVal = b.getAttribute('data-v'); syncSeg(segVal); }
 });
+// —— 代理模式（跟随系统 / 直连 / 手动）——
+var proxyMode = 'system';
+function syncProxySeg(){
+  var bs = el('proxyseg').querySelectorAll('button');
+  for (var i=0;i<bs.length;i++) bs[i].className = (bs[i].getAttribute('data-v')===proxyMode) ? 'on' : '';
+  el('proxyaddr').style.display = (proxyMode === 'manual') ? '' : 'none';
+}
+function syncSysHint(sysProxy){
+  el('syshint').textContent = '';
+}
+el('proxyseg').addEventListener('click', function(e){
+  var b = e.target.closest('button');
+  if (b){ proxyMode = b.getAttribute('data-v'); syncProxySeg(); }
+});
+// cfgProxy → 模式：system 关键字 / direct 关键字 / 其余 = 手动地址
+function proxyModeOf(p){
+  var pl = (p || '').trim().toLowerCase();
+  if (pl === 'system') return 'system';
+  if (pl === '' || pl === 'direct' || pl === 'none' || pl === 'off') return 'direct';
+  return 'manual';
+}
 async function load(){
   try{
     const r = await fetch('/config', {cache:'no-store'});
@@ -149,17 +184,33 @@ async function load(){
     el('f_segc').value = d.segConcurrency;
     el('f_retry').value = d.maxRetries;
     el('f_port').value = d.port;
+    el('f_proxy').value = (proxyModeOf(d.proxy) === 'manual') ? d.proxy : '';
+    proxyMode = proxyModeOf(d.proxy);
+    syncProxySeg();
+    syncSysHint(d.systemProxy || '');
     segVal = (d.uiView === 'compact') ? 'compact' : 'detail';
     syncSeg(segVal);
   }catch(e){ toast('无法读取服务端配置', true); }
 }
 async function save(){
+  var pv = '';
+  if (proxyMode === 'manual'){
+    pv = el('f_proxy').value.trim();
+    if (!/^http:\/\/[^\s]+:\d+/.test(pv)){
+      toast('代理地址应为 http://host:port', true); return;
+    }
+  }else if (proxyMode === 'direct'){
+    pv = 'direct';
+  }else{
+    pv = 'system';
+  }
   const v = {
     maxConcurrent:  parseInt(el('f_maxc').value, 10),
     segConcurrency: parseInt(el('f_segc').value, 10),
     maxRetries:     parseInt(el('f_retry').value, 10),
     port:           parseInt(el('f_port').value, 10),
-    uiView:         segVal
+    uiView:         segVal,
+    proxy:          pv
   };
   if (isNaN(v.maxConcurrent) || isNaN(v.segConcurrency) || isNaN(v.maxRetries) || isNaN(v.port) || v.port<1 || v.port>65535){
     toast('请填写有效的数字（端口 1 – 65535）', true); return;

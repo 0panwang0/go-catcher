@@ -44,8 +44,13 @@ type dlJob struct {
 	// init 段解析结果，由 container.NewState 创建，跨分片/跨批次/断点续传共用；
 	// 无状态容器为 nil）
 	norm NormState
-	// normFn 分片写入前的规范化回调（nil = 原样写）
-	normFn func([]byte) []byte
+	// decryptor 分片解密器（nil = 明文流），由 ensureDecryptor 按播放列表
+	// 的 #EXT-X-KEY 装配；decKeyID 已装配解密器的 key 指纹（直播轮询幂等去重）
+	decryptor SegDecryptor
+	decKeyID  string
+	// preURL 容器探测预取分片的 URL（streamDownload 复用 pre 前核对，
+	// 防直播列表滚动后首片张冠李戴写错内容）
+	preURL string
 }
 
 // seenHas / seenAdd / seenSnapshot 直播分片去重与持久化窗口。
@@ -55,12 +60,12 @@ func (j *dlJob) seenHas(u string) bool {
 	return j.seen[u]
 }
 
-// backfill 任务完成/暂停收尾：委托容器注册的 Backfill 回调（nil = 无需收尾处理）。
+// backfill 任务完成/暂停收尾：委托规范化状态的 Finish（无状态容器为 nil，静默跳过）。
 func (j *dlJob) backfill(path string) error {
-	if j.container == nil || j.container.Backfill == nil {
+	if j.norm == nil {
 		return nil
 	}
-	return j.container.Backfill(path, j.norm)
+	return j.norm.Finish(path)
 }
 
 func (j *dlJob) seenAdd(u string) {
@@ -197,8 +202,6 @@ func (sw *streamWriter) Close() error {
 //  3. 单连接续传：其余情况 → Range 追加（206）/ 全量覆盖（200）/ 丢弃重下（416）
 // 分片模式下 ctx 取消或失败保留 .part 与 .meta，任务恢复后从位图断点继续。
 func (j *dlJob) downloadDirect(ctx context.Context, outPath string) error {
-	initSharedClient()
-
 	// 模式 1：分片续传（位图恢复）
 	if m, ok := loadChunkMeta(outPath); ok {
 		return j.downloadChunked(ctx, outPath, m)
@@ -226,7 +229,7 @@ func (j *dlJob) downloadDirect(ctx context.Context, outPath string) error {
 		if offset > 0 {
 			req.Header.Set("Range", fmt.Sprintf("bytes=%d-", offset))
 		}
-		resp, err := sharedClient.Do(req)
+		resp, err := getClient().Do(req)
 		if err != nil {
 			return err
 		}
@@ -307,7 +310,7 @@ func (j *dlJob) probeRange(ctx context.Context) (int64, bool) {
 		return 0, false
 	}
 	req.Header.Set("Range", "bytes=0-0")
-	resp, err := sharedClient.Do(req)
+	resp, err := getClient().Do(req)
 	if err != nil {
 		return 0, false
 	}
@@ -417,7 +420,7 @@ func (j *dlJob) downloadRange(ctx context.Context, f *os.File, start, end int64)
 		}
 		req = req.WithContext(ctx)
 		req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", start, end))
-		resp, err := sharedClient.Do(req)
+		resp, err := getClient().Do(req)
 		if err != nil {
 			if ctx.Err() != nil {
 				return err
@@ -516,7 +519,6 @@ func streamToFile(body io.Reader, outPath string, offset int64) (cpErr, closeErr
 // fetchSegment 带重试地把单个分片下载到内存。ctx 取消时立刻返回。
 
 func fetchSegment(ctx context.Context, j *dlJob, segURL string) ([]byte, error) {
-	initSharedClient()
 	var lastErr error
 	for attempt := 1; attempt <= maxRetries; attempt++ {
 		if err := ctx.Err(); err != nil {
@@ -527,7 +529,7 @@ func fetchSegment(ctx context.Context, j *dlJob, segURL string) ([]byte, error) 
 			return nil, cleanURLParseErr(err, segURL)
 		}
 		req = req.WithContext(ctx)
-		resp, err := sharedClient.Do(req)
+		resp, err := getClient().Do(req)
 		if err != nil {
 			lastErr = fmt.Errorf("attempt %d: %w", attempt, err)
 			if ctx.Err() != nil {
@@ -559,14 +561,17 @@ func fetchSegment(ctx context.Context, j *dlJob, segURL string) ([]byte, error) 
 
 // streamDownload 并发下载 segURLs（一个连续批次）并按序写入 outPath。
 // startIdx 是 segURLs[0] 对应的写入序号（点播=断点 from；直播=当前已写分片数）。
+// seqBase 是 segURLs[0] 的 media sequence（播放列表 MEDIA-SEQUENCE + 其在列表中的
+// 位置；密钥无显式 IV 时按它派生 IV，明文流无意义传 0）。
 // 返回批次结束后的下一个写入序号（= startIdx+len(segURLs)）与错误。
 // 暂停/取消时返回已实际写入的序号，便于上层保存进度后从断点恢复。
-// 首个分片若已被容器探测预取（j.pre 非空，startIdx==0 时）直接复用。
-func streamDownload(ctx context.Context, j *dlJob, segURLs []string, startIdx int, outPath string) (int, error) {
-	initSharedClient()
+// 首个分片若已被容器探测预取（j.pre 非空且 URL 吻合，startIdx==0 时）直接复用。
+func streamDownload(ctx context.Context, j *dlJob, segURLs []string, startIdx int, seqBase uint64, outPath string) (int, error) {
 	total := len(segURLs)
-	// 直播列表无限增长：进度只报已写入数，segTot 恒为 0（前端按录制时长展示）
-	dispTot := int64(total)
+	// 直播列表无限增长：进度只报已写入数，segTot 恒为 0（前端按录制时长展示）。
+	// 点播 segTot 必须用绝对总数（断点 startIdx + 本批 total）：segDone 是跨批次
+	// 累计的绝对写入数，若只报本批长度，续传时分片数会显示成「1771 / 654」。
+	dispTot := int64(startIdx + total)
 	if j.live {
 		dispTot = 0
 	}
@@ -579,7 +584,22 @@ func streamDownload(ctx context.Context, j *dlJob, segURLs []string, startIdx in
 		} else {
 			fmt.Printf("\r  下载进度: %d / %d   ", next, startIdx+total)
 		}
-	}, j.normFn)
+	}, func(d []byte) []byte {
+		// 写入前规范化：委托容器状态对象（fMP4 时间戳归一化 + NAL 封装转换 +
+		// 内联 init 消费）；无状态容器原样写，规范化失败降级原样写
+		if j.norm == nil {
+			return d
+		}
+		nd, err := j.norm.Normalize(d)
+		if err != nil {
+			fmt.Printf("[norm] 分片规范化失败（原样写入）: %v\n", err)
+			return d
+		}
+		if len(nd) != len(d) {
+			fmt.Printf("[norm] 分片规范化: %d → %d 字节\n", len(d), len(nd))
+		}
+		return nd
+	})
 	if err != nil {
 		return startIdx, err
 	}
@@ -643,8 +663,9 @@ dispatch:
 			}()
 
 			var data []byte
-			if startIdx == 0 && i == 0 && j.pre != nil {
-				data = j.pre // 容器探测时已下载过，直接复用
+			var err error // 闭包局部错误：并发写函数级 err 会数据竞争
+			if startIdx == 0 && i == 0 && j.pre != nil && j.preURL == u {
+				data = j.pre // 容器探测时已下载（含解密），直接复用
 			} else {
 				data, err = fetchSegment(ctx, j, u)
 				if err != nil {
@@ -653,6 +674,10 @@ dispatch:
 					} else {
 						setErr(fmt.Errorf("分片 %d 下载失败: %w", idx, err))
 					}
+					return
+				}
+				if data, err = j.decryptSegmentIfAny(seqBase+uint64(i), data); err != nil {
+					setErr(fmt.Errorf("分片 %d 解密失败: %w", idx, err))
 					return
 				}
 			}
@@ -710,18 +735,26 @@ func (j *dlJob) liveDownload(ctx context.Context, outPath string, from int) (int
 			return next, fmt.Errorf("直播播放列表响应变为直链媒体，无法继续跟随录制")
 		}
 		cur := parsePlaylist(content, base)
+		// 每轮轮询重新装配解密器（幂等：key 未变不重拉）；key 轮换时按新 key 解密后续分片
+		if kerr := j.ensureDecryptor(ctx, cur.key); kerr != nil {
+			return next, kerr
+		}
 
 		var newSegs []string
-		for _, u := range cur.segments {
+		firstNewPos := -1 // 本批首个新分片在当前列表中的位置（派生 IV 的序号基准）
+		for pos, u := range cur.segments {
 			if !j.seenHas(u) {
 				j.seenAdd(u)
 				newSegs = append(newSegs, u)
+				if firstNewPos < 0 {
+					firstNewPos = pos
+				}
 			}
 		}
 
 		if len(newSegs) > 0 {
 			empty = 0
-			n, derr := streamDownload(ctx, j, newSegs, next, outPath)
+			n, derr := streamDownload(ctx, j, newSegs, next, cur.mediaSeq+uint64(firstNewPos), outPath)
 			next = n
 			if derr != nil {
 				if ctx.Err() != nil {

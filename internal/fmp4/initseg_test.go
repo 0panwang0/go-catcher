@@ -1,5 +1,5 @@
 // fMP4 init 段与总时长回填测试：mehd 占位插入、每轨结束时间累计、mehd/mvhd 回填。
-package core
+package fmp4
 
 import (
 	"bytes"
@@ -164,7 +164,7 @@ func TestInitInfoPersistRoundTrip(t *testing.T) {
 func TestNormStateEndAccumulation(t *testing.T) {
 	v0 := []byte{0, 0, 0, 4, 0x65, 0x11, 0x22, 0x33}       // 已封装 AVCC，8B
 	v1 := []byte{0, 0, 0, 5, 0x65, 0x44, 0x55, 0x66, 0x77} // 9B
-	st := newNormState()
+	st := NewState()
 
 	seg0 := buildSegmentDur(9000000, 9000000, v0, v1, 3000, 3000, 2048)
 	out0, err := normalizeFMP4Segment(seg0, st)
@@ -195,8 +195,8 @@ func TestNormStateEndAccumulation(t *testing.T) {
 	}
 
 	// 断点续传：持久化 → 新状态恢复 → 继续累计
-	st2 := newNormState()
-	st2.restore(st.snapshot())
+	st2 := NewState()
+	st2.Restore(st.Snapshot())
 	st2.restoreEnd(st.endSnapshot())
 	seg2 := buildSegmentDur(9012000, 9004096, v0, v1, 3000, 3000, 2048)
 	if _, err := normalizeFMP4Segment(seg2, st2); err != nil {
@@ -277,14 +277,15 @@ func TestBackfillDurationsWrites(t *testing.T) {
 		t.Fatal("init 无 mehd")
 	}
 
-	// 模拟真实管线：init 落盘 → 分片经 normFn（累计到同一 norm）落盘
-	st := newNormState()
+	// 模拟真实管线：init 经规范化状态消费（consumeInit 幂等，补 mehd 占位并持有
+	// 回填位置）→ 分片经 streamWriter 的规范化钩子（累计到同一 norm）落盘
+	st := NewState()
 	v0 := []byte{0, 0, 0, 4, 0x65, 0x11, 0x22, 0x33}
 	v1 := []byte{0, 0, 0, 5, 0x65, 0x44, 0x55, 0x66, 0x77}
 	seg := buildSegmentDur(900000, 480000, v0, v1, 450000, 450000, 240000) // 视频 10s / 音频 5s
 	seg2 := buildSegmentDur(1800000, 960000, v0, v1, 450000, 450000, 240000)
 
-	data := append([]byte{}, init...)
+	data := append([]byte{}, st.consumeInit(init)...)
 	for _, s := range [][]byte{seg, seg2} {
 		out, err := normalizeFMP4Segment(s, st)
 		if err != nil {
@@ -301,9 +302,8 @@ func TestBackfillDurationsWrites(t *testing.T) {
 	if err := os.WriteFile(path, data, 0644); err != nil {
 		t.Fatal(err)
 	}
-	// 真实管线中 init 信息由规范化状态持有（setInit），Backfill 只收状态
-	st.setInit(info)
-	if err := backfillDurations(path, st); err != nil {
+	// 任务完成：Finish 把状态持有的 init 信息回填到文件
+	if err := st.Finish(path); err != nil {
 		t.Fatal(err)
 	}
 	got, err := os.ReadFile(path)
@@ -342,11 +342,12 @@ func TestBackfillDurationsFtypLayout(t *testing.T) {
 		t.Fatalf("mvhdOff=%d 处不是 mvhd box", info.mvhdOff)
 	}
 
-	st := newNormState()
+	st := NewState()
 	v0 := []byte{0, 0, 0, 4, 0x65, 0x11, 0x22, 0x33}
 	v1 := []byte{0, 0, 0, 5, 0x65, 0x44, 0x55, 0x66, 0x77}
 	seg := buildSegmentDur(900000, 480000, v0, v1, 450000, 450000, 240000)
-	data := append([]byte{}, init...)
+	// 真实管线：init 由规范化状态消费（consumeInit 补 mehd 占位并持有回填位置）
+	data := append([]byte{}, st.consumeInit(init)...)
 	out, err := normalizeFMP4Segment(seg, st)
 	if err != nil {
 		t.Fatal(err)
@@ -357,8 +358,8 @@ func TestBackfillDurationsFtypLayout(t *testing.T) {
 	if err := os.WriteFile(path, data, 0644); err != nil {
 		t.Fatal(err)
 	}
-	st.setInit(info)
-	if err := backfillDurations(path, st); err != nil {
+	// 任务完成：Finish 把状态持有的 init 信息回填到文件
+	if err := st.Finish(path); err != nil {
 		t.Fatal(err)
 	}
 	got, err := os.ReadFile(path)

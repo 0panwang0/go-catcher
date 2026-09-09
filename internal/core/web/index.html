@@ -121,12 +121,11 @@
 <body>
 <div class="wrap">
   <div class="hd"><span class="dot" id="dot"></span><h1>GoCatcher 下载监控</h1></div>
-  <div class="sub">本地服务 <span id="svcaddr">127.0.0.1:…</span></div>
 
   <div class="stats" id="stats"></div>
   <div id="list"></div>
 
-  <div class="foot"><span id="errline"></span><span>暂停后可从断点继续 · 任务记录自动保存</span></div>
+  <div class="foot"><span id="errline"></span></div>
 </div>
 <div id="toast"></div>
 <button id="setbtn" title="设置">⚙</button>
@@ -220,7 +219,6 @@ function card(t){
   else if(t.done) barCls='done';
   else if(t.paused) barCls='pause';
   else if(t.live) barCls='indet';                    // 直播：无限进度条
-  else if(t.stage==='解析视频源') barCls='indet'; // 源站响应慢时显示流动进度，避免像死锁
   const seg = t.live
     ? ('已录制 '+t.segDone+' 个分片')
     : ((t.segTot>0)?('分片 '+t.segDone+' / '+t.segTot):'');
@@ -241,7 +239,7 @@ function card(t){
     + '</div>'
     + '<div style="margin-bottom:6px">'+stageText(t)+'</div>'
     + '<div class="pctline"><span>'+pctTxt+'</span><span style="color:var(--muted)">'+seg+'</span></div>'
-    + '<div class="bar"><i class="'+barCls+'"'+(barCls==='indet'?'':' style="width:'+(t.done&&!t.error?100:(t.live?100:pct))+'%"')+'></i></div>'
+    + '<div class="bar"><i class="'+barCls+'"'+(barCls==='indet'?'':' style="width:'+(t.stage==='解析视频源'||t.done&&!t.error?100:(t.live?100:pct))+'%"')+'></i></div>'
     + actions(t)
     + '</div>';
 }
@@ -259,18 +257,17 @@ function actions(t){
     if (sd) b.push(btn('ghost','📂 打开文件夹','openFolder('+sd+')'));
     b.push(btn('ghost','🗑 移除记录','removeTask('+id+')'));
   } else if (t.paused) {
-    if (op) b.push(btn('ghost','▶ 打开半成品','openFile('+op+')'));
     if (sd) b.push(btn('ghost','📂 打开文件夹','openFolder('+sd+')'));
     b.push(btn('primary','▶ 继续下载','resumeTask('+id+')'));
     b.push(btn('danger','✕ 取消','cancelTask('+id+')'));
   } else if (t.error) {
-    if (op) b.push(btn('ghost','▶ 打开半成品','openFile('+op+')'));
     b.push(btn('primary','▶ 重试','resumeTask('+id+')'));
     b.push(btn('danger','✕ 取消','cancelTask('+id+')'));
     if (sd) b.push(btn('ghost','📂 打开文件夹','openFolder('+sd+')'));
     b.push(btn('ghost','🗑 移除记录','removeTask('+id+')'));
   } else {
-    // 下载中 / 排队中
+    // 下载中 / 排队中（随时可打开文件夹查看 .part 半成品）
+    if (sd) b.push(btn('ghost','📂 打开文件夹','openFolder('+sd+')'));
     b.push(btn('warn','⏸ 暂停','pauseTask('+id+')'));
     b.push(btn('danger','✕ 取消','cancelTask('+id+')'));
   }
@@ -306,14 +303,17 @@ function rowCard(t){
          + (sd ? ibtn('','📂','打开文件夹','openFolder('+sd+')') : '')
          + ibtn('','🗑','移除记录','removeTask('+id+')');
   } else if (t.paused) {
-    acts = ibtn('primary','▶','继续下载','resumeTask('+id+')')
+    acts = (sd ? ibtn('','📂','打开文件夹','openFolder('+sd+')') : '')
+         + ibtn('primary','▶','继续下载','resumeTask('+id+')')
          + ibtn('danger','✕','取消（删除文件）','cancelTask('+id+')');
   } else if (t.error) {
-    acts = ibtn('primary','↻','重试','resumeTask('+id+')')
+    acts = (sd ? ibtn('','📂','打开文件夹','openFolder('+sd+')') : '')
+         + ibtn('primary','↻','重试','resumeTask('+id+')')
          + ibtn('danger','✕','取消（删除文件）','cancelTask('+id+')')
          + ibtn('','🗑','移除记录','removeTask('+id+')');
   } else {
-    acts = ibtn('','⏸','暂停','pauseTask('+id+')')
+    acts = (sd ? ibtn('','📂','打开文件夹','openFolder('+sd+')') : '')
+         + ibtn('','⏸','暂停','pauseTask('+id+')')
          + ibtn('danger','✕','取消（删除文件）','cancelTask('+id+')');
   }
   const name = esc(fnameOf(t));
@@ -466,9 +466,6 @@ async function loadConfig(){
 }
 // 设置独立成页（/settings）：本页不再有弹层，⚙ 直接跳转；保存后回监控页会自动重新加载配置
 el('setbtn').addEventListener('click', function(){ location.href = '/settings'; });
-
-// 页面由服务自身提供，host 即真实端口（设置改端口后从新端口访问，这里自动跟随）
-el('svcaddr').textContent = location.host;
 
 setInterval(poll, 900);
 poll();

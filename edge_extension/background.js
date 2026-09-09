@@ -8,12 +8,15 @@ chrome.action.onClicked.addListener(() => {
 });
 
 // 嗅探所有 .m3u8 请求
+// frameUrl 记录发起请求的 frame 文档 URL（details.documentUrl）：跨域 iframe
+// 播放器（苹果CMS 第三方解析页等）里 video 所在 frame 的 location.href 与顶层
+// 页 pageUrl 不同域，没有它匹配时候选会全部落空（悬停按钮永不出现）。
 chrome.webRequest.onCompleted.addListener(
   (details) => {
-    if (details.tabId < 0) return;
+    if (details.tabId < 0 || !shouldSniff(details, ".m3u8")) return;
     chrome.tabs.get(details.tabId, (tab) => {
       if (chrome.runtime.lastError) return;
-      recordMedia(details.url, tab.url || "", tab.title || "", "m3u8");
+      recordMedia(details.url, tab.url || "", details.documentUrl || "", tab.title || "", "m3u8");
     });
   },
   { urls: ["*://*/*.m3u8", "*://*/*.m3u8?*"] }
@@ -22,7 +25,7 @@ chrome.webRequest.onCompleted.addListener(
 // 嗅探 MP4 直链（IDM 也常提供 MP4 格式选项）
 chrome.webRequest.onCompleted.addListener(
   (details) => {
-    if (details.tabId < 0) return;
+    if (details.tabId < 0 || !shouldSniff(details, ".mp4")) return;
     chrome.tabs.get(details.tabId, (tab) => {
       if (chrome.runtime.lastError) return;
       let size = 0;
@@ -32,19 +35,47 @@ chrome.webRequest.onCompleted.addListener(
         );
         if (len && len.value) size = parseInt(len.value, 10) || 0;
       }
-      recordMedia(details.url, tab.url || "", tab.title || "", "mp4", size);
+      recordMedia(details.url, tab.url || "", details.documentUrl || "", tab.title || "", "mp4", size);
     });
   },
   { urls: ["*://*/*.mp4", "*://*/*.mp4?*"] },
   ["responseHeaders"]
 );
 
-async function recordMedia(url, pageUrl, title, type, size = 0) {
+// shouldSniff 嗅探入录前置过滤：
+//   1. main_frame/sub_frame 是文档导航（网页/iframe 页面本身），永远不是媒体
+//   2. URL 的路径部分必须以对应扩展名结尾——解析页 URL 形如
+//      https://parser.com/play/?url=…index.m3u8，查询参数尾部恰好是 .m3u8，
+//      恰好命中 webRequest 匹配模式（模式按 path+query 整体匹配），会被误录
+//      成 m3u8；点它下载拉回的是 HTML 网页，任务必失败
+function shouldSniff(details, ext) {
+  if (details.type === "main_frame" || details.type === "sub_frame") return false;
+  try {
+    return new URL(details.url).pathname.toLowerCase().endsWith(ext);
+  } catch {
+    return false;
+  }
+}
+
+// isCandidateURL 嗅探记录读出自愈：过滤历史上被误录的解析页 URL（路径无媒体
+// 扩展名、靠 ?url= 跳转参数尾部伪装 .m3u8）。路径带扩展名、或不含 ?url=
+// 参数的记录才作为候选（?url= 是苹果CMS 系解析页的通用签名）。
+function isCandidateURL(u) {
+  try {
+    const p = new URL(u);
+    return /\.(m3u8|mp4)$/i.test(p.pathname) || !p.searchParams.has("url");
+  } catch {
+    return false;
+  }
+}
+
+async function recordMedia(url, pageUrl, frameUrl, title, type, size = 0) {
   const key = type === "mp4" ? "mp4_list" : "m3u8_list";
   const { [key]: list = [] } = await chrome.storage.local.get(key);
   const existing = list.find((it) => it.url === url);
   if (existing) {
     existing.pageUrl = pageUrl || existing.pageUrl;
+    existing.frameUrl = frameUrl || existing.frameUrl || "";
     existing.title = title || existing.title;
     existing.time = Date.now();
     if (size) existing.size = size;
@@ -52,6 +83,7 @@ async function recordMedia(url, pageUrl, title, type, size = 0) {
     list.unshift({
       url,
       pageUrl,
+      frameUrl: frameUrl || "",
       title,
       time: Date.now(),
       type,
@@ -86,7 +118,13 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (msg.type === "getVideoSource") {
     getVideoSource(msg)
       .then((res) => sendResponse({ ok: true, source: res }))
-      .catch((e) => sendResponse({ ok: false, error: String(e) }));
+      .catch((e) => sendResponse({ ok: false, error: String(e && e.message ? e.message : e) }));
+    return true;
+  }
+  if (msg.type === "getVideoSources") {
+    getVideoSources(msg)
+      .then((res) => sendResponse({ ok: true, sources: res }))
+      .catch((e) => sendResponse({ ok: false, error: String(e && e.message ? e.message : e) }));
     return true;
   }
   if (msg.type === "openDownloader") {
@@ -182,6 +220,29 @@ async function setRefererRules(tabId, pairs) {
 }
 
 // ============================================================
+// 页面归属判定
+// ============================================================
+// hostOf 提取 hostname（非法 URL 返回空串；旧记录无该字段时安全）。
+function hostOf(u) {
+  try {
+    return new URL(u).hostname;
+  } catch {
+    return "";
+  }
+}
+
+// sameSite 判定嗅探记录是否属于查询页面：顶层页 pageUrl 或发起请求的 frame
+// 文档 frameUrl 任一命中即算。跨域 iframe 播放器（video 所在 frame 的
+// location.href 与顶层页不同域）必须靠 frameUrl 才能对上；frameUrl 侧仅比
+// hostname（解析页路径对同一站点所有视频都相同，比路径只会全部漏掉）。
+function sameSite(it, pageUrl) {
+  if (!it.pageUrl || !pageUrl) return false;
+  const h = hostOf(pageUrl);
+  if (!h) return false;
+  return hostOf(it.pageUrl) === h || hostOf(it.frameUrl) === h;
+}
+
+// ============================================================
 // 解析当前页面所有可下载项（TS 各档 + MP4 直链）
 // ============================================================
 async function getVideoOptions(tab) {
@@ -194,18 +255,10 @@ async function getVideoOptions(tab) {
     "mp4_list",
   ]);
 
-  // 过滤属于当前页的媒体（同域名或同页面）
-  const samePage = (it) => {
-    if (!it.pageUrl) return false;
-    try {
-      return new URL(it.pageUrl).hostname === new URL(pageUrl).hostname;
-    } catch {
-      return false;
-    }
-  };
-
-  const m3u8Items = m3u8_list.filter(samePage);
-  const mp4Items = mp4_list.filter(samePage);
+  // 过滤属于当前页的媒体（顶层页或发起 frame 任一同域；并自愈过滤历史误录
+  // 的解析页假链接）
+  const m3u8Items = m3u8_list.filter((it) => sameSite(it, pageUrl) && isCandidateURL(it.url));
+  const mp4Items = mp4_list.filter((it) => sameSite(it, pageUrl) && isCandidateURL(it.url));
 
   const options = [];
   let seq = 1;
@@ -319,27 +372,81 @@ function openDownloader(item) {
 // ============================================================
 // 只分析"这个视频"的源
 // ============================================================
-async function getVideoSource({ src = "", pageUrl = "", segmentDir = "", title = "" }) {
+// hostCandidates 取与 pageUrl 同站的全部嗅探记录（顶层页或发起 frame 任一
+// 命中），master 候选排前。
+async function hostCandidates(pageUrl) {
   const { m3u8_list = [], mp4_list = [] } = await chrome.storage.local.get([
     "m3u8_list",
     "mp4_list",
   ]);
+  const hostM3U8 = m3u8_list.filter((it) => sameSite(it, pageUrl) && isCandidateURL(it.url));
+  const hostMP4 = mp4_list.filter((it) => sameSite(it, pageUrl) && isCandidateURL(it.url));
+  // master candidate 永远在前：避免播放器先请求 240p 变体导致我们误中预览片
+  hostM3U8.sort(masterFirst);
+  hostMP4.sort(masterFirst);
+  return { hostM3U8, hostMP4 };
+}
 
-  const sameHost = (it) => {
+// pageCandidates 在同站基础上进一步限定「同一视频页」，逐级收窄、宁多勿漏：
+//   1. frameUrl 完全相等——iframe 播放器场景最准（解析页 URL 的 ?url= 参数
+//      编码了目标 m3u8，同站不同视频的 frameUrl 各不相同，可精确隔离）
+//   2. 顶层页 hostname+pathname 相同——常规站内页（B 站房间号在路径里可隔离）
+//   3. 都为空（SPA 路由变化等）回退同站全集
+async function pageCandidates(pageUrl) {
+  const { hostM3U8, hostMP4 } = await hostCandidates(pageUrl);
+  const byFrame = (it) => !!it.frameUrl && it.frameUrl === pageUrl;
+  const frameM3U8 = hostM3U8.filter(byFrame);
+  const frameMP4 = hostMP4.filter(byFrame);
+  if (frameM3U8.length || frameMP4.length) {
+    return { hostM3U8: frameM3U8, hostMP4: frameMP4 };
+  }
+  const samePath = (it) => {
     if (!it.pageUrl || !pageUrl) return false;
     try {
-      return new URL(it.pageUrl).hostname === new URL(pageUrl).hostname;
+      return new URL(it.pageUrl).pathname === new URL(pageUrl).pathname;
     } catch {
       return false;
     }
   };
+  const pageM3U8 = hostM3U8.filter(samePath);
+  const pageMP4 = hostMP4.filter(samePath);
+  if (pageM3U8.length || pageMP4.length) {
+    return { hostM3U8: pageM3U8, hostMP4: pageMP4 };
+  }
+  return { hostM3U8, hostMP4 };
+}
 
-  let hostM3U8 = m3u8_list.filter(sameHost);
-  let hostMP4 = mp4_list.filter(sameHost);
+// getVideoSources 返回"该视频"的全部候选链接（不挑选、不解析），
+// 供 content.js 做 IDM 式链接列表（解析放页面主世界，避免扩展 Origin 403）。
+async function getVideoSources({ src = "", pageUrl = "" }) {
+  const { hostM3U8, hostMP4 } = await pageCandidates(pageUrl);
+  const sources = [];
+  if (/^https?:/i.test(src)) {
+    sources.push({ type: "mp4", url: src, title: "", pageUrl, fromSrc: true });
+  }
+  for (const it of hostM3U8) {
+    sources.push({
+      type: "ts",
+      url: it.url,
+      title: it.title || "",
+      pageUrl: it.pageUrl || pageUrl,
+    });
+  }
+  for (const it of hostMP4) {
+    sources.push({
+      type: "mp4",
+      url: it.url,
+      title: it.title || "",
+      pageUrl: it.pageUrl || pageUrl,
+      size: it.size || 0,
+    });
+  }
+  // src 直链可能与嗅探到的 mp4 重复
+  return sources.filter((s, i, arr) => arr.findIndex((o) => o.url === s.url) === i);
+}
 
-  // master candidate 永远在前：避免播放器先请求 240p 变体导致我们误中预览片
-  hostM3U8.sort(masterFirst);
-  hostMP4.sort(masterFirst);
+async function getVideoSource({ src = "", pageUrl = "", segmentDir = "", title = "" }) {
+  const { hostM3U8, hostMP4 } = await pageCandidates(pageUrl);
 
   // 1. 如果 video.src 本身就是 http 直链，优先用它
   if (/^https?:/i.test(src)) {

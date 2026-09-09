@@ -8,9 +8,10 @@
 
 - **单文件三模式**：GUI 客户端 / 无头服务 / 命令行直下，一个 exe 全搞定
 - **m3u8/HLS 流媒体**：自动解析 master playlist、多码率选择、边下边写（无需合并），原始 TS 流直接落盘
+- **HLS AES-128 解密**：自动识别 `#EXT-X-KEY` 加密流，拉取密钥并逐分片解密（显式 IV / 按分片序号派生 IV），落盘即明文可播
 - **断点续传**：任务状态持久化到本地，服务重启后自动恢复未完成任务
 - **并发与重试**：分片并发下载、失败自动重试、`--limit` 试片模式
-- **代理支持**：`--proxy` 指定 HTTP/SOCKS5 代理
+- **代理支持**：默认跟随 Windows 系统代理（Clash 等工具开「系统代理」即自动生效），设置页可切换手动指定 / 直连，保存即生效；CLI 模式用 `--proxy` 指定
 - **端口可配置**：监控页设置里可改服务端口（解决端口冲突），重启服务生效
 - **Edge 浏览器扩展**：网页内一键发起下载，自动回填页面 URL 作为 Referer
 - **本地优先**：服务只监听 `127.0.0.1`，监控页与 API 不对外暴露
@@ -41,7 +42,7 @@ go-catcher.exe --url="https://cdn.example.com/video/1080p/video.m3u8" --referer=
 |---|---|
 | `--url` | 下载地址（m3u8 流地址或直链文件） |
 | `--referer` | 来源页 URL，部分站点必填 |
-| `--proxy` | 代理地址，如 `http://127.0.0.1:7890`（空/direct/none = 直连） |
+| `--proxy` | 代理：`system` 跟随 Windows 系统代理（默认）、`http://127.0.0.1:7890` 手动指定、`direct`/`none` 直连 |
 | `-c` | 分片并发数，默认 10 |
 | `-o` | 输出文件名（默认 output.ts；HLS 原始流直接落盘，不做封装转换） |
 | `--limit` | 只下载前 N 个分片（0 = 全部，用于试片） |
@@ -83,10 +84,26 @@ go-catcher.exe
 
 ## 从源码构建
 
-需要 Go 1.24+。
+需要 Go 1.24+（Makefile 依赖 GNU Make，其余构建工具由 `go run` 按需拉取）。
 
 ```powershell
-go build -ldflags "-H=windowsgui -s -w" -o go-catcher.exe .
+make build
 ```
 
-> `-H=windowsgui` 用于 GUI 模式不弹出终端窗口。
+> 等价于：先生成 Windows 资源，再 `go build -ldflags "-H=windowsgui -s -w" -o go-catcher.exe ./cmd/go-catcher`。`-H=windowsgui` 用于 GUI 模式不弹出终端窗口。
+
+其他目标：`make test`（全量测试，含竞态检测）、`make cover`（覆盖率报告）、`make clean`。
+
+### Windows 资源（图标 / 清单）
+
+`cmd/go-catcher/` 下的 `rsrc_windows_*.syso` 是构建产物（`.gitignore` 已排除，不入仓库），`make build` 每次从 `winres/` 源文件重新生成，`go build` 自动链接主包目录的 `.syso`。手工生成：
+
+```powershell
+go run github.com/tc-hib/go-winres@latest make --arch amd64,386,arm64 --in winres/winres.json --out cmd/go-catcher/rsrc
+```
+
+- 图标源：`winres/icon.png`（托盘用 `internal/app/icon.ico`，两者同源，改动时保持同步）
+- 清单：`winres/app.manifest`（Per-Monitor V2 DPI 感知）
+- 配置：`winres/winres.json`
+
+> 图标资源 ID 必须是 `#1`：go-webview2 的 `WindowOptions.IconId` 按 exe 资源 ID 加载窗口类图标（`internal/app/app.go`），改 ID 需同步改 `IconId`，否则任务栏回落为通用图标。

@@ -93,6 +93,60 @@ func TestDetectContainer(t *testing.T) {
 	}
 }
 
+// TestGuardGenericMedia 加密流误判守卫：
+// generic 容器 + 声明加密 + 解密后首片无媒体特征 → 应判定解密失败；
+// 明文 generic / 已知容器 / 解密后含媒体特征 → 放行。
+func TestGuardGenericMedia(t *testing.T) {
+	tsData := make([]byte, 376)
+	tsData[0] = 0x47
+	tsData[188] = 0x47
+
+	encKey := &KeyInfo{Method: "AES-128", URI: "https://x/enc.key"}
+	cipherLike := []byte{0xd2, 0x16, 0xca, 0x5f, 0x25, 0x68, 0xdb, 0xc3, 0x5d, 0xd6, 0x56, 0x5d, 0xdc, 0x6e, 0x59, 0x29}
+
+	cases := []struct {
+		name      string
+		container *Container
+		key       *KeyInfo
+		pre       []byte
+		wantErr   bool
+	}{
+		{
+			name:      "已知容器(ts)+加密声明 → 放行",
+			container: detectContainer(tsData, false),
+			key:       encKey, pre: tsData, wantErr: false,
+		},
+		{
+			name:      "明文 generic(任意文件) → 放行",
+			container: detectContainer([]byte("GENERIC-BINARY"), false),
+			key:       nil, pre: []byte("GENERIC-BINARY"), wantErr: false,
+		},
+		{
+			name:      "generic+加密+解密后含TS特征 → 放行(罕见容器变体,不误伤)",
+			container: findContainerByID("generic"),
+			key:       encKey, pre: tsData, wantErr: false,
+		},
+		{
+			name:      "generic+加密+仍是密文(无媒体特征) → 判失败",
+			container: findContainerByID("generic"),
+			key:       encKey, pre: cipherLike, wantErr: true,
+		},
+		{
+			name:      "generic+加密+解密失败垃圾数据 → 判失败",
+			container: findContainerByID("generic"),
+			key:       encKey, pre: []byte("AAAAAAAAAAAAAAAAAAAAAAAAAAAA"), wantErr: true,
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			err := guardGenericMedia(c.container, c.key, c.pre)
+			if (err != nil) != c.wantErr {
+				t.Fatalf("guardGenericMedia() err=%v wantErr=%v", err, c.wantErr)
+			}
+		})
+	}
+}
+
 // TestWriteInitSegment init 段只在文件为空时写入，重复调用不叠加。
 func TestWriteInitSegment(t *testing.T) {
 	p := filepath.Join(t.TempDir(), "out.mp4.part")
@@ -112,27 +166,28 @@ func TestWriteInitSegment(t *testing.T) {
 	}
 }
 
-// TestContainerBackfillRegistered 收尾处理已注册化：fMP4 容器（两条目 +
-// findContainerByID）必须带 Backfill 回调，无收尾需求的容器（generic）必须为 nil。
-func TestContainerBackfillRegistered(t *testing.T) {
-	if c := findContainerByID("fmp4"); c == nil || c.Backfill == nil {
-		t.Fatalf("findContainerByID(fmp4)=%+v want Backfill 非 nil", c)
+// TestContainerNormStateRegistered 规范化状态工厂已注册化：fMP4 容器（两条目 +
+// findContainerByID）必须带 NewState 工厂（有跨分片规范化状态），
+// 无状态容器（generic）必须为 nil。
+func TestContainerNormStateRegistered(t *testing.T) {
+	if c := findContainerByID("fmp4"); c == nil || c.NewState == nil {
+		t.Fatalf("findContainerByID(fmp4)=%+v want NewState 非 nil", c)
 	}
-	if c := findContainerByID("generic"); c == nil || c.Backfill != nil {
-		t.Fatalf("findContainerByID(generic)=%+v want Backfill nil", c)
+	if c := findContainerByID("generic"); c == nil || c.NewState != nil {
+		t.Fatalf("findContainerByID(generic)=%+v want NewState nil", c)
 	}
-	// 探测路径：内联 init / #EXT-X-MAP 两种 fmp4 形态都要带收尾回调
+	// 探测路径：内联 init / #EXT-X-MAP 两种 fmp4 形态都要带状态工厂
 	for _, d := range [][]byte{
 		[]byte("\x00\x00\x00\x18ftypisom"),
 		[]byte("\x00\x00\x00\x18moofDATA"),
 	} {
 		c := detectContainer(d, true)
-		if c.ID != "fmp4" || c.Backfill == nil {
-			t.Fatalf("detectContainer 命中 %s: Backfill 应为非 nil", c.ID)
+		if c.ID != "fmp4" || c.NewState == nil {
+			t.Fatalf("detectContainer 命中 %s: NewState 应为非 nil", c.ID)
 		}
 	}
-	if c := detectContainer([]byte("GENERIC-BINARY"), false); c.Backfill != nil {
-		t.Fatal("generic 容器 Backfill 应为 nil")
+	if c := detectContainer([]byte("GENERIC-BINARY"), false); c.NewState != nil {
+		t.Fatal("generic 容器 NewState 应为 nil")
 	}
 }
 
@@ -224,7 +279,75 @@ func TestLiveFollowStop(t *testing.T) {
 	}
 }
 
-// TestVODFMP4 点播 fMP4：播放列表带 #EXT-X-MAP，验证 init 段写入 + 首片预取复用。
+// TestVODStreamResumeRemainder 点播续传口径：恢复批次只传剩余分片时，
+// 进度上报的 segTot 必须是绝对总数（断点+本批），每片恰好请求一次。
+func TestVODStreamResumeRemainder(t *testing.T) {
+	var mu sync.Mutex
+	hits := map[string]int{}
+	mux := http.NewServeMux()
+	mux.HandleFunc("/vod.m3u8", func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, "#EXTM3U\n#EXT-X-VERSION:3\n"+
+			"#EXTINF:6.0,\nseg/0.ts\n#EXTINF:6.0,\nseg/1.ts\n"+
+			"#EXTINF:6.0,\nseg/2.ts\n#EXTINF:6.0,\nseg/3.ts\n#EXT-X-ENDLIST\n")
+	})
+	mux.HandleFunc("/seg/", func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		hits[r.URL.Path]++
+		mu.Unlock()
+		fmt.Fprintf(w, "SEG-%s", strings.TrimPrefix(r.URL.Path, "/seg/"))
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	j := &dlJob{m3u8URL: srv.URL + "/vod.m3u8"}
+	var pmu sync.Mutex
+	var tots []int64
+	j.progress = func(stage string, done, tot int64) {
+		pmu.Lock()
+		tots = append(tots, tot)
+		pmu.Unlock()
+	}
+	content, base, isDirect, err := j.fetchPlaylist()
+	if err != nil || isDirect {
+		t.Fatalf("fetchPlaylist: isDirect=%v err=%v", isDirect, err)
+	}
+	pl := parsePlaylist(content, base)
+	if len(pl.segments) != 4 {
+		t.Fatalf("segments=%d want 4", len(pl.segments))
+	}
+
+	out := filepath.Join(t.TempDir(), "vod.ts")
+	// 模拟暂停：首批只写前 2 片（断点 = 2）
+	if n, err := streamDownload(context.Background(), j, pl.segments[:2], 0, 0, out); err != nil || n != 2 {
+		t.Fatalf("首批: n=%d err=%v want 2", n, err)
+	}
+	pmu.Lock()
+	tots = nil // 只校验续传批次的口径
+	pmu.Unlock()
+	// 续传：从断点 2 起只传剩余 2 片
+	if n, err := streamDownload(context.Background(), j, pl.segments[2:], 2, 2, out); err != nil || n != 4 {
+		t.Fatalf("续传: n=%d err=%v want 4", n, err)
+	}
+
+	data, _ := os.ReadFile(out)
+	if want := "SEG-0.tsSEG-1.tsSEG-2.tsSEG-3.ts"; string(data) != want {
+		t.Fatalf("续传后文件=%q want %q（内容不应重复）", data, want)
+	}
+	mu.Lock()
+	for path, c := range hits {
+		if c != 1 {
+			t.Fatalf("分片 %s 请求 %d 次，应恰好一次（续传不重下）", path, c)
+		}
+	}
+	mu.Unlock()
+	pmu.Lock()
+	defer pmu.Unlock()
+	for _, tot := range tots {
+		if tot != 4 {
+			t.Fatalf("续传批次上报 segTot=%d want 4（绝对总数，而非本批长度 2）", tot)
+		}
+	}
+}
 func TestVODFMP4(t *testing.T) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/vod.m3u8", func(w http.ResponseWriter, r *http.Request) {
@@ -277,8 +400,9 @@ func TestVODFMP4(t *testing.T) {
 		t.Fatalf("writeInitSegment: %v", err)
 	}
 	j.pre = pre
+	j.preURL = pl.segments[0]
 
-	next, err := streamDownload(ctx, j, pl.segments, 0, out)
+	next, err := streamDownload(ctx, j, pl.segments, 0, 0, out)
 	if err != nil {
 		t.Fatalf("streamDownload: %v", err)
 	}

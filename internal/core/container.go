@@ -5,6 +5,12 @@
 // 自动修正输出扩展名、写入 fMP4 init 段，无需改动其它代码。
 package core
 
+import (
+	"errors"
+
+	"github.com/0panwang0/go-catcher/internal/fmp4"
+)
+
 // InitPolicy 说明是否需要「初始化段」（fMP4 的 ftyp/moov 文件头）。
 type InitPolicy int
 
@@ -21,17 +27,28 @@ const (
 	ConcatInitAppend                   // 文件头先写 init 段，再 append 分片（fMP4）
 )
 
-// NormState 容器规范化的跨分片状态接口：有状态容器（当前 fMP4）实现
-// 快照/恢复/结束时间累计；无状态容器（generic 等）不实现，NewState 为 nil。
-// 方法未导出：状态实现目前集中在 core 包内，跨包格式可后续导出发布。
+// NormState 容器规范化的跨分片状态接口：有状态容器（当前 fMP4）实现；
+// 无状态容器（generic 等）不实现，NewState 为 nil。
+// 状态对象同时是「数据变换器」：Normalize 对一段写入前的数据（init 段或分片）
+// 做处理，实现内部直接访问自己的具体字段——接口上不泄漏任何容器专属类型，
+// 跨分片信息一律以不透明字节在 Snapshot/Restore 间传递。
+// 方法导出：实现可位于独立工具包（internal/fmp4），靠 Go 接口的结构化
+// 匹配满足本接口，无需反向 import core。
 type NormState interface {
-	snapshot() map[string]uint64
-	restore(map[string]uint64)
-	endSnapshot() map[string]uint64
-	restoreEnd(map[string]uint64)
+	// Snapshot 导出全部跨分片状态（tfdt 基准、结束时间、init 信息）为不透明字节
+	Snapshot() []byte
+	// Restore 载入持久化的状态（断点续传；格式自解释，未知/损坏字节静默忽略）
+	Restore(b []byte)
+
+	// Normalize 处理一段写入前的数据（fMP4：init 段补 mehd 占位 + 分片时间戳
+	// 归一化 + 裸 NAL→AVCC）；非本容器数据原样返回（不报错），保证管线不受影响
+	Normalize(data []byte) ([]byte, error)
+
+	// Finish 任务完成/暂停收尾（fMP4：回填 mehd/mvhd 总时长；无状态容器为空实现）
+	Finish(path string) error
 }
 
-// Container 一种媒体容器格式的完整描述。
+// Container 一种媒体容器格式的完整描述（纯静态事实，不含算法）。
 type Container struct {
 	ID     string
 	Ext    string // 输出文件扩展名（含点）；空 = 保持调用方给定的文件名
@@ -39,14 +56,8 @@ type Container struct {
 	Init   InitPolicy
 	Concat ConcatKind
 	// NewState 创建该容器的跨分片规范化状态；nil = 无状态（generic）。
+	// 状态自带数据变换（normalize）与收尾（finish），容器条目本身不携带算法。
 	NewState func() NormState
-	// Normalize 分片写入前的规范化处理（当前仅 fMP4：时间戳归一化 + 裸 NAL→AVCC）。
-	// st 由 NewState 创建并跨分片复用（tfdt 基准、每轨结束时间、轨道类型）。
-	Normalize func(data []byte, st NormState) ([]byte, error)
-	// Backfill 任务完成/暂停收尾时的容器特定处理（当前仅 fMP4：回填 mehd/mvhd 总时长）。
-	// 容器自有的 init 信息由规范化状态持有（NewState 创建的 st），实现内自行获取；
-	// nil = 无需收尾处理（generic 等）。有 Backfill 的容器必然需要 init 信息（见 pipeline 续传分支）。
-	Backfill func(path string, st NormState) error
 }
 
 // ---- 魔数探测 ----
@@ -136,6 +147,10 @@ func indexBytes(hay, needle []byte) int {
 
 // ---- 注册表 ----
 
+// fmp4State 把 fmp4.NewState 包装为 NormState 接口工厂（注册表条目共用）。
+// 此处即编译期验证：*fmp4.normState 的方法集满足 NormState 接口。
+func fmp4State() NormState { return fmp4.NewState() }
+
 // containerRegistry 按序探测（先命中的格式优先）。fmp4 有两个条目：
 //   - 首片自带 ftyp（完整 init 内联）→ 无需 #EXT-X-MAP，裸拼即可
 //   - 首片是 styp/moof（纯媒体分片）→ 需要 #EXT-X-MAP 提供的 init 段
@@ -143,8 +158,8 @@ func indexBytes(hay, needle []byte) int {
 // generic 恒真 Detect 兜底，必须保持在最后。
 var containerRegistry = []Container{
 	{ID: "ts", Ext: ".ts", Detect: isTS, Init: InitNone, Concat: ConcatAppend},
-	{ID: "fmp4", Ext: ".mp4", Detect: hasFtyp, Init: InitNone, Concat: ConcatAppend, NewState: newFMP4State, Normalize: normalizeFMP4Segment, Backfill: backfillDurations},
-	{ID: "fmp4", Ext: ".mp4", Detect: hasMoof, Init: InitFromMap, Concat: ConcatInitAppend, NewState: newFMP4State, Normalize: normalizeFMP4Segment, Backfill: backfillDurations},
+	{ID: "fmp4", Ext: ".mp4", Detect: hasFtyp, Init: InitNone, Concat: ConcatAppend, NewState: fmp4State},
+	{ID: "fmp4", Ext: ".mp4", Detect: hasMoof, Init: InitFromMap, Concat: ConcatInitAppend, NewState: fmp4State},
 	{ID: "flv", Ext: ".flv", Detect: isFLV, Init: InitNone, Concat: ConcatAppend},
 	{ID: "webm", Ext: ".webm", Detect: isWebM, Init: InitNone, Concat: ConcatAppend},
 	{ID: "mkv", Ext: ".mkv", Detect: isMKV, Init: InitNone, Concat: ConcatAppend},
@@ -159,7 +174,7 @@ var containerRegistry = []Container{
 
 // findContainerByID 按 ID 找回容器（断点续传时恢复规范化等格式相关行为）。
 // fmp4 在注册表有两个条目（内联 init / #EXT-X-MAP）：续传时文件已有 init 段，
-// 只依赖 Normalize 行为（两条目相同），统一返回 #EXT-X-MAP 形态的条目。
+// 状态行为（NewState）两条目相同，统一返回 #EXT-X-MAP 形态的条目。
 func findContainerByID(id string) *Container {
 	var fallback *Container
 	for i := range containerRegistry {
@@ -175,6 +190,58 @@ func findContainerByID(id string) *Container {
 	}
 	return fallback
 }
+
+// looksLikeMedia 宽松判断数据是否具有可识别的媒体特征。
+// 它比 detectContainer 的判定更宽容（只求"看起来像媒体"），
+// 用于加密流场景下的误判守卫：探测结果是 generic 时，若数据连媒体
+// 特征都没有，几乎可断定仍是密文/解密失败，而不是某个罕见但合法的容器。
+func looksLikeMedia(p []byte) bool {
+	if len(p) == 0 {
+		return false
+	}
+	// 高熵随机的 AES 密文偶尔也会撞上单个 0x47 / 字节碰巧命中某魔数前缀，
+	// 故逐项收紧：TS 需连续两包同步、ISO BMFF 需完整 ftyp/moof/styp 判定，
+	// 音频/容器魔数用其最小可区分长度。
+	switch {
+	case isTS(p):
+		return true
+	case hasFtyp(p), hasMoof(p):
+		return true
+	case isFLV(p), isEBML(p), isAAC(p), isMP3(p), isWAV(p), isOgg(p), isAVI(p):
+		return true
+	}
+	return false
+}
+
+// guardGenericMedia 加密流误判守卫。
+// 管线按首个分片探测到 generic 容器（"识别不出已知媒体格式"）时调用：
+//
+//   - key == nil（明文流/直链）：generic 是合法结果（可能是任意文件），放行。
+//   - key != nil（播放列表声明了 #EXT-X-KEY，应解密成媒体）：
+//     此时首个分片若在解密后仍无任何媒体特征，几乎必然意味着解密未生效
+//     或源被加扰，当前正把密文/垃圾当成品保存——这是比"下载失败"更隐蔽的
+//     数据损坏。返回描述性错误让任务判失败，而不是静默产出不可播文件。
+//
+// 已解密出明确媒体格式的分片不会走到这里（detectContainer 会命中 ts/fmp4/...），
+// 因此本守卫只对"真出问题"的加密流生效，不误伤正常下载。
+func guardGenericMedia(container *Container, key *KeyInfo, pre []byte) error {
+	if container == nil || container.ID != "generic" {
+		return nil
+	}
+	if key == nil {
+		return nil
+	}
+	if looksLikeMedia(pre) {
+		// 数据具备媒体特征但未被严格识别（罕见容器变体）：放行，避免误伤。
+		return nil
+	}
+	return errDecryptProbeFailed
+}
+
+// errDecryptProbeFailed generic + 声明加密 + 解密后首片无媒体特征 → 判定解密失败。
+var errDecryptProbeFailed = errors.New(
+	"探测到视频已声明 AES 加密(#EXT-X-KEY)，但解密后的首个分片不包含任何可识别的媒体数据，" +
+		"疑似解密失败或视频源被加扰，已中止下载以避免保存损坏文件")
 
 // detectContainer 根据首个分片的开头字节 + 播放列表元信息识别容器。
 //

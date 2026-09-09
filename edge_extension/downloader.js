@@ -9,6 +9,18 @@ const MAIN_VIDEO_MIN = 60;   // 时长 >= 60s 判定为主视频
 const $ = (sel) => document.querySelector(sel);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+// isCandidateURL 与 background.js 同名实现保持一致（service worker 上下文
+// 隔离无法共享）：过滤路径无媒体扩展名、靠 ?url= 参数尾部伪装 .m3u8 的
+// 解析页假链接，点它下载拉回 HTML 网页任务必失败。
+function isCandidateURL(u) {
+  try {
+    const p = new URL(u);
+    return /\.(m3u8|mp4)$/i.test(p.pathname) || !p.searchParams.has("url");
+  } catch {
+    return false;
+  }
+}
+
 let running = false;
 
 document.addEventListener("DOMContentLoaded", async () => {
@@ -73,8 +85,11 @@ document.addEventListener("DOMContentLoaded", async () => {
 // ============================================================
 async function refreshList() {
   const { m3u8_list = [] } = await chrome.storage.local.get("m3u8_list");
-  renderList(m3u8_list);
-  if (m3u8_list.some((it) => !it.analyzed)) analyzeList(m3u8_list);
+  // 自愈过滤历史误录的解析页假链接（路径无 .m3u8 扩展名、靠 ?url= 参数尾部
+  // 伪装）：点它下载拉回 HTML 网页，任务必失败
+  const list = m3u8_list.filter(isCandidateURL);
+  renderList(list);
+  if (list.some((it) => !it.analyzed)) analyzeList(list);
 }
 
 async function analyzeList(list) {

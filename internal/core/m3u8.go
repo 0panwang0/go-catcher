@@ -2,6 +2,7 @@
 package core
 
 import (
+	"encoding/hex"
 	"fmt"
 	"net/url"
 	"path/filepath"
@@ -83,11 +84,20 @@ func directExtFromURL(raw string) string {
 
 // playlistInfo 一次媒体播放列表解析结果（含分段、init 段与直播/点播标记）。
 type playlistInfo struct {
-	segments  []string // 分片绝对 URL（播放列表内顺序）
-	hasMap    bool     // 存在 #EXT-X-MAP（fMP4 init 段声明）
-	mapURI    string   // init 段绝对 URL（hasMap 时有效）
-	hasEndList bool    // 存在 #EXT-X-ENDLIST（点播；缺失 = 直播/事件流）
-	totalDur  float64  // EXTINF 时长累加（点播总时长 / 直播已见时长）
+	segments   []string // 分片绝对 URL（播放列表内顺序）
+	hasMap     bool     // 存在 #EXT-X-MAP（fMP4 init 段声明）
+	mapURI     string   // init 段绝对 URL（hasMap 时有效）
+	hasEndList bool     // 存在 #EXT-X-ENDLIST（点播；缺失 = 直播/事件流）
+	totalDur   float64  // EXTINF 时长累加（点播总时长 / 直播已见时长）
+	mediaSeq   uint64   // #EXT-X-MEDIA-SEQUENCE（缺省 0；密钥无显式 IV 时派生 IV 用）
+	key        *KeyInfo // #EXT-X-KEY（nil = 明文流；METHOD=NONE 同样为 nil）
+}
+
+// KeyInfo 一条 #EXT-X-KEY 声明（URI 已按播放列表 base 解析为绝对地址）。
+type KeyInfo struct {
+	Method string // AES-128 / SAMPLE-AES …（大写）
+	URI    string // 密钥绝对 URL
+	IV     []byte // 显式 IV（16 字节）；nil = 按 media sequence 派生
 }
 
 // fetchPlaylist 获取并返回媒体播放列表内容与其基准 URL。
@@ -118,6 +128,10 @@ func (j *dlJob) fetchPlaylist() (content, base string, isDirect bool, err error)
 		if err != nil {
 			return "", "", false, err
 		}
+		if !isM3U8Playlist(subBody) {
+			return "", "", false, fmt.Errorf(
+				"子播放列表响应不是 m3u8 内容（可能是网页/解析页）: %s", sanitizeURLForError(subURL))
+		}
 		return string(subBody), subURL, false, nil
 	}
 	return content, base, false, nil
@@ -128,6 +142,9 @@ func (j *dlJob) fetchPlaylist() (content, base string, isDirect bool, err error)
 // 不返回错误：未知标签与非法行一律跳过，由调用方检查 segments 是否为空。
 func parsePlaylist(m3u8Text, base string) playlistInfo {
 	var pl playlistInfo
+	// 剥 BOM：带 BOM 的播放列表首行 "\ufeff#EXTM3U" 不以 # 开头，
+	// 会被当成分片 URL 产出一条垃圾条目
+	m3u8Text = strings.TrimPrefix(m3u8Text, "\ufeff")
 	lines := strings.Split(m3u8Text, "\n")
 	for _, line := range lines {
 		line = strings.TrimSpace(line)
@@ -137,6 +154,14 @@ func parsePlaylist(m3u8Text, base string) playlistInfo {
 		switch {
 		case strings.HasPrefix(line, "#EXT-X-ENDLIST"):
 			pl.hasEndList = true
+		case strings.HasPrefix(line, "#EXT-X-MEDIA-SEQUENCE:"):
+			if v, err := strconv.ParseUint(strings.TrimSpace(strings.TrimPrefix(line, "#EXT-X-MEDIA-SEQUENCE:")), 10, 64); err == nil {
+				pl.mediaSeq = v
+			}
+		case strings.HasPrefix(line, "#EXT-X-KEY:"):
+			// 后一条 key 行覆盖前一条（含 METHOD=NONE 显式转为明文）；
+			// 多 key 播放列表（中途换 key）当前管线按最后一条下载
+			pl.key = parseKeyLine(line, base)
 		case strings.HasPrefix(line, "#EXT-X-MAP:"):
 			if m := regexp.MustCompile(`URI="([^"]*)"`).FindStringSubmatch(line); len(m) == 2 && m[1] != "" {
 				pl.hasMap = true
@@ -165,6 +190,38 @@ func parseEXTINFDuration(line string) float64 {
 	}
 	d, _ := strconv.ParseFloat(rest, 64)
 	return d
+}
+
+// #EXT-X-KEY 行属性的正则（模块级编译，parseKeyLine 每行解析复用；
+// 属性名按大小写不敏感匹配，容忍非规范播放列表）。
+var (
+	keyMethodRe = regexp.MustCompile(`(?i)METHOD=([A-Za-z0-9-]+)`)
+	keyURIRe    = regexp.MustCompile(`(?i)URI="([^"]*)"`)
+	keyIVRe     = regexp.MustCompile(`(?i)IV=0[xX]([0-9A-Fa-f]{32})`)
+)
+
+// parseKeyLine 解析 #EXT-X-KEY 行：METHOD、URI（相对路径按 base 解析）与
+// 十六进制 IV。METHOD=NONE（明文）或缺 URI 返回 nil。
+func parseKeyLine(line, base string) *KeyInfo {
+	m := keyMethodRe.FindStringSubmatch(line)
+	if len(m) != 2 {
+		return nil
+	}
+	method := strings.ToUpper(m[1])
+	if method == "NONE" {
+		return nil
+	}
+	um := keyURIRe.FindStringSubmatch(line)
+	if len(um) != 2 || um[1] == "" {
+		return nil
+	}
+	k := &KeyInfo{Method: method, URI: resolveURL(base, um[1])}
+	if iv := keyIVRe.FindStringSubmatch(line); len(iv) == 2 {
+		if b, err := hex.DecodeString(iv[1]); err == nil {
+			k.IV = b
+		}
+	}
+	return k
 }
 
 func (j *dlJob) pickHighestBitrateM3U8(content string) (string, error) {
