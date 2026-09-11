@@ -31,6 +31,9 @@ func main() {
 	case opts.ServerMode:
 		runHeadless(opts.Port)
 	case len(os.Args) == 1:
+		// GUI 无控制台（windowsgui 子系统）：把诊断输出落盘到 exe 同目录的
+		// gocatcher.log，否则重试/回退/落盘失败这类信息全部进黑洞。
+		core.SetupFileLogging()
 		app.Run()
 	case opts.URL == "":
 		core.PrintUsage()
@@ -42,6 +45,9 @@ func main() {
 
 // runHeadless 无头服务模式：起引擎后阻塞，直到 /svc/stop 或 Ctrl+C。
 func runHeadless(port int) {
+	// 由 bat 用 start 拉起（或 AttachConsole 失败）时同样没有控制台，
+	// 日志落盘保证排障有据可查；有控制台时输出行为不变（tee）。
+	core.SetupFileLogging()
 	eng := core.NewEngine(port)
 	if err := eng.Start(); err != nil {
 		fmt.Fprintf(os.Stderr, "server error: %v\n", err)

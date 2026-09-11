@@ -2,6 +2,7 @@
 package core
 
 import (
+	"bytes"
 	"encoding/hex"
 	"fmt"
 	"net/url"
@@ -91,6 +92,30 @@ type playlistInfo struct {
 	totalDur   float64  // EXTINF 时长累加（点播总时长 / 直播已见时长）
 	mediaSeq   uint64   // #EXT-X-MEDIA-SEQUENCE（缺省 0；密钥无显式 IV 时派生 IV 用）
 	key        *KeyInfo // #EXT-X-KEY（nil = 明文流；METHOD=NONE 同样为 nil）
+	// multiKey 播放列表在"已经下过分片之后"换了另一组 KEY（key rotation）。
+	// 当前管线只保留最后一条 key，前面的分片会被解成随机字节且毫无提示 ——
+	// 用这个标记让调用方显式失败，而不是静默产出损坏文件。
+	multiKey bool
+	// segSeenForKey 当前 key 生效期间已见分片数：只有"用过之后才换 key"才算轮换，
+	// 播放列表里每个分片前重复同一条 key 是合法且常见的写法。
+	segSeenForKey int
+}
+
+// sameKey 判定两条 #EXT-X-KEY 是否等价（METHOD/URI/IV 全同）。
+func sameKey(a, b *KeyInfo) bool {
+	if a == nil || b == nil {
+		return a == nil && b == nil
+	}
+	return a.Method == b.Method && a.URI == b.URI && bytes.Equal(a.IV, b.IV)
+}
+
+// ensureSingleKey 校验播放列表没有中途换 key。key rotation 需要按分片选择
+// 解密器，当前实现不支持；显式报错远好过产出一个"前几段是噪声"的文件。
+func ensureSingleKey(pl playlistInfo) error {
+	if pl.multiKey {
+		return fmt.Errorf("播放列表在中途更换了加密密钥（出现多组不同的 METHOD/URI/IV），当前版本只支持全程同一把密钥，无法安全解密")
+	}
+	return nil
 }
 
 // KeyInfo 一条 #EXT-X-KEY 声明（URI 已按播放列表 base 解析为绝对地址）。
@@ -104,7 +129,7 @@ type KeyInfo struct {
 // 返回的 base 是真正承载分片的那份播放列表的 URL：
 // master playlist 会先选最高码率子流，base 即子流 URL（相对分片按其解析）。
 func (j *dlJob) fetchPlaylist() (content, base string, isDirect bool, err error) {
-	body, isDirect, status, err := httpGetPlaylist(j.m3u8URL, j.referer)
+	body, isDirect, status, err := j.rt.httpGetPlaylist(j.m3u8URL, j.referer)
 	if err != nil {
 		if status != 0 {
 			return "", "", false, fmt.Errorf("HTTP %d: %w", status, err)
@@ -124,7 +149,7 @@ func (j *dlJob) fetchPlaylist() (content, base string, isDirect bool, err error)
 			return "", "", false, err
 		}
 		fmt.Printf("发现 master playlist，选择最高码率: %s\n", subURL)
-		subBody, _, err := httpGetWithRetry(subURL, j.referer)
+		subBody, _, err := j.rt.httpGetWithRetry(subURL, j.referer)
 		if err != nil {
 			return "", "", false, err
 		}
@@ -159,11 +184,19 @@ func parsePlaylist(m3u8Text, base string) playlistInfo {
 				pl.mediaSeq = v
 			}
 		case strings.HasPrefix(line, "#EXT-X-KEY:"):
-			// 后一条 key 行覆盖前一条（含 METHOD=NONE 显式转为明文）；
-			// 多 key 播放列表（中途换 key）当前管线按最后一条下载
-			pl.key = parseKeyLine(line, base)
+			// 后一条 key 行覆盖前一条（含 METHOD=NONE 显式转为明文）。
+			// 但"已经按旧 key 下过分片之后"再换 key 就是 key rotation：管线只
+			// 保留最后一条，前面的分片会被解错。这里记录，交给 ensureSingleKey 报错。
+			nk := parseKeyLine(line, base)
+			if !sameKey(pl.key, nk) {
+				if pl.segSeenForKey > 0 {
+					pl.multiKey = true
+				}
+				pl.segSeenForKey = 0
+			}
+			pl.key = nk
 		case strings.HasPrefix(line, "#EXT-X-MAP:"):
-			if m := regexp.MustCompile(`URI="([^"]*)"`).FindStringSubmatch(line); len(m) == 2 && m[1] != "" {
+			if m := mapURIRe.FindStringSubmatch(line); len(m) == 2 && m[1] != "" {
 				pl.hasMap = true
 				pl.mapURI = resolveURL(base, m[1])
 			}
@@ -175,6 +208,7 @@ func parsePlaylist(m3u8Text, base string) playlistInfo {
 			// 防御：含控制字符的行不是合法 URL（二进制响应切碎后的残片），跳过
 			if !looksBinary(line) {
 				pl.segments = append(pl.segments, resolveURL(base, line))
+				pl.segSeenForKey++
 			}
 		}
 	}
@@ -198,6 +232,8 @@ var (
 	keyMethodRe = regexp.MustCompile(`(?i)METHOD=([A-Za-z0-9-]+)`)
 	keyURIRe    = regexp.MustCompile(`(?i)URI="([^"]*)"`)
 	keyIVRe     = regexp.MustCompile(`(?i)IV=0[xX]([0-9A-Fa-f]{32})`)
+	// mapURIRe #EXT-X-MAP 的 URI 属性（模块级编译，别在逐行循环里反复编译）
+	mapURIRe = regexp.MustCompile(`URI="([^"]*)"`)
 )
 
 // parseKeyLine 解析 #EXT-X-KEY 行：METHOD、URI（相对路径按 base 解析）与
@@ -250,10 +286,12 @@ func (j *dlJob) pickHighestBitrateM3U8(content string) (string, error) {
 	return bestURL, nil
 }
 
+// bandwidthRe #EXT-X-STREAM-INF 的 BANDWIDTH 属性（模块级编译：
+// 原先每次调用都 MustCompile 一遍，逐行解析 master playlist 时白烧 CPU）。
+var bandwidthRe = regexp.MustCompile(`BANDWIDTH=(\d+)`)
+
 func extractBitrate(line string) int64 {
-	re := regexp.MustCompile(`BANDWIDTH=(\d+)`)
-	m := re.FindStringSubmatch(line)
-	if len(m) == 2 {
+	if m := bandwidthRe.FindStringSubmatch(line); len(m) == 2 {
 		bw, _ := strconv.ParseInt(m[1], 10, 64)
 		return bw
 	}

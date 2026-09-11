@@ -133,9 +133,9 @@ func patchMoov(moov []byte, insert bool) ([]byte, int, bool) {
 	newMoov = append(newMoov, moov[:mvexPos+8]...)
 	newMoov = append(newMoov, mehd[:]...)
 	newMoov = append(newMoov, moov[mvexPos+8:]...)
-	binary.BigEndian.PutUint32(newMoov[0:], uint32(len(newMoov)))                    // moov size
-	binary.BigEndian.PutUint32(newMoov[mvexPos:], uint32(mvexSz+20))                 // mvex size
-	return newMoov, mvexPos + 8, true // mehd 位于 mvex 子 box 序列起点
+	binary.BigEndian.PutUint32(newMoov[0:], uint32(len(newMoov)))    // moov size
+	binary.BigEndian.PutUint32(newMoov[mvexPos:], uint32(mvexSz+20)) // mvex size
+	return newMoov, mvexPos + 8, true                                // mehd 位于 mvex 子 box 序列起点
 }
 
 // parseTimescales 解析 mvhd（电影 timescale）与各 trak 的 tkhd/mdhd。
@@ -194,7 +194,7 @@ func parseTrakTimescales(trak []byte, info *fmp4InitInfo) {
 		case "tkhd":
 			trackID = tkhdTrackID(trak[payload:])
 		case "mdia":
-			if ts, ok := mdhdTimescale(trak[pos:pos+sz]); ok {
+			if ts, ok := mdhdTimescale(trak[pos : pos+sz]); ok {
 				trackTS = ts
 			}
 			if m := hdlrMediaType(trak[pos : pos+sz]); m != "" {
@@ -370,7 +370,7 @@ func mehdDuration(n *normState, info *fmp4InitInfo) uint64 {
 		if !ok || ts == 0 {
 			continue
 		}
-		v := end*uint64(info.movieTS) / uint64(ts)
+		v := end * uint64(info.movieTS) / uint64(ts)
 		if v > max {
 			max = v
 		}

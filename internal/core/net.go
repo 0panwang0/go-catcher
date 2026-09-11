@@ -6,13 +6,14 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"net/url"
 	"strings"
-	"sync"
+	"sync/atomic"
 	"time"
 
 	utls "github.com/refraction-networking/utls"
@@ -29,14 +30,15 @@ func (c *bufferedConn) Read(b []byte) (int, error) {
 
 // dialTLSContext: 连接 Clash 代理 → CONNECT 隧道 → uTLS 伪造 Chrome 指纹握手
 // 代理为空 / direct / none 时不走代理，直接连接（Clash 没开或访问国内资源时用）
+//
+// proxyAddr / sharedClient / netMu 均为 Runtime 字段（见 runtime.go），
+// 访问入口是方法 getProxyAddr / setProxyAddr / getClient。
 
-func dialTLSContext(ctx context.Context, network, addr string) (net.Conn, error) {
-	proxy := effectiveProxy()
-	if isDirectStr(proxy) {
-		return dialDirect(ctx, addr)
-	}
-
-	proxyURL, err := url.Parse(proxy)
+// dialProxyTunnel 连上配置的代理并向 addr 建立 CONNECT 隧道。
+// 返回的 *bufferedConn 复用读取 CONNECT 响应时用的 bufio.Reader —— 响应之后
+// 代理可能已经把目标数据一起发过来了，新建 Reader 会把这部分丢掉。
+func (r *Runtime) dialProxyTunnel(ctx context.Context, addr string) (*bufferedConn, error) {
+	proxyURL, err := url.Parse(r.effectiveProxy())
 	if err != nil {
 		return nil, err
 	}
@@ -65,10 +67,34 @@ func dialTLSContext(ctx context.Context, network, addr string) (net.Conn, error)
 		conn.Close()
 		return nil, fmt.Errorf("代理 CONNECT 失败: %s", resp.Status)
 	}
+	return &bufferedConn{r: br, Conn: conn}, nil
+}
+
+// dialContext 处理明文 http://（及非 TLS 的 TCP）目标。
+//
+// http.Transport 只在目标是 https 时才调 DialTLSContext；明文请求会落到默认
+// 拨号器上，也就是**完全绕过用户配置的代理** —— 需要代理的用户遇到 http CDN
+// 会直连失败，甚至把真实 IP 暴露出去。这里补上：直连配置走直连，否则建立
+// CONNECT 隧道（隧道内是明文 HTTP，不做 TLS 握手）。
+func (r *Runtime) dialContext(ctx context.Context, network, addr string) (net.Conn, error) {
+	if r.isDirectProxy() {
+		return (&net.Dialer{Timeout: 30 * time.Second}).DialContext(ctx, network, addr)
+	}
+	return r.dialProxyTunnel(ctx, addr)
+}
+
+func (r *Runtime) dialTLSContext(ctx context.Context, network, addr string) (net.Conn, error) {
+	if r.isDirectProxy() {
+		return dialDirect(ctx, addr)
+	}
+
+	bConn, err := r.dialProxyTunnel(ctx, addr)
+	if err != nil {
+		return nil, err
+	}
 
 	// 4. uTLS 握手 — 伪造 Chrome 指纹
 	host, _, _ := net.SplitHostPort(addr)
-	bConn := &bufferedConn{r: br, Conn: conn}
 
 	uConn := utls.UClient(bConn, &utls.Config{
 		ServerName: host,
@@ -100,17 +126,17 @@ func dialTLSContext(ctx context.Context, network, addr string) (net.Conn, error)
 
 // effectiveProxy 返回本次连接实际使用的代理地址（空 = 直连）。
 // "system" 模式每次建连现读注册表：Clash 开关系统代理、改端口即时跟随。
-func effectiveProxy() string {
-	p := strings.TrimSpace(getProxyAddr())
+func (r *Runtime) effectiveProxy() string {
+	p := strings.TrimSpace(r.getProxyAddr())
 	if strings.EqualFold(p, "system") {
-		return systemProxyAddr()
+		return r.systemProxyAddr()
 	}
 	return p
 }
 
 // isDirectProxy 当前是否直连（含 system 模式下系统代理未启用的情况）。
-func isDirectProxy() bool {
-	return isDirectStr(effectiveProxy())
+func (r *Runtime) isDirectProxy() bool {
+	return isDirectStr(r.effectiveProxy())
 }
 
 // isDirectStr 代理串的直连判定（空 / direct / none / off，不区分大小写）。
@@ -135,14 +161,14 @@ func dialDirect(ctx context.Context, addr string) (net.Conn, error) {
 	return uConn, nil
 }
 
-func newRequest(target, ref string) (*http.Request, error) {
+func (r *Runtime) newRequest(target, ref string) (*http.Request, error) {
 	req, err := http.NewRequest("GET", target, nil)
 	if err != nil {
 		return nil, err
 	}
 	// 伪造浏览器请求头。Origin 从 Referer 的同源推导（浏览器里真实播放时就是这么发的）；
 	// Referer 为空则不设 Origin。
-	req.Header.Set("User-Agent", userAgent)
+	req.Header.Set("User-Agent", r.userAgent)
 	req.Header.Set("Referer", ref)
 	if u, err := url.Parse(ref); err == nil && u.Scheme != "" && u.Host != "" {
 		req.Header.Set("Origin", u.Scheme+"://"+u.Host)
@@ -192,15 +218,15 @@ func cleanURLParseErr(err error, target string) error {
 
 // 带重试的 HTTP GET
 
-func httpGetWithRetry(target, ref string) ([]byte, int, error) {
+func (r *Runtime) httpGetWithRetry(target, ref string) ([]byte, int, error) {
 	var lastErr error
 	var lastStatus int
-	for attempt := 1; attempt <= maxRetries; attempt++ {
-		req, err := newRequest(target, ref)
+	for attempt := 1; attempt <= r.maxRetriesNow(); attempt++ {
+		req, err := r.newRequest(target, ref)
 		if err != nil {
 			return nil, 0, cleanURLParseErr(err, target)
 		}
-		resp, err := getClient().Do(req)
+		resp, err := r.getClient().Do(req)
 		if err != nil {
 			lastErr = fmt.Errorf("attempt %d: %w", attempt, err)
 			time.Sleep(time.Duration(attempt*2) * time.Second)
@@ -262,15 +288,15 @@ func isM3U8Playlist(body []byte) bool {
 // httpGetPlaylist 获取 m3u8 播放列表；若响应是直链媒体文件（MP4 等），
 // 只读取开头一小段识别后即返回（isDirect=true），由上层改为流式整体下载，
 // 避免把整个大文件读进内存。文本播放列表则读完剩余部分一并返回。
-func httpGetPlaylist(target, ref string) (body []byte, isDirect bool, status int, err error) {
+func (r *Runtime) httpGetPlaylist(target, ref string) (body []byte, isDirect bool, status int, err error) {
 	const peekLen = 32 << 10 // 32KB：足够判断文本播放列表与二进制媒体头
 	var lastErr error
-	for attempt := 1; attempt <= maxRetries; attempt++ {
-		req, rerr := newRequest(target, ref)
+	for attempt := 1; attempt <= r.maxRetriesNow(); attempt++ {
+		req, rerr := r.newRequest(target, ref)
 		if rerr != nil {
 			return nil, false, 0, cleanURLParseErr(rerr, target)
 		}
-		resp, rerr := getClient().Do(req)
+		resp, rerr := r.getClient().Do(req)
 		if rerr != nil {
 			lastErr = fmt.Errorf("attempt %d: %w", attempt, rerr)
 			time.Sleep(time.Duration(attempt*2) * time.Second)
@@ -335,16 +361,10 @@ func httpGetPlaylist(target, ref string) (body []byte, isDirect bool, status int
 
 // 从 URL 中提取 base path（用于拼接相对路径，保留尾部 /）
 
-var (
-	netMu        sync.Mutex // 保护 proxyAddr 与 sharedClient（代理运行时可经 /config 修改）
-	proxyAddr    = "system" // 默认跟随 Windows 系统代理（Clash 开箱即用）
-	sharedClient *http.Client
-)
-
-func getProxyAddr() string {
-	netMu.Lock()
-	defer netMu.Unlock()
-	return proxyAddr
+func (r *Runtime) getProxyAddr() string {
+	r.netMu.Lock()
+	defer r.netMu.Unlock()
+	return r.proxyAddr
 }
 
 // setProxyAddr 更新代理并整体换新共享客户端。只关空闲连接不够：连接池里
@@ -353,38 +373,118 @@ func getProxyAddr() string {
 // 新代理；仅保存瞬间在飞的请求（每任务最多分片并发数个）持旧 client 引用
 // 在旧代理上收尾。值未变化时不动连接池——applyConfigLocked 对任何配置
 // 保存都会调用，不能因改个并发数就迫使所有任务重握 TLS。
-func setProxyAddr(v string) {
-	netMu.Lock()
-	defer netMu.Unlock()
-	if v == proxyAddr {
+func (r *Runtime) setProxyAddr(v string) {
+	r.netMu.Lock()
+	defer r.netMu.Unlock()
+	if v == r.proxyAddr {
 		return
 	}
-	proxyAddr = v
-	if sharedClient != nil {
-		old := sharedClient
-		sharedClient = nil // 下次 getClient() 重建，走新代理
+	r.proxyAddr = v
+	if r.sharedClient != nil {
+		old := r.sharedClient
+		r.sharedClient = nil // 下次 getClient() 重建，走新代理
 		old.CloseIdleConnections()
 	}
 }
 
+// systemProxyAddr 读系统代理（经可注入钩子，测试可替换）。
+func (r *Runtime) systemProxyAddr() string {
+	if r.systemProxyAddrFn == nil {
+		return ""
+	}
+	return r.systemProxyAddrFn()
+}
+
 // getClient 取共享 HTTP 客户端（首次调用时构建）。
-func getClient() *http.Client {
-	netMu.Lock()
-	defer netMu.Unlock()
-	if sharedClient == nil {
-		sharedClient = &http.Client{
+//
+// 这里刻意**不设** http.Client.Timeout：它计的是「从发起请求到读完整个响应体」，
+// 大文件直链在慢链路上必然超过任何固定值（此前 90s 就是这么把下载掐死的）。
+// 超时按阶段拆开：
+//   - TLSHandshakeTimeout    TLS 握手
+//   - ResponseHeaderTimeout  等响应头（服务端"收下请求就不吭声"的场景）
+//   - IdleConnTimeout        连接池内空闲连接回收
+//   - 响应体读取用「空闲超时」（见 copyWithIdleTimeout）：只要还在持续收到
+//     数据就不算超时，连续无数据到达才判卡死
+func (r *Runtime) getClient() *http.Client {
+	r.netMu.Lock()
+	defer r.netMu.Unlock()
+	if r.sharedClient == nil {
+		r.sharedClient = &http.Client{
 			Transport: &http.Transport{
 				// 不走环境 HTTP(S)_PROXY——代理只由设置页 / --proxy 控制（经 DialTLSContext）
-				Proxy:               nil,
-				DialTLSContext:      dialTLSContext,
-				MaxIdleConns:        200,
-				MaxIdleConnsPerHost: 50,
-				IdleConnTimeout:     90 * time.Second,
+				Proxy:                 nil,
+				DialContext:           r.dialContext,    // 明文 http://（Transport 不会为它调 DialTLSContext）
+				DialTLSContext:        r.dialTLSContext, // https:// 走 uTLS 指纹
+				MaxIdleConns:          200,
+				MaxIdleConnsPerHost:   50,
+				IdleConnTimeout:       90 * time.Second,
+				TLSHandshakeTimeout:   15 * time.Second,
+				ResponseHeaderTimeout: 30 * time.Second,
 			},
-			Timeout: 90 * time.Second,
 		}
 	}
-	return sharedClient
+	return r.sharedClient
+}
+
+// ============================================================
+// 传输层超时
+// ------------------------------------------------------------
+// 固定总时长超时（如旧的 Client.Timeout=90s）与"大文件 + 慢链路"天然冲突：
+// 前者解决不了，后者必然被误杀。真正要防的是"连接卡死"——TCP 半开、
+// 服务端收下请求后不再发送。判据是"有没有新数据到达"，而不是"总共花了多久"。
+// ============================================================
+
+// transferIdleTimeout 响应体读取的空闲超时（连续该时长无数据到达即判卡死）。
+const transferIdleTimeout = 60 * time.Second
+
+// errTransferStalled 传输空闲超时。调用方需先查 ctx.Err() 以区分"用户暂停"。
+var errTransferStalled = fmt.Errorf(
+	"传输中断：连续 %s 无数据到达（连接卡死或服务端已停止响应）", transferIdleTimeout)
+
+// copyWithIdleTimeout 把 body 拷到 dst，读空闲超过 idle 即关闭 body 中断传输。
+// 返回已写字节数与错误；正常情况下 io.EOF 归零为 nil。
+//
+// body.Close() 是 net/http 官方支持的"从另一 goroutine 中断阻塞读"手段：
+// 关闭后阻塞中的 Read 会立刻返回错误，连接同时被作废（不会把半个连接还回池）。
+func copyWithIdleTimeout(dst io.Writer, body io.ReadCloser, idle time.Duration) (int64, error) {
+	var stalled atomic.Bool
+	timer := time.AfterFunc(idle, func() {
+		stalled.Store(true)
+		body.Close()
+	})
+	defer timer.Stop()
+
+	buf := make([]byte, 128<<10)
+	var total int64
+	for {
+		n, rerr := body.Read(buf)
+		if n > 0 {
+			timer.Reset(idle) // 有数据到达 → 重新计时
+			if _, werr := dst.Write(buf[:n]); werr != nil {
+				return total, werr
+			}
+			total += int64(n)
+		}
+		if rerr != nil {
+			switch {
+			case errors.Is(rerr, io.EOF):
+				return total, nil
+			case stalled.Load():
+				return total, errTransferStalled
+			default:
+				return total, rerr
+			}
+		}
+	}
+}
+
+// readAllWithIdleTimeout 读整个 body 到内存，带空闲超时（小分片用）。
+func readAllWithIdleTimeout(body io.ReadCloser, idle time.Duration) ([]byte, error) {
+	var buf bytes.Buffer
+	if _, err := copyWithIdleTimeout(&buf, body, idle); err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
 }
 
 // dlJob：单个下载任务的全部状态。同一时刻可存在多个 dlJob 并行跑。

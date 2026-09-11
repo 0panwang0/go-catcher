@@ -13,16 +13,16 @@ import (
 // saveRestoreHTTP 覆盖 sharedClient 与 maxRetries 全局，测试结束恢复。
 func saveRestoreHTTP(t *testing.T, c *http.Client, retries int) {
 	t.Helper()
-	oldClient, oldRetries := sharedClient, maxRetries
-	netMu.Lock()
-	sharedClient = c
-	netMu.Unlock()
-	maxRetries = retries
+	oldClient, oldRetries := testStd.sharedClient, testStd.maxRetriesNow()
+	testStd.netMu.Lock()
+	testStd.sharedClient = c
+	testStd.netMu.Unlock()
+	testStd.setDownloadTuning(-1, retries)
 	t.Cleanup(func() {
-		netMu.Lock()
-		sharedClient = oldClient
-		netMu.Unlock()
-		maxRetries = oldRetries
+		testStd.netMu.Lock()
+		testStd.sharedClient = oldClient
+		testStd.netMu.Unlock()
+		testStd.setDownloadTuning(-1, oldRetries)
 	})
 }
 
@@ -38,7 +38,7 @@ func TestHTTPGetWithRetryGzipFallback(t *testing.T) {
 	defer srv.Close()
 	// DisableCompression：模拟个别 CDN 把压缩流原样返回的场景
 	saveRestoreHTTP(t, &http.Client{Transport: &http.Transport{DisableCompression: true}}, 2)
-	body, status, err := httpGetWithRetry(srv.URL, "")
+	body, status, err := testStd.httpGetWithRetry(srv.URL, "")
 	if err != nil {
 		t.Fatalf("httpGetWithRetry: %v", err)
 	}
@@ -60,7 +60,7 @@ func TestHTTPGetWithRetryStatusFailure(t *testing.T) {
 	defer srv.Close()
 	saveRestoreHTTP(t, srv.Client(), 1) // 1 次尝试，避免长时间 sleep
 
-	_, status, err := httpGetWithRetry(srv.URL, "")
+	_, status, err := testStd.httpGetWithRetry(srv.URL, "")
 	if status != http.StatusNotFound {
 		t.Fatalf("status=%d want 404", status)
 	}
@@ -80,7 +80,7 @@ func TestHTTPGetWithRetrySuccess(t *testing.T) {
 	defer srv.Close()
 	saveRestoreHTTP(t, srv.Client(), 3)
 
-	body, status, err := httpGetWithRetry(srv.URL, "")
+	body, status, err := testStd.httpGetWithRetry(srv.URL, "")
 	if err != nil || status != http.StatusOK || string(body) != "plain" {
 		t.Fatalf("body=%q status=%d err=%v", body, status, err)
 	}
@@ -89,7 +89,7 @@ func TestHTTPGetWithRetrySuccess(t *testing.T) {
 // TestHTTPGetWithRetryBadURL 非法 URL 直接报错不发起请求。
 func TestHTTPGetWithRetryBadURL(t *testing.T) {
 	saveRestoreHTTP(t, &http.Client{}, 3)
-	_, _, err := httpGetWithRetry("://bad url", "")
+	_, _, err := testStd.httpGetWithRetry("://bad url", "")
 	if err == nil {
 		t.Fatal("非法 URL 应报错")
 	}
@@ -100,8 +100,8 @@ func TestHTTPGetWithRetryBadURL(t *testing.T) {
 func TestIsM3U8Playlist(t *testing.T) {
 	valid := []string{
 		"#EXTM3U\n#EXTINF:1,\ns.ts\n",
-		"#EXTM3U",                        // 无换行的最简形式
-		"\ufeff#EXTM3U\n#EXTINF:1,\n",    // BOM
+		"#EXTM3U",                         // 无换行的最简形式
+		"\ufeff#EXTM3U\n#EXTINF:1,\n",     // BOM
 		"\n\n#EXTM3U\n#EXTINF:1,\ns.ts\n", // 前导空行
 	}
 	for _, s := range valid {
@@ -110,10 +110,10 @@ func TestIsM3U8Playlist(t *testing.T) {
 		}
 	}
 	invalid := []string{
-		"",                       // 空
-		"\ufeff",                 // 仅 BOM
+		"",                           // 空
+		"\ufeff",                     // 仅 BOM
 		"<!DOCTYPE html>\n<html>...", // HTML 页面
-		"random text",            // 普通文本
+		"random text",                // 普通文本
 	}
 	for _, s := range invalid {
 		if isM3U8Playlist([]byte(s)) {
@@ -135,7 +135,7 @@ func TestFetchPlaylistRejectsHTML(t *testing.T) {
 	// maxRetries=3：若误走重试路径会请求 3 次，校验应首次即失败
 	saveRestoreHTTP(t, srv.Client(), 3)
 
-	j := &dlJob{m3u8URL: srv.URL + "/play/?url=https://x.com/a.m3u8", referer: ""}
+	j := &dlJob{rt: testStd, m3u8URL: srv.URL + "/play/?url=https://x.com/a.m3u8", referer: ""}
 	_, _, _, err := j.fetchPlaylist()
 	if err == nil || !strings.Contains(err.Error(), "不是 m3u8 播放列表") {
 		t.Fatalf("err=%v want 指向非 m3u8 的明确错误", err)
@@ -153,7 +153,7 @@ func TestFetchPlaylistAcceptsBOM(t *testing.T) {
 	defer srv.Close()
 	saveRestoreHTTP(t, srv.Client(), 1)
 
-	j := &dlJob{m3u8URL: srv.URL + "/index.m3u8", referer: ""}
+	j := &dlJob{rt: testStd, m3u8URL: srv.URL + "/index.m3u8", referer: ""}
 	content, base, isDirect, err := j.fetchPlaylist()
 	if err != nil {
 		t.Fatalf("fetchPlaylist: %v", err)
@@ -186,7 +186,7 @@ func TestFetchPlaylistMasterSubNotPlaylist(t *testing.T) {
 	defer srv.Close()
 	saveRestoreHTTP(t, srv.Client(), 1)
 
-	j := &dlJob{m3u8URL: srv.URL + "/master.m3u8", referer: ""}
+	j := &dlJob{rt: testStd, m3u8URL: srv.URL + "/master.m3u8", referer: ""}
 	_, _, _, err := j.fetchPlaylist()
 	if err == nil || !strings.Contains(err.Error(), "子播放列表") {
 		t.Fatalf("err=%v want 子播放列表校验失败", err)
@@ -197,32 +197,32 @@ func TestFetchPlaylistMasterSubNotPlaylist(t *testing.T) {
 // 空闲连接，归还回来的旧代理连接会被进行中任务的下一个分片继续借走。
 // 置 nil 重建后 getClient 返回新实例；同值重复设置不动连接池。
 func TestSetProxyAddrSwapsClient(t *testing.T) {
-	oldProxy, oldClient := getProxyAddr(), sharedClient
+	oldProxy, oldClient := testStd.getProxyAddr(), testStd.sharedClient
 	t.Cleanup(func() {
-		netMu.Lock()
-		sharedClient = oldClient
-		netMu.Unlock()
-		setProxyAddr(oldProxy)
+		testStd.netMu.Lock()
+		testStd.sharedClient = oldClient
+		testStd.netMu.Unlock()
+		testStd.setProxyAddr(oldProxy)
 	})
 
 	// 预置一个「旧代理」客户端
 	old := &http.Client{}
-	netMu.Lock()
-	sharedClient = old
-	netMu.Unlock()
+	testStd.netMu.Lock()
+	testStd.sharedClient = old
+	testStd.netMu.Unlock()
 
-	setProxyAddr("http://10.0.0.1:8080")
-	if getProxyAddr() != "http://10.0.0.1:8080" {
-		t.Fatalf("proxy=%q", getProxyAddr())
+	testStd.setProxyAddr("http://10.0.0.1:8080")
+	if testStd.getProxyAddr() != "http://10.0.0.1:8080" {
+		t.Fatalf("proxy=%q", testStd.getProxyAddr())
 	}
-	if getClient() == old {
+	if testStd.getClient() == old {
 		t.Fatal("换代理后应重建客户端，旧实例不得复用")
 	}
 
 	// 同值重复设置：客户端保持原实例（配置页保存其它字段也走这里）
-	cur := getClient()
-	setProxyAddr("http://10.0.0.1:8080")
-	if getClient() != cur {
+	cur := testStd.getClient()
+	testStd.setProxyAddr("http://10.0.0.1:8080")
+	if testStd.getClient() != cur {
 		t.Fatal("代理未变化时不应重建客户端（白白丢连接池重握手）")
 	}
 }

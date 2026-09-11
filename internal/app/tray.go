@@ -78,7 +78,8 @@ var (
 // 调用失败（版本太老）也不致命——浅色标题栏仍然可用。
 //
 // DwmSetWindowAttribute 签名：
-//   HRESULT DwmSetWindowAttribute(HWND hwnd, DWORD dwAttribute, LPCVOID pvAttribute, DWORD cbAttribute);
+//
+//	HRESULT DwmSetWindowAttribute(HWND hwnd, DWORD dwAttribute, LPCVOID pvAttribute, DWORD cbAttribute);
 func enableDarkTitleBar(hwnd uintptr) {
 	// 1) 沉浸式深色（让标题栏文本/控件变成白色，Win11 用 attr=20，Win10 1903 用 attr=19）。
 	var enabled int32 = 1

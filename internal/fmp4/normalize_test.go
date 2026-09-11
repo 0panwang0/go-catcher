@@ -388,9 +388,9 @@ func TestNormalizeFMP4Passthrough(t *testing.T) {
 	cases := [][]byte{
 		nil,
 		[]byte("GENERIC-BINARY-NOT-MP4"),
-		[]byte{0x47, 0x11, 0x22, 0x33, 0x47, 0x00}, // TS 头
+		[]byte{0x47, 0x11, 0x22, 0x33, 0x47, 0x00},            // TS 头
 		{0, 0, 0, 12, 'f', 't', 'y', 'p', 'i', 's', 'o', 'm'}, // 仅 ftyp，无 moof
-		{0, 0, 0, 8, 'm', 'o', 'o', 'f'},                       // 空 moof
+		{0, 0, 0, 8, 'm', 'o', 'o', 'f'},                      // 空 moof
 	}
 	for i, d := range cases {
 		out, err := normalizeFMP4Segment(d, st)

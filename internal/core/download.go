@@ -18,15 +18,22 @@ import (
 )
 
 type dlJob struct {
+	// rt 是任务所属运行时（创建任务时注入）：分片并发/重试参数、共享 HTTP
+	// 客户端、直播轮询参数、伪造 UA 等都经它读取，不再依赖包级全局。
+	rt      *Runtime
 	id      string // 任务 ID（server 模式分配；CLI 模式为空）
 	m3u8URL string
 	referer string
 	saveDir string // 目标保存目录
 	fname   string // 目标文件名（含扩展名）
 	limit   int    // 分片上限（0 = 全部）
-	// 分片进度（每任务独立原子计数）
-	segDone int64
-	segTot  int64
+	// 分片进度（每任务独立原子计数）。
+	// segDone 是"已写进缓冲区"的序号（给界面看，反映真实进度）；
+	// segFlushed 是"已确认落盘"的序号（给断点持久化用，见 swFlushBytes 注释）。
+	// 两者分开：进度要即时，断点必须保守。
+	segDone    int64
+	segFlushed int64
+	segTot     int64
 	// 供 server 模式刷新任务状态；CLI 模式为空
 	progress func(stage string, segDone, segTot int64)
 
@@ -51,6 +58,9 @@ type dlJob struct {
 	// preURL 容器探测预取分片的 URL（streamDownload 复用 pre 前核对，
 	// 防直播列表滚动后首片张冠李戴写错内容）
 	preURL string
+	// initLen 本次实际写入 .part 头的 init 段长度（0 = 无 init 段或续传）。
+	// 落盘校验用它兜住"只落了 init 段、分片一个没写"的假成功。
+	initLen int
 }
 
 // seenHas / seenAdd / seenSnapshot 直播分片去重与持久化窗口。
@@ -98,6 +108,15 @@ func (j *dlJob) setSeg(done, tot int64) {
 
 func (j *dlJob) segNow() int64 { return atomic.LoadInt64(&j.segDone) }
 
+// segFlushedNow 返回"已确认落盘"的断点。持久化必须用它而不是 segNow()：
+// segNow() 可能领先磁盘若干 MB，拿它当断点续传会在文件中间留下空洞。
+func (j *dlJob) segFlushedNow() int64 { return atomic.LoadInt64(&j.segFlushed) }
+
+// setSegFlushed 推进已落盘断点（streamWriter 每次 flush 后回调）。
+func (j *dlJob) setSegFlushed(n int64) {
+	atomic.StoreInt64(&j.segFlushed, n)
+}
+
 func (j *dlJob) segTotal() int64 { return atomic.LoadInt64(&j.segTot) }
 
 // ============================================================
@@ -112,35 +131,49 @@ func (j *dlJob) segTotal() int64 { return atomic.LoadInt64(&j.segTot) }
 //
 // 额外收益：next 之前的数据都已落盘，next 天然就是断点，
 // 暂停 / 崩溃 / 重启后都能从 next 继续 append（断点续传）。
-// 内存有界：同时在飞的分片数 = concurrency，乱序到达的暂存在 buf。
+// 内存有界：同时在飞的分片数 = concurrencyNow()，乱序到达的暂存在 buf。
 // ============================================================
 
 // streamWriter 按严格顺序把到达的分片 append 到目标文件。
 
+// swFlushBytes 是 streamWriter 的主动刷新阈值：缓冲区攒够这么多字节就 flush 一次。
+//
+// 为什么不能只靠 bufio 自动刷（R9）：进度计数会被当成断点持久化，而它记录的
+// 是"已写进缓冲区"而非"已落盘"。Engine.Stop 在 waitTasksSettled(3s) 超时后
+// 直接落盘，此时计数可能领先磁盘最多一个缓冲区（8MB）；重启续传从该断点往后
+// append，中间这段就永久缺失 —— 文件错位甚至直接损坏。
+// 因此把"可持久化断点"（flushed）与"界面进度"（next）分开，并且 flushed
+// 只在 flush 成功后才推进。
+const swFlushBytes = 1 << 20 // 1MB
+
 type streamWriter struct {
 	mu      sync.Mutex
-	next    int            // 下一个待写入的分片序号（= 断点）
+	next    int            // 下一个待写入缓冲区的分片序号（= 内存断点）
+	flushed int            // 已确认落盘的断点：所有 < flushed 的分片字节都已 flush
 	buf     map[int][]byte // 乱序到达、暂时还不能写的数据
 	w       *bufio.Writer
 	f       *os.File
-	onWrite func(next int)    // 每次推进后回调（用来刷新进度）
+	onWrite func(next int)      // 每次推进后回调（刷新界面进度）
+	onFlush func(flushed int)   // 每次落盘后回调（推进可持久化断点）
 	norm    func([]byte) []byte // 写入前的规范化（nil = 原样写）
 }
 
 // newStreamWriter 以追加模式打开 path（不存在则创建），从 startIdx 开始写。
 // 追加模式是断点续传的关键：恢复时直接从上次断点继续往后写。
 
-func newStreamWriter(path string, startIdx int, onWrite func(int), norm func([]byte) []byte) (*streamWriter, error) {
+func newStreamWriter(path string, startIdx int, onWrite, onFlush func(int), norm func([]byte) []byte) (*streamWriter, error) {
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
 	if err != nil {
 		return nil, err
 	}
 	return &streamWriter{
 		next:    startIdx,
+		flushed: startIdx,
 		buf:     make(map[int][]byte),
 		w:       bufio.NewWriterSize(f, 8<<20),
 		f:       f,
 		onWrite: onWrite,
+		onFlush: onFlush,
 		norm:    norm,
 	}, nil
 }
@@ -169,10 +202,29 @@ func (sw *streamWriter) submit(idx int, data []byte) error {
 		}
 		sw.next++
 	}
+	// 攒够阈值就落盘，并把"可持久化断点"推进到 flush 之后的位置。
+	// 界面进度始终报 next（真实进度），断点只报 flushed（保守值）。
+	sw.flushLocked()
 	if sw.onWrite != nil {
 		sw.onWrite(sw.next)
 	}
 	return nil
+}
+
+// flushLocked 在缓冲达到阈值时落盘并推进 flushed（调用方须持 mu）。
+func (sw *streamWriter) flushLocked() {
+	if sw.w.Buffered() < swFlushBytes {
+		return
+	}
+	if err := sw.w.Flush(); err != nil {
+		return // 写入错误由下一次 Write 暴露，这里不吞掉断点推进即可
+	}
+	if sw.flushed != sw.next {
+		sw.flushed = sw.next
+		if sw.onFlush != nil {
+			sw.onFlush(sw.flushed)
+		}
+	}
 }
 
 // Next 返回当前断点（下一个待写序号），暂停时用它作为续传起点。
@@ -188,11 +240,18 @@ func (sw *streamWriter) Next() int {
 func (sw *streamWriter) Close() error {
 	sw.mu.Lock()
 	defer sw.mu.Unlock()
-	if err := sw.w.Flush(); err != nil {
-		sw.f.Close()
+	err := sw.w.Flush()
+	if err == nil {
+		// 尾部数据已落盘，断点可以安全推进到 next
+		sw.flushed = sw.next
+		if sw.onFlush != nil {
+			sw.onFlush(sw.flushed)
+		}
+		err = sw.f.Close()
 		return err
 	}
-	return sw.f.Close()
+	sw.f.Close()
+	return err
 }
 
 // downloadDirect 直链文件（MP4 等）整体下载：流式把响应体写入 outPath。
@@ -200,6 +259,7 @@ func (sw *streamWriter) Close() error {
 //  1. 分片续传：.part.meta 位图存在 → 只下载未完成的分片
 //  2. 分片下载：全新文件且服务器支持 Range（Content-Range 给出总大小）→ 并发分片
 //  3. 单连接续传：其余情况 → Range 追加（206）/ 全量覆盖（200）/ 丢弃重下（416）
+//
 // 分片模式下 ctx 取消或失败保留 .part 与 .meta，任务恢复后从位图断点继续。
 func (j *dlJob) downloadDirect(ctx context.Context, outPath string) error {
 	// 模式 1：分片续传（位图恢复）
@@ -210,7 +270,7 @@ func (j *dlJob) downloadDirect(ctx context.Context, outPath string) error {
 	// 模式 2：全新下载且服务器支持 Range → 分片下载（小文件不值得分片）
 	if partFileOffset(outPath) == 0 {
 		if total, ok := j.probeRange(ctx); ok && total > minChunkedSize {
-			m := newChunkMeta(total, concurrency)
+			m := newChunkMeta(total, j.rt.concurrencyNow())
 			if err := saveChunkMeta(outPath, m); err != nil {
 				return err
 			}
@@ -221,7 +281,7 @@ func (j *dlJob) downloadDirect(ctx context.Context, outPath string) error {
 	// 模式 3：单连接续传
 	offset := partFileOffset(outPath)
 	for attempt := 0; ; attempt++ {
-		req, err := newRequest(j.m3u8URL, j.referer)
+		req, err := j.rt.newRequest(j.m3u8URL, j.referer)
 		if err != nil {
 			return cleanURLParseErr(err, j.m3u8URL)
 		}
@@ -229,7 +289,7 @@ func (j *dlJob) downloadDirect(ctx context.Context, outPath string) error {
 		if offset > 0 {
 			req.Header.Set("Range", fmt.Sprintf("bytes=%d-", offset))
 		}
-		resp, err := getClient().Do(req)
+		resp, err := j.rt.getClient().Do(req)
 		if err != nil {
 			return err
 		}
@@ -305,12 +365,12 @@ func newChunkMeta(total int64, workers int) *chunkMeta {
 // probeRange 探测服务器是否支持 Range 并取得文件总大小。
 // 发 Range: bytes=0-0，仅当 206 且 Content-Range 给出明确总大小时确认可用。
 func (j *dlJob) probeRange(ctx context.Context) (int64, bool) {
-	req, err := newRequest(j.m3u8URL, j.referer)
+	req, err := j.rt.newRequest(j.m3u8URL, j.referer)
 	if err != nil {
 		return 0, false
 	}
 	req.Header.Set("Range", "bytes=0-0")
-	resp, err := getClient().Do(req)
+	resp, err := j.rt.getClient().Do(req)
 	if err != nil {
 		return 0, false
 	}
@@ -333,7 +393,7 @@ func (j *dlJob) probeRange(ctx context.Context) (int64, bool) {
 var errChunkStale = errors.New("服务器内容已变化（HTTP 416）")
 
 // downloadChunked 并发下载未完成分片：每片独立 Range 请求，WriteAt 按偏移落盘。
-// 失败的分片在片内重试（maxRetries 次）；整体出错时保留位图供下次续传。
+// 失败的分片在片内重试（maxRetriesNow() 次）；整体出错时保留位图供下次续传。
 // 全部完成后删除 .meta（分片状态失效）。
 func (j *dlJob) downloadChunked(ctx context.Context, outPath string, m *chunkMeta) error {
 	f, err := os.OpenFile(outPath, os.O_RDWR|os.O_CREATE, 0644)
@@ -356,7 +416,7 @@ func (j *dlJob) downloadChunked(ctx context.Context, outPath string, m *chunkMet
 	}
 
 	var wg sync.WaitGroup
-	sem := make(chan struct{}, concurrency)
+	sem := make(chan struct{}, j.rt.concurrencyNow())
 	for i, d := range m.Done {
 		if d {
 			continue
@@ -414,18 +474,18 @@ func (j *dlJob) downloadRange(ctx context.Context, f *os.File, start, end int64)
 	expected := end - start + 1
 	attempt := 1
 	for {
-		req, err := newRequest(j.m3u8URL, j.referer)
+		req, err := j.rt.newRequest(j.m3u8URL, j.referer)
 		if err != nil {
 			return err
 		}
 		req = req.WithContext(ctx)
 		req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", start, end))
-		resp, err := getClient().Do(req)
+		resp, err := j.rt.getClient().Do(req)
 		if err != nil {
 			if ctx.Err() != nil {
 				return err
 			}
-			if attempt >= maxRetries {
+			if attempt >= j.rt.maxRetriesNow() {
 				return err
 			}
 			attempt++
@@ -438,20 +498,20 @@ func (j *dlJob) downloadRange(ctx context.Context, f *os.File, start, end int64)
 		}
 		if resp.StatusCode != http.StatusPartialContent {
 			resp.Body.Close()
-			if attempt >= maxRetries {
+			if attempt >= j.rt.maxRetriesNow() {
 				return fmt.Errorf("HTTP %d", resp.StatusCode)
 			}
 			attempt++
 			time.Sleep(time.Duration(attempt-1) * 300 * time.Millisecond)
 			continue
 		}
-		n, cpErr := io.Copy(&offsetWriter{f: f, off: start}, resp.Body)
+		n, cpErr := copyWithIdleTimeout(&offsetWriter{f: f, off: start}, resp.Body, transferIdleTimeout)
 		resp.Body.Close()
 		if cpErr != nil {
 			if ctx.Err() != nil {
 				return cpErr
 			}
-			if attempt >= maxRetries {
+			if attempt >= j.rt.maxRetriesNow() {
 				return cpErr
 			}
 			attempt++
@@ -459,7 +519,7 @@ func (j *dlJob) downloadRange(ctx context.Context, f *os.File, start, end int64)
 			continue
 		}
 		if n != expected {
-			if attempt >= maxRetries {
+			if attempt >= j.rt.maxRetriesNow() {
 				return fmt.Errorf("分片 %d-%d 收到 %d 字节, 期望 %d", start, end, n, expected)
 			}
 			attempt++
@@ -492,7 +552,9 @@ func partFileOffset(outPath string) int64 {
 
 // streamToFile 把 body 写入 outPath。offset=0 时截断覆盖（全量下载），
 // offset>0 时追加（续传）。返回写错误与关闭错误。
-func streamToFile(body io.Reader, outPath string, offset int64) (cpErr, closeErr error) {
+// 读取带空闲超时：直链整体下载不能设固定总时长（大文件必然超），
+// 但连接卡死必须能中断。
+func streamToFile(body io.ReadCloser, outPath string, offset int64) (cpErr, closeErr error) {
 	var f *os.File
 	var err error
 	if offset > 0 {
@@ -511,7 +573,7 @@ func streamToFile(body io.Reader, outPath string, offset int64) (cpErr, closeErr
 			return err, nil
 		}
 	}
-	_, cpErr = io.Copy(f, body)
+	_, cpErr = copyWithIdleTimeout(f, body, transferIdleTimeout)
 	closeErr = f.Close()
 	return
 }
@@ -520,16 +582,16 @@ func streamToFile(body io.Reader, outPath string, offset int64) (cpErr, closeErr
 
 func fetchSegment(ctx context.Context, j *dlJob, segURL string) ([]byte, error) {
 	var lastErr error
-	for attempt := 1; attempt <= maxRetries; attempt++ {
+	for attempt := 1; attempt <= j.rt.maxRetriesNow(); attempt++ {
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
-		req, err := newRequest(segURL, j.referer)
+		req, err := j.rt.newRequest(segURL, j.referer)
 		if err != nil {
 			return nil, cleanURLParseErr(err, segURL)
 		}
 		req = req.WithContext(ctx)
-		resp, err := getClient().Do(req)
+		resp, err := j.rt.getClient().Do(req)
 		if err != nil {
 			lastErr = fmt.Errorf("attempt %d: %w", attempt, err)
 			if ctx.Err() != nil {
@@ -544,7 +606,7 @@ func fetchSegment(ctx context.Context, j *dlJob, segURL string) ([]byte, error) 
 			time.Sleep(time.Duration(attempt) * time.Second)
 			continue
 		}
-		data, err := io.ReadAll(resp.Body)
+		data, err := readAllWithIdleTimeout(resp.Body, transferIdleTimeout)
 		resp.Body.Close()
 		if err != nil {
 			lastErr = fmt.Errorf("attempt %d: read body: %w", attempt, err)
@@ -576,6 +638,7 @@ func streamDownload(ctx context.Context, j *dlJob, segURLs []string, startIdx in
 		dispTot = 0
 	}
 	j.setSeg(int64(startIdx), dispTot)
+	j.setSegFlushed(int64(startIdx))
 
 	sw, err := newStreamWriter(outPath, startIdx, func(next int) {
 		j.setSeg(int64(next), dispTot)
@@ -584,6 +647,10 @@ func streamDownload(ctx context.Context, j *dlJob, segURLs []string, startIdx in
 		} else {
 			fmt.Printf("\r  下载进度: %d / %d   ", next, startIdx+total)
 		}
+	}, func(flushed int) {
+		// 断点只在真实落盘后推进（R9）：Engine.Stop 可能在 pipeline 收尾前
+		// 就落盘状态；若断点领先磁盘字节，续传会在文件中间留下空洞。
+		j.setSegFlushed(int64(flushed))
 	}, func(d []byte) []byte {
 		// 写入前规范化：委托容器状态对象（fMP4 时间戳归一化 + NAL 封装转换 +
 		// 内联 init 消费）；无状态容器原样写，规范化失败降级原样写
@@ -603,13 +670,19 @@ func streamDownload(ctx context.Context, j *dlJob, segURLs []string, startIdx in
 	if err != nil {
 		return startIdx, err
 	}
-	defer func() {
+	closed := false
+	closeSW := func() {
+		if closed {
+			return
+		}
+		closed = true
 		if cerr := sw.Close(); cerr != nil {
 			fmt.Printf("\n  [!] 关闭输出文件失败: %v\n", cerr)
 		}
-	}()
+	}
+	defer closeSW()
 
-	cc := concurrency
+	cc := j.rt.concurrencyNow()
 	if cc < 1 {
 		cc = 1
 	}
@@ -690,8 +763,12 @@ dispatch:
 	wg.Wait()
 	fmt.Println()
 
+	// 先冲刷关闭、再取断点：返回的 next 会被上层当成续传起点持久化，
+	// 必须保证它对应的字节已经真正落在 .part 里（R9）。
+	closeSW()
 	next := sw.Next()
 	j.setSeg(int64(next), dispTot)
+	j.setSegFlushed(int64(next))
 
 	errMu.Lock()
 	e := firstErr
@@ -713,12 +790,8 @@ dispatch:
 // 返回 (已写分片数, 错误)：暂停/取消时返回当前断点与 nil，由上层按意图收尾。
 // ============================================================
 
-var (
-	// livePollInterval 直播轮询间隔；liveMaxEmptyPolls 连续无新分片轮询上限
-	// （约 75s，防死流/直播结束但无 ENDLIST 时挂死；正常直播几分钟内必有新片）。
-	livePollInterval  = 3 * time.Second
-	liveMaxEmptyPolls = 25
-)
+// livePollInterval / liveMaxEmptyPolls 为 Runtime 字段（约 75s/25 次兜底，
+// 防死流/直播结束但无 ENDLIST 时挂死；测试可调短）。
 
 func (j *dlJob) liveDownload(ctx context.Context, outPath string, from int) (int, error) {
 	next := from
@@ -735,6 +808,11 @@ func (j *dlJob) liveDownload(ctx context.Context, outPath string, from int) (int
 			return next, fmt.Errorf("直播播放列表响应变为直链媒体，无法继续跟随录制")
 		}
 		cur := parsePlaylist(content, base)
+		// 同一轮窗口内换 key（key rotation）无法安全解密：显式失败。
+		// 跨轮换 key 是支持的 —— 每轮按本轮声明的 key 解密本轮分片。
+		if kerr := ensureSingleKey(cur); kerr != nil {
+			return next, kerr
+		}
 		// 每轮轮询重新装配解密器（幂等：key 未变不重拉）；key 轮换时按新 key 解密后续分片
 		if kerr := j.ensureDecryptor(ctx, cur.key); kerr != nil {
 			return next, kerr
@@ -772,7 +850,7 @@ func (j *dlJob) liveDownload(ctx context.Context, outPath string, from int) (int
 				return next, nil
 			}
 			empty++
-			if empty >= liveMaxEmptyPolls {
+			if empty >= j.rt.liveMaxEmptyPolls {
 				fmt.Printf("[live] 连续 %d 次轮询无新分片，判定直播结束\n", empty)
 				return next, nil
 			}
@@ -781,7 +859,7 @@ func (j *dlJob) liveDownload(ctx context.Context, outPath string, from int) (int
 		select {
 		case <-ctx.Done():
 			return next, nil
-		case <-time.After(livePollInterval):
+		case <-time.After(j.rt.livePollInterval):
 		}
 	}
 }

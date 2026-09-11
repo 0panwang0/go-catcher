@@ -131,6 +131,10 @@
 <button id="setbtn" title="设置">⚙</button>
 
 <script>
+// 本地服务访问令牌（由服务端注入本页）：所有请求都要带上，否则 401。
+// 这样浏览器里其它网页即使能打到 127.0.0.1，也命令不动这个服务。
+var API_TOKEN = "__GOCATCHER_TOKEN__";
+function api(url){ return url + (url.indexOf('?') >= 0 ? '&' : '?') + 't=' + encodeURIComponent(API_TOKEN); }
 var tasks = [];
 var lastAction = 0;   // 操作后短暂停止重建 DOM，避免按钮被刷新打断
 var lastSig = '';
@@ -146,10 +150,15 @@ function applyViewMode(v){
 
 async function poll() {
   try {
-    const r = await fetch('/status', {cache:'no-store'});
+    const r = await fetch(api('/status'), {cache:'no-store'});
     const d = await r.json();
     tasks = d.tasks || [];
-    setErr('');
+    // 持久化健康：断点写盘失败时必须让用户看到，否则"以为存了、重启发现进度回退"
+    if (d.persist && d.persist.ok === false) {
+      setErr('断点状态写入磁盘失败：' + (d.persist.error || '未知原因') + '（恢复下载后进度可能回退）');
+    } else {
+      setErr('');
+    }
     updateStats();
     const sig = tasks.map(t=>t.id+t.stage+t.segDone+t.pct+t.paused+t.canceled+t.done+t.fileMissing+(t.error||'')+(t.live&&t.running?Math.floor((Date.now()-(t.started?new Date(t.started).getTime():Date.now()))/1000):'')).join('|');
     if (sig !== lastSig && Date.now() - lastAction > 1200) {
@@ -253,21 +262,21 @@ function actions(t){
   if (t.canceled) {
     b.push(btn('ghost','🗑 移除记录','removeTask('+id+')'));
   } else if (t.done && !t.error) {
-    if (op) b.push(btn('primary','▶ 打开文件','openFile('+op+')'));
-    if (sd) b.push(btn('ghost','📂 打开文件夹','openFolder('+sd+')'));
+    if (op) b.push(btn('primary','▶ 打开文件','openFile('+id+')'));
+    if (sd) b.push(btn('ghost','📂 打开文件夹','openFolder('+id+')'));
     b.push(btn('ghost','🗑 移除记录','removeTask('+id+')'));
   } else if (t.paused) {
-    if (sd) b.push(btn('ghost','📂 打开文件夹','openFolder('+sd+')'));
+    if (sd) b.push(btn('ghost','📂 打开文件夹','openFolder('+id+')'));
     b.push(btn('primary','▶ 继续下载','resumeTask('+id+')'));
     b.push(btn('danger','✕ 取消','cancelTask('+id+')'));
   } else if (t.error) {
     b.push(btn('primary','▶ 重试','resumeTask('+id+')'));
     b.push(btn('danger','✕ 取消','cancelTask('+id+')'));
-    if (sd) b.push(btn('ghost','📂 打开文件夹','openFolder('+sd+')'));
+    if (sd) b.push(btn('ghost','📂 打开文件夹','openFolder('+id+')'));
     b.push(btn('ghost','🗑 移除记录','removeTask('+id+')'));
   } else {
     // 下载中 / 排队中（随时可打开文件夹查看 .part 半成品）
-    if (sd) b.push(btn('ghost','📂 打开文件夹','openFolder('+sd+')'));
+    if (sd) b.push(btn('ghost','📂 打开文件夹','openFolder('+id+')'));
     b.push(btn('warn','⏸ 暂停','pauseTask('+id+')'));
     b.push(btn('danger','✕ 取消','cancelTask('+id+')'));
   }
@@ -299,20 +308,20 @@ function rowCard(t){
   if (t.canceled) {
     acts = ibtn('','🗑','移除记录','removeTask('+id+')');
   } else if (t.done && !t.error) {
-    acts = (op ? ibtn('','▶','打开文件','openFile('+op+')') : '')
-         + (sd ? ibtn('','📂','打开文件夹','openFolder('+sd+')') : '')
+    acts = (op ? ibtn('','▶','打开文件','openFile('+id+')') : '')
+         + (sd ? ibtn('','📂','打开文件夹','openFolder('+id+')') : '')
          + ibtn('','🗑','移除记录','removeTask('+id+')');
   } else if (t.paused) {
-    acts = (sd ? ibtn('','📂','打开文件夹','openFolder('+sd+')') : '')
+    acts = (sd ? ibtn('','📂','打开文件夹','openFolder('+id+')') : '')
          + ibtn('primary','▶','继续下载','resumeTask('+id+')')
          + ibtn('danger','✕','取消（删除文件）','cancelTask('+id+')');
   } else if (t.error) {
-    acts = (sd ? ibtn('','📂','打开文件夹','openFolder('+sd+')') : '')
+    acts = (sd ? ibtn('','📂','打开文件夹','openFolder('+id+')') : '')
          + ibtn('primary','↻','重试','resumeTask('+id+')')
          + ibtn('danger','✕','取消（删除文件）','cancelTask('+id+')')
          + ibtn('','🗑','移除记录','removeTask('+id+')');
   } else {
-    acts = (sd ? ibtn('','📂','打开文件夹','openFolder('+sd+')') : '')
+    acts = (sd ? ibtn('','📂','打开文件夹','openFolder('+id+')') : '')
          + ibtn('','⏸','暂停','pauseTask('+id+')')
          + ibtn('danger','✕','取消（删除文件）','cancelTask('+id+')');
   }
@@ -422,7 +431,7 @@ function toast(msg,isErr){
 async function call(url, okMsg){
   lastAction = Date.now();
   try{
-    const r = await fetch(url,{cache:'no-store'});
+    const r = await fetch(api(url),{cache:'no-store'});
     if(!r.ok){ const t = await r.json().catch(()=>({})); throw new Error(t.error||('HTTP '+r.status)); }
     if(okMsg) toast(okMsg,false);
   }catch(e){ toast('操作失败：'+e.message,true); }
@@ -438,17 +447,19 @@ function cancelTask(id){
   return call('/cancel?id='+encodeURIComponent(id),'已取消');
 }
 function removeTask(id){ return call('/remove?id='+encodeURIComponent(id),'已移除记录'); }
-async function openFile(p){
+// 打开文件 / 打开所在文件夹：只传任务 id，路径由服务端从任务记录里取。
+// 服务端不再接受任意 path —— 那等于给任何网页一个"执行任意文件"的入口。
+async function openFile(id){
   try{
-    const r = await fetch('/openfile?path='+encodeURIComponent(p),{cache:'no-store'});
+    const r = await fetch(api('/openfile?id='+encodeURIComponent(id)),{cache:'no-store'});
     if(!r.ok){ const t=await r.json().catch(()=>({})); throw new Error(t.error||('HTTP '+r.status)); }
     const d=await r.json().catch(()=>({}));
     toast('已请求打开文件（服务端返回 '+(d&&d.ok?'OK':'?')+'）',false);
   }catch(e){ toast('打开文件失败：'+e.message,true); }
 }
-async function openFolder(p){
+async function openFolder(id){
   try{
-    const r = await fetch('/openfolder?path='+encodeURIComponent(p),{cache:'no-store'});
+    const r = await fetch(api('/openfolder?id='+encodeURIComponent(id)),{cache:'no-store'});
     if(!r.ok){ const t=await r.json().catch(()=>({})); throw new Error(t.error||('HTTP '+r.status)); }
     const d=await r.json().catch(()=>({}));
     toast('已请求打开文件夹（服务端返回 '+(d&&d.ok?'OK':'?')+'）',false);
@@ -458,7 +469,7 @@ async function openFolder(p){
 // —— 设置 ——
 async function loadConfig(){
   try{
-    const r = await fetch('/config',{cache:'no-store'});
+    const r = await fetch(api('/config'),{cache:'no-store'});
     const d = await r.json();
     curCfg = d;
     if (d.uiView && d.uiView !== viewMode) applyViewMode(d.uiView);

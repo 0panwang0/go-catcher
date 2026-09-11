@@ -68,8 +68,8 @@ func TestDetectContainer(t *testing.T) {
 	}{
 		{"ts", tsData, false, "ts", ".ts", InitNone},
 		{"fmp4-inline", []byte("\x00\x00\x00\x18ftypisom"), false, "fmp4", ".mp4", InitNone},
-		{"fmp4-map", []byte("\x00\x00\x00\x18moofDATA"), true, "fmp4", ".mp4", InitFromMap},
-		{"fmp4-moof-nomap", []byte("\x00\x00\x00\x18moofDATA"), false, "fmp4", ".mp4", InitFromMap},
+		{"fmp4-map", []byte("\x00\x00\x00\x18moofDATA"), true, "fmp4-map", ".mp4", InitFromMap},
+		{"fmp4-moof-nomap", []byte("\x00\x00\x00\x18moofDATA"), false, "fmp4-map", ".mp4", InitFromMap},
 		{"flv", []byte("FLV\x01\x05\x00\x00\x00\x09"), false, "flv", ".flv", InitNone},
 		{"webm", append([]byte("\x1a\x45\xdf\xa3"), []byte("webm")...), false, "webm", ".webm", InitNone},
 		{"mkv", append([]byte("\x1a\x45\xdf\xa3"), []byte("matroska")...), false, "mkv", ".mkv", InitNone},
@@ -170,8 +170,10 @@ func TestWriteInitSegment(t *testing.T) {
 // findContainerByID）必须带 NewState 工厂（有跨分片规范化状态），
 // 无状态容器（generic）必须为 nil。
 func TestContainerNormStateRegistered(t *testing.T) {
-	if c := findContainerByID("fmp4"); c == nil || c.NewState == nil {
-		t.Fatalf("findContainerByID(fmp4)=%+v want NewState 非 nil", c)
+	for _, id := range []string{"fmp4", "fmp4-map"} {
+		if c := findContainerByID(id); c == nil || c.NewState == nil {
+			t.Fatalf("findContainerByID(%s)=%+v want NewState 非 nil", id, c)
+		}
 	}
 	if c := findContainerByID("generic"); c == nil || c.NewState != nil {
 		t.Fatalf("findContainerByID(generic)=%+v want NewState nil", c)
@@ -182,7 +184,7 @@ func TestContainerNormStateRegistered(t *testing.T) {
 		[]byte("\x00\x00\x00\x18moofDATA"),
 	} {
 		c := detectContainer(d, true)
-		if c.ID != "fmp4" || c.NewState == nil {
+		if (c.ID != "fmp4" && c.ID != "fmp4-map") || c.NewState == nil {
 			t.Fatalf("detectContainer 命中 %s: NewState 应为非 nil", c.ID)
 		}
 	}
@@ -216,13 +218,13 @@ func TestLiveFollow(t *testing.T) {
 	srv := httptest.NewServer(mux)
 	defer srv.Close()
 
-	oldI, oldE := livePollInterval, liveMaxEmptyPolls
-	livePollInterval = 5 * time.Millisecond
-	liveMaxEmptyPolls = 3
-	defer func() { livePollInterval, liveMaxEmptyPolls = oldI, oldE }()
+	oldI, oldE := testStd.livePollInterval, testStd.liveMaxEmptyPolls
+	testStd.livePollInterval = 5 * time.Millisecond
+	testStd.liveMaxEmptyPolls = 3
+	defer func() { testStd.livePollInterval, testStd.liveMaxEmptyPolls = oldI, oldE }()
 
 	out := filepath.Join(t.TempDir(), "live.ts")
-	j := &dlJob{m3u8URL: srv.URL + "/live.m3u8", live: true, seen: make(map[string]bool)}
+	j := &dlJob{rt: testStd, m3u8URL: srv.URL + "/live.m3u8", live: true, seen: make(map[string]bool)}
 
 	next, err := j.liveDownload(context.Background(), out, 0)
 	if err != nil {
@@ -254,12 +256,12 @@ func TestLiveFollowStop(t *testing.T) {
 	srv := httptest.NewServer(mux)
 	defer srv.Close()
 
-	oldI := livePollInterval
-	livePollInterval = 50 * time.Millisecond
-	defer func() { livePollInterval = oldI }()
+	oldI := testStd.livePollInterval
+	testStd.livePollInterval = 50 * time.Millisecond
+	defer func() { testStd.livePollInterval = oldI }()
 
 	out := filepath.Join(t.TempDir(), "live.ts")
-	j := &dlJob{m3u8URL: srv.URL + "/live.m3u8", live: true, seen: make(map[string]bool)}
+	j := &dlJob{rt: testStd, m3u8URL: srv.URL + "/live.m3u8", live: true, seen: make(map[string]bool)}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	go func() {
@@ -299,7 +301,7 @@ func TestVODStreamResumeRemainder(t *testing.T) {
 	srv := httptest.NewServer(mux)
 	defer srv.Close()
 
-	j := &dlJob{m3u8URL: srv.URL + "/vod.m3u8"}
+	j := &dlJob{rt: testStd, m3u8URL: srv.URL + "/vod.m3u8"}
 	var pmu sync.Mutex
 	var tots []int64
 	j.progress = func(stage string, done, tot int64) {
@@ -368,7 +370,7 @@ func TestVODFMP4(t *testing.T) {
 	defer srv.Close()
 
 	ctx := context.Background()
-	j := &dlJob{m3u8URL: srv.URL + "/vod.m3u8"}
+	j := &dlJob{rt: testStd, m3u8URL: srv.URL + "/vod.m3u8"}
 	content, base, isDirect, err := j.fetchPlaylist()
 	if err != nil || isDirect {
 		t.Fatalf("fetchPlaylist: isDirect=%v err=%v", isDirect, err)

@@ -137,6 +137,9 @@
 <div id="toast"></div>
 
 <script>
+// 本地服务访问令牌（服务端注入）：请求都要带上，否则 401
+var API_TOKEN = "__GOCATCHER_TOKEN__";
+function api(url){ return url + (url.indexOf('?') >= 0 ? '&' : '?') + 't=' + encodeURIComponent(API_TOKEN); }
 function el(id){return document.getElementById(id)}
 var segVal = 'detail';
 var toastTimer = null;
@@ -178,7 +181,7 @@ function proxyModeOf(p){
 }
 async function load(){
   try{
-    const r = await fetch('/config', {cache:'no-store'});
+    const r = await fetch(api('/config'), {cache:'no-store'});
     const d = await r.json();
     el('f_maxc').value = d.maxConcurrent;
     el('f_segc').value = d.segConcurrency;
@@ -216,7 +219,7 @@ async function save(){
     toast('请填写有效的数字（端口 1 – 65535）', true); return;
   }
   try{
-    const r = await fetch('/config', {method:'POST', headers:{'Content-Type':'application/json'},
+    const r = await fetch(api('/config'), {method:'POST', headers:{'Content-Type':'application/json'},
                                       body:JSON.stringify(v), cache:'no-store'});
     if (!r.ok){ const t = await r.json().catch(()=>({})); throw new Error(t.error || ('HTTP '+r.status)); }
     const d = await r.json();

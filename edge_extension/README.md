@@ -53,17 +53,37 @@
    链接的画质/时长信息通过**本地 Go 服务的 `/probe` 接口**预检（服务端带 Referer + uTLS 指纹直连——浏览器对无 CORS 头的 CDN 只能拿到空响应，这是预检必须走服务端的原因）；GoCatcher 未运行时预检降级为页面 fetch，拿不到信息的条目标"未预检"灰显排在列表末尾。列表按视频分组聚拢，每行显示格式/画质/分辨率/码率/时长/估算大小/URL：
    - **只有 1 个链接**：直接弹出**确认面板**
    - **多个链接**：弹出**链接列表面板**，列出全部可选链接（TS/MP4 格式、画质、分辨率、码率、时长/大小、直播标记），点击任一行进入该链接的确认面板
-4. 确认面板显示视频名称、画质、资源链接（可复制核验）、建议保存文件名；点 **确认下载** → 浏览器弹出原生 **Save As 对话框**
-5. 在 Save As 对话框选好保存位置（如 `D:\Downloads\视频名_1080P.ts`）→ 点保存
-6. 浏览器自动从本地 Go 服务拉取视频数据，下载完成后 Chrome 右下角有提示
-7. 下载进度实时显示在 GoCatcher 客户端的任务列表里（或浏览器打开 `http://127.0.0.1:7891/`）
+4. 确认面板显示视频名称、画质、资源链接（可复制核验）、建议保存文件名；点 **确认下载**
+5. 浏览器弹出 **原生文件夹选择框**，选好保存位置（如 `D:\Downloads`）→ 确认
+6. 下载由**本地 Go 服务**执行并直接落盘（浏览器不参与数据传输，大文件不受标签页内存/超时限制）
+7. 下载进度实时显示在确认后的进度面板里，同时也显示在 GoCatcher 客户端的任务列表（或浏览器打开 `http://127.0.0.1:7891/`）
 
-## 输出格式说明（TS）
+> 扩展自身**不做**分片下载与合并：跨域 403 已由服务端代拉解决，而浏览器侧实现无法解密 `#EXT-X-KEY`
+> 加密流、也拿不到服务端的产物校验守卫——留着它只会静默产出不可播放的密文文件。相关代码已移除。
 
-HLS 分片按序拼接的原始流直接保存为 `.ts`（MPEG-TS），**不做任何封装转换、不依赖 ffmpeg**：
+## 排查：悬停不出现按钮
 
-- PotPlayer / VLC 靠内容嗅探可正常播放
-- 需要标准 MP4 容器时，自行用 ffmpeg 转封装：`ffmpeg -i 视频.ts -c copy -movflags +faststart 视频.mp4`（秒级完成，不重新编码）
+按顺序检查：
+
+1. **改了扩展代码后必须「重新加载」扩展 + 刷新页面**。在 `edge://extensions` 点「重新加载」后，已打开页面的 content script 上下文已失效（表现为完全不响应），必须 F5 刷新原页面。
+2. **先播放几秒再悬停**。嗅探记录来自真实网络请求，视频未开始加载时没有任何候选。
+3. **检查是否被遮挡层挡住**。站点在播放器上盖透明层（提示条 / 点击劫持广告层 / 弹幕层）时，命中测试拿不到底下的 video/iframe；扩展每 700ms 按「指针坐标 + 矩形包含」复查一次，正常会在 1s 内补显示按钮。
+4. **需要日志时**打开 `content.js`，把顶部 `const DEBUG = false;` 改成 `true`，重新加载扩展并刷新页面，F12 → Console 里会打印悬停判定过程（`[M3U8 Catcher]` 前缀）：
+   - `命中链接，显示按钮` = 匹配成功
+   - `未嗅探到该目标，暂不显示按钮 <pageUrl>` = 后台没匹配到候选，把这条 `pageUrl` 发回来排查最快
+   - 完全没有日志 = `findMediaTargetAtPoint` 没识别到目标（元素被隐藏、尺寸小于 200×120，或不是 http(s) iframe）
+
+匹配优先级（背景页 `getVideoSource`）：解析页 iframe 的 `?url=` 锚点 → video 直链 → 分片目录 → 同页最新 master 候选 → 最大 MP4。
+
+## 输出格式说明
+
+HLS 分片按序拼接的原始流直接保存，**不做任何封装转换、不依赖 ffmpeg**。
+输出扩展名由**实际探测到的容器**决定（不是由链接名或调用方指定）：
+
+- **TS**（`.ts`，MPEG-TS）：PotPlayer / VLC 靠内容嗅探可正常播放；需要标准 MP4 容器时自行转封装：
+  `ffmpeg -i 视频.ts -c copy -movflags +faststart 视频.mp4`（秒级完成，不重新编码）
+- **fMP4**（`.mp4`）：`#EXT-X-MAP` 的 init 段写在文件头，收尾会回填 mehd/mvhd 总时长，
+  播放器能显示时长并拖动进度条（否则只能按"直播流"处理）
 
 相关参数：
 - `-o <文件名>`：输出路径，默认 `output.ts`；不带扩展名时自动补 `.ts`；显式写其它扩展名则原样使用
@@ -89,7 +109,7 @@ chcp 65001 ; "C:\path\to\go-catcher.exe" --url="..." --referer="..." -o "视频�
 Go 二进制（`go-catcher.exe`）已经预设好：
 - uTLS 伪造 Chrome TLS 指纹（解决 JA3 检测）
 - 走 Clash 代理 127.0.0.1:7890
-- 10 并发 + 3 次重试 + 自动合并为 `.ts`
+- 10 并发 + 3 次重试 + 按序落盘（无独立合并阶段，`next` 即断点，支持暂停/崩溃续传）
 - 已端到端验证可下载 2.7GB 1080p 视频（约 1 分钟）
 
 ## 代理说明（重要）
@@ -107,7 +127,11 @@ Go 二进制（`go-catcher.exe`）已经预设好：
 
 旧版本在扩展页（`chrome-extension://...`）直接 fetch，Origin 头会被 CDN 识别为非页面请求而 403。
 
-当前版本已改为：嗅探/识别在后台完成，**实际下载请求通过 MAIN world content script 在页面主世界发出**，与视频正常播放时的请求完全一致，403 问题已从根本上解决。若仍遇到 403，请检查 Clash 是否已开启系统代理/TUN 模式。
+当前版本：**所有实际下载请求都由本地 Go 服务发起**，服务端带 Referer + uTLS 指纹直连，与视频正常播放时的请求特征一致，403 问题已从根本上解决。若仍遇到 403，请检查 Clash 是否已开启系统代理/TUN 模式。
+
+> `content-main.js`（MAIN world fetch 代理）现在只用于一种场景：GoCatcher 未运行时，
+> `/probe` 预检降级为页面内 fetch（此时拿不到 CORS 头的 CDN 会返回空响应，条目标注"未预检"）。
+> 它不再承担任何下载职责。
 
 ## 与 Go 版的对应关系
 
@@ -116,18 +140,32 @@ Go 二进制（`go-catcher.exe`）已经预设好：
 | uTLS 伪造 Chrome TLS 指纹 | 浏览器原生指纹，无需伪造 |
 | Clash 代理 `127.0.0.1:7890` | 跟随 Edge 系统代理 |
 | `referer` / `userAgent` 伪造 | `declarativeNetRequest` 按来源页注入 Referer；UA 即浏览器本身 |
-| 10 worker 并发 + 3 次重试 | 8 并发 + 3 次重试 |
+| 分片并发下载 + 重试 | 扩展只负责嗅探/识别，下载与并发/重试全部交给本地 Go 服务 |
 | master playlist 选最高码率 | 同样支持 |
-| 合并为 output.ts | 合并后浏览器保存为 `.ts`，文件名自动从 URL/标题生成 |
+| 按容器识别并规范化，落盘前抽样校验 | 同左（扩展侧无本地下载路径，不存在第二套实现） |
 
 ## 文件结构
 
 ```
 edge_extension/
 ├── manifest.json      # MV3 清单
-├── background.js      # service worker：嗅探 m3u8/mp4 + 视频源识别
-├── content.js         # 页面内 IDM 式悬停下载按钮 + 完整下载/合并逻辑
+├── src/background/    # service worker 源码（ES 模块，esbuild 打包成 background.js）
+├── background.js      # 打包产物（提交进仓库，改 src/ 后跑 make ext 重建）
+├── content.js         # 页面内 IDM 式悬停下载按钮 + 链接列表面板 + 交给本地服务下载
 ├── content-main.js    # MAIN world fetch 代理（请求头与页面一致，绕过 403）
 ├── downloader.html    # 下载器页面（备用/手动下载）
-└── downloader.js      # 下载器页面逻辑
+├── downloader.js      # 下载器页面逻辑
+└── tests/             # Node 回归测试（不参与扩展运行）
+    ├── embedmatch.test.js   # 页面归属判定
+    ├── probes.test.js       # webRequest 注册参数 + 无扩展名通道判据
+    └── storage.test.js      # 嗅探列表并发写入与淘汰
 ```
+
+跑测试：`node tests/*.test.js`（或项目根 `make ext-check`，会连打包一致性一起校验）。
+
+> ⚠ **onCompleted 的 extraInfoSpec 只能是 `extraHeaders` / `responseHeaders`。**
+> 写成别的值（例如 `requestHeaders`，那是 `onBeforeSendHeaders` 才认的）不会报错到
+> `addListener` 调用点，而是让**整个探测器静默安装失败**——面板里只有一条错误，
+> 功能悄无声息地少一条通道。`tests/probes.test.js` 专门守这条，别删。
+
+> 目录内**不能有以 `_` 开头的文件/目录**（Chrome 保留给系统使用，会导致「无法加载扩展」）。

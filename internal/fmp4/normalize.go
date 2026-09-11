@@ -188,17 +188,17 @@ func (n *normState) normTfdt(id uint32, raw, dur uint64) uint64 {
 
 // trafInfo 一个 traf（单轨分片）的解析结果。
 type trafInfo struct {
-	trackID    uint32
-	tfdtOff    int    // tfdt 值字段在 moof 内的偏移（-1 = 无 tfdt）
-	tfdtVal    uint64 // 原始 baseMediaDecodeTime
-	tfdtWide   bool   // tfdt version==1（64 位值）
-	durTotal   uint64 // 本 traf 全部样本总时长（track timescale 单位；未知为 0）
-	durSet     bool   // 是否从 trun/tfhd 读到了时长信息
-	sampleCount int   // 本 traf 样本总数（跨多个 trun 累计）
-	dataStart  int    // 本轨首个样本的绝对文件偏移
-	dataOffOff int    // trun 内 data_offset 字段在 moof 内的偏移（-1 = 无该字段）
-	sizes      []uint32
-	sizeOffs   []int // trun 内逐样本 size 字段在 moof 内的偏移（空 = trun 无逐样本 size）
+	trackID     uint32
+	tfdtOff     int    // tfdt 值字段在 moof 内的偏移（-1 = 无 tfdt）
+	tfdtVal     uint64 // 原始 baseMediaDecodeTime
+	tfdtWide    bool   // tfdt version==1（64 位值）
+	durTotal    uint64 // 本 traf 全部样本总时长（track timescale 单位；未知为 0）
+	durSet      bool   // 是否从 trun/tfhd 读到了时长信息
+	sampleCount int    // 本 traf 样本总数（跨多个 trun 累计）
+	dataStart   int    // 本轨首个样本的绝对文件偏移
+	dataOffOff  int    // trun 内 data_offset 字段在 moof 内的偏移（-1 = 无该字段）
+	sizes       []uint32
+	sizeOffs    []int // trun 内逐样本 size 字段在 moof 内的偏移（空 = trun 无逐样本 size）
 }
 
 // boxHeader 解析 b[pos:] 处的一个 box 头，返回总大小、payload 偏移、类型。
@@ -679,8 +679,8 @@ func normalizeFMP4Segment(data []byte, n *normState) ([]byte, error) {
 			pending = &pendingMoof{orig: moofCopy, infos: infos}
 			pos += sz
 		case "mdat":
-				if pending != nil {
-					newMdat, newSizes, rerr := rebuildMdat(data[pos:pos+sz], pos, pending.infos, n)
+			if pending != nil {
+				newMdat, newSizes, rerr := rebuildMdat(data[pos:pos+sz], pos, pending.infos, n)
 				if rerr != nil {
 					// 转换失败：保留 tfdt 归一化，mdat 原样放行
 					out = append(out, buildMoof(pending, nil)...)

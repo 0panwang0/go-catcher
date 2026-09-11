@@ -1,0 +1,82 @@
+name: ci
+
+# 质量护栏：格式 / 静态检查 / 测试（含竞态）。
+# 之所以要有 CI：项目曾出现 16 个文件长期未 gofmt、pipeline.go 缩进错位、
+# 以及"改了代码但忘了跑 -race"的情况——靠人记不如靠机器拦。
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  go:
+    name: Go（格式 / vet / test）
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: gofmt（未格式化文件即为失败）
+        shell: pwsh
+        run: |
+          $unformatted = gofmt -l ./cmd ./internal
+          if ($unformatted) {
+            Write-Host "以下文件未格式化，请执行 gofmt -w："
+            $unformatted | ForEach-Object { Write-Host "  $_" }
+            exit 1
+          }
+          Write-Host "gofmt OK"
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: go test -race
+        shell: pwsh
+        run: |
+          # windows/amd64 的 -race 需要 cgo + gcc。runner 上若没有 gcc 就退化为普通测试，
+          # 但要显式说明——不能让"跳过竞态检测"看起来像通过。
+          if (Get-Command gcc -ErrorAction SilentlyContinue) {
+            go test ./... -race -count=1
+          } else {
+            Write-Host "::warning::未找到 gcc，跳过 -race（本地请跑 make test）"
+            go test ./... -count=1
+          }
+
+  extension:
+    name: Edge 扩展（语法 / 回归）
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: edge_extension
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: 构建（esbuild 打包，验证 src/ 模块可编译出 bundle）
+        run: |
+          npm install --no-audit --no-fund
+          node build.mjs
+          # 打包产物应与仓库中提交的 bundle 一致（防止改了 src/ 忘了重新构建）
+          git diff --exit-code -- background.js || (echo "background.js 与 src/ 不一致，请本地跑 node build.mjs 后提交" && exit 1)
+
+      - name: 语法检查
+        run: |
+          for f in content.js background.js content-main.js downloader.js tests/*.js; do
+            node --check "$f"
+            echo "OK  $f"
+          done
+          node -e "JSON.parse(require('fs').readFileSync('manifest.json','utf8'));console.log('OK  manifest.json')"
+
+      - name: 回归测试
+        run: |
+          # 用 glob 而不是逐个列文件：新增 tests/*.test.js 自动纳入，不会漏跑
+          for t in tests/*.test.js; do
+            echo "---- $t"
+            node "$t"
+          done

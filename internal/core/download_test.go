@@ -46,7 +46,7 @@ func TestDownloadDirectBasic(t *testing.T) {
 
 	dir := t.TempDir()
 	part := filepath.Join(dir, "x.mp4.part")
-	job := &dlJob{m3u8URL: srv.URL}
+	job := &dlJob{rt: testStd, m3u8URL: srv.URL}
 	if err := job.downloadDirect(context.Background(), part); err != nil {
 		t.Fatalf("downloadDirect: %v", err)
 	}
@@ -77,7 +77,7 @@ func TestDownloadDirectResume(t *testing.T) {
 	part := filepath.Join(dir, "x.mp4.part")
 	os.WriteFile(part, []byte("01234"), 0644) // 已下 5 字节
 
-	job := &dlJob{m3u8URL: srv.URL}
+	job := &dlJob{rt: testStd, m3u8URL: srv.URL}
 	if err := job.downloadDirect(context.Background(), part); err != nil {
 		t.Fatalf("downloadDirect: %v", err)
 	}
@@ -105,7 +105,7 @@ func TestDownloadDirectNoRangeFallback(t *testing.T) {
 	part := filepath.Join(dir, "x.mp4.part")
 	os.WriteFile(part, []byte("stale-old-data"), 0644)
 
-	job := &dlJob{m3u8URL: srv.URL}
+	job := &dlJob{rt: testStd, m3u8URL: srv.URL}
 	if err := job.downloadDirect(context.Background(), part); err != nil {
 		t.Fatalf("downloadDirect: %v", err)
 	}
@@ -137,7 +137,7 @@ func TestDownloadDirect416Retry(t *testing.T) {
 	part := filepath.Join(dir, "x.mp4.part")
 	os.WriteFile(part, []byte("very-long-stale-part"), 0644) // 20 字节 > 新文件长度
 
-	job := &dlJob{m3u8URL: srv.URL}
+	job := &dlJob{rt: testStd, m3u8URL: srv.URL}
 	if err := job.downloadDirect(context.Background(), part); err != nil {
 		t.Fatalf("downloadDirect: %v", err)
 	}
@@ -172,7 +172,7 @@ func TestDownloadDirectCancelKeepsPart(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 80*time.Millisecond)
 	defer cancel()
 
-	job := &dlJob{m3u8URL: srv.URL}
+	job := &dlJob{rt: testStd, m3u8URL: srv.URL}
 	err := job.downloadDirect(ctx, part)
 	if err == nil {
 		t.Fatal("取消应返回错误")
@@ -189,9 +189,9 @@ func TestDownloadDirectCancelKeepsPart(t *testing.T) {
 // saveRestoreSeg 保存并恢复任务内分片并发数全局。
 func saveRestoreSeg(t *testing.T, n int) {
 	t.Helper()
-	old := concurrency
-	t.Cleanup(func() { concurrency = old })
-	concurrency = n
+	old := testStd.concurrencyNow()
+	t.Cleanup(func() { testStd.setDownloadTuning(old, -1) })
+	testStd.setDownloadTuning(n, -1)
 }
 
 // TestNewChunkMeta 分片均分与末片边界。
@@ -224,7 +224,7 @@ func TestDownloadDirectChunked(t *testing.T) {
 
 	dir := t.TempDir()
 	part := filepath.Join(dir, "big.mp4.part")
-	job := &dlJob{m3u8URL: srv.URL}
+	job := &dlJob{rt: testStd, m3u8URL: srv.URL}
 	if err := job.downloadDirect(context.Background(), part); err != nil {
 		t.Fatalf("downloadDirect: %v", err)
 	}
@@ -278,7 +278,7 @@ func TestDownloadDirectChunkedResume(t *testing.T) {
 		t.Fatalf("saveChunkMeta: %v", err)
 	}
 
-	job := &dlJob{m3u8URL: srv.URL}
+	job := &dlJob{rt: testStd, m3u8URL: srv.URL}
 	if err := job.downloadDirect(context.Background(), part); err != nil {
 		t.Fatalf("downloadDirect: %v", err)
 	}
@@ -322,7 +322,7 @@ func TestDownloadDirectSmallFile(t *testing.T) {
 
 	dir := t.TempDir()
 	part := filepath.Join(dir, "small.mp4.part")
-	job := &dlJob{m3u8URL: srv.URL}
+	job := &dlJob{rt: testStd, m3u8URL: srv.URL}
 	if err := job.downloadDirect(context.Background(), part); err != nil {
 		t.Fatalf("downloadDirect: %v", err)
 	}
@@ -354,7 +354,7 @@ func TestDownloadDirectChunk416(t *testing.T) {
 
 	dir := t.TempDir()
 	part := filepath.Join(dir, "big.mp4.part")
-	job := &dlJob{m3u8URL: srv.URL}
+	job := &dlJob{rt: testStd, m3u8URL: srv.URL}
 	err := job.downloadDirect(context.Background(), part)
 	if err == nil {
 		t.Fatal("416 应报错")
@@ -364,5 +364,54 @@ func TestDownloadDirectChunk416(t *testing.T) {
 	}
 	if _, merr := os.Stat(part + ".meta"); !os.IsNotExist(merr) {
 		t.Fatal("416 后 .meta 应删除")
+	}
+}
+
+// TestStreamWriterFlushBreakpointNotAhead 可持久化断点（onFlush 回调值）永远不得
+// 超过 .part 文件里真实存在的字节数（R9）。旧实现把 bufio 缓冲里的数据也算进
+// 断点，Engine.Stop 超时落盘后重启续传会在文件中间留下空洞。
+func TestStreamWriterFlushBreakpointNotAhead(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "x.ts")
+	const (
+		segCount = 8
+		segSize  = 300 << 10 // 8 × 300KB = 2.4MB，足以跨过 1MB 刷新阈值
+	)
+	flushed := 0
+	sw, err := newStreamWriter(path, 0, func(int) {}, func(f int) {
+		if f > flushed {
+			flushed = f
+		}
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < segCount; i++ {
+		if err := sw.submit(i, bytes.Repeat([]byte{byte(i + 1)}, segSize)); err != nil {
+			t.Fatalf("submit %d: %v", i, err)
+		}
+		fi, err := os.Stat(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if fi.Size() < int64(flushed)*segSize {
+			t.Fatalf("断点 %d 声称已落盘，但文件仅 %d 字节（应 ≥ %d）", flushed, fi.Size(), flushed*segSize)
+		}
+		if flushed > i+1 {
+			t.Fatalf("断点 %d 超过已提交分片数 %d", flushed, i+1)
+		}
+	}
+	if err := sw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	fi, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fi.Size() != segCount*segSize {
+		t.Fatalf("最终文件大小 %d want %d", fi.Size(), segCount*segSize)
+	}
+	if flushed != segCount {
+		t.Fatalf("Close 后断点应推进到 %d, got %d", segCount, flushed)
 	}
 }

@@ -11,19 +11,23 @@ import (
 	"testing"
 )
 
-// setupProbeTest 测试期强制直连并重置共享客户端，避免默认代理干扰。
+// setupProbeTest 测试期强制直连并重置共享客户端，避免默认代理干扰；
+// 同时放行本机地址（上游是 httptest 起的 127.0.0.1 服务，默认会被 SSRF 防护挡掉）。
 func setupProbeTest(t *testing.T) {
 	t.Helper()
-	oldProxy, oldClient := getProxyAddr(), sharedClient
-	setProxyAddr("direct")
-	netMu.Lock()
-	sharedClient = nil
-	netMu.Unlock()
+	oldProxy, oldClient := testStd.getProxyAddr(), testStd.sharedClient
+	oldAllowLocal := testStd.probeAllowLocal
+	testStd.setProxyAddr("direct")
+	testStd.probeAllowLocal = true
+	testStd.netMu.Lock()
+	testStd.sharedClient = nil
+	testStd.netMu.Unlock()
 	t.Cleanup(func() {
-		setProxyAddr(oldProxy)
-		netMu.Lock()
-		sharedClient = oldClient
-		netMu.Unlock()
+		testStd.setProxyAddr(oldProxy)
+		testStd.probeAllowLocal = oldAllowLocal
+		testStd.netMu.Lock()
+		testStd.sharedClient = oldClient
+		testStd.netMu.Unlock()
 	})
 }
 
@@ -43,16 +47,41 @@ func TestProbeForwardsPlaylist(t *testing.T) {
 	defer upstream.Close()
 
 	rec := httptest.NewRecorder()
-	handleProbe(rec, probeRequest(t, upstream.URL+"/live.m3u8", "https://page.example"))
+	testEngine().handleProbe(rec, probeRequest(t, upstream.URL+"/live.m3u8", "https://page.example"))
 
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status=%d want 200, body=%s", rec.Code, rec.Body.String())
 	}
-	if got := rec.Header().Get("Access-Control-Allow-Origin"); got != "*" {
-		t.Fatalf("ACAO=%q want *", got)
-	}
+	// CORS 头已不在端点里设置：跨源读取权限统一由 auth.go 的 guard 按令牌决定
 	if body := rec.Body.String(); !strings.Contains(body, "#EXTM3U") {
 		t.Fatalf("响应应包含 playlist 文本: %q", body)
+	}
+}
+
+// TestValidProbeTargetBlocksInternal /probe 不能变成 SSRF 跳板：
+// 环回、私网、链路本地、云元数据地址与内网主机名一律拒绝。
+func TestValidProbeTargetBlocksInternal(t *testing.T) {
+	// 不调用 setupProbeTest：本用例要的就是生产语义（不放行本机地址）
+	blocked := []string{
+		"http://127.0.0.1:7891/status",
+		"http://localhost/x.m3u8",
+		"http://[::1]/x.m3u8",
+		"http://10.0.0.5/a.m3u8",
+		"http://172.16.3.4/a.m3u8",
+		"http://192.168.1.1/a.m3u8",
+		"http://169.254.169.254/latest/meta-data/", // 云元数据
+		"http://100.64.0.1/a.m3u8",                 // CGNAT
+		"http://0.0.0.0/a.m3u8",
+		"http://router.internal/a.m3u8",
+		"http://nas.local/a.m3u8",
+	}
+	for _, raw := range blocked {
+		if testStd.validProbeTarget(raw) {
+			t.Errorf("应拒绝内网目标: %s", raw)
+		}
+	}
+	if !testStd.validProbeTarget("https://cdn.example.com/live/index.m3u8") {
+		t.Error("公网 https 目标应放行")
 	}
 }
 
@@ -68,7 +97,7 @@ func TestProbeForwardsReferer(t *testing.T) {
 	defer upstream.Close()
 
 	rec := httptest.NewRecorder()
-	handleProbe(rec, probeRequest(t, upstream.URL+"/live.m3u8", "https://live.example/room"))
+	testEngine().handleProbe(rec, probeRequest(t, upstream.URL+"/live.m3u8", "https://live.example/room"))
 	if rec.Code != http.StatusOK {
 		t.Fatalf("正确 Referer 应转发成功: status=%d", rec.Code)
 	}
@@ -87,7 +116,7 @@ func TestProbeGunzipsBody(t *testing.T) {
 	defer upstream.Close()
 
 	rec := httptest.NewRecorder()
-	handleProbe(rec, probeRequest(t, upstream.URL+"/live.m3u8", ""))
+	testEngine().handleProbe(rec, probeRequest(t, upstream.URL+"/live.m3u8", ""))
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
 	}
@@ -99,7 +128,7 @@ func TestProbeGunzipsBody(t *testing.T) {
 func TestProbeMethodNotAllowed(t *testing.T) {
 	setupProbeTest(t)
 	rec := httptest.NewRecorder()
-	handleProbe(rec, httptest.NewRequest(http.MethodPost, "/probe?url=https://x.example/a.m3u8", nil))
+	testEngine().handleProbe(rec, httptest.NewRequest(http.MethodPost, "/probe?url=https://x.example/a.m3u8", nil))
 	if rec.Code != http.StatusMethodNotAllowed {
 		t.Fatalf("status=%d want 405", rec.Code)
 	}
@@ -108,17 +137,17 @@ func TestProbeMethodNotAllowed(t *testing.T) {
 func TestProbeBadParams(t *testing.T) {
 	setupProbeTest(t)
 	cases := []string{
-		"",                            // 缺 url
-		"ftp://cdn.example/a.m3u8",    // 非 http(s)
-		"https://",                    // 无 host
-		"not a url at all \x01\x02",   // 解析失败/非法
+		"",                          // 缺 url
+		"ftp://cdn.example/a.m3u8",  // 非 http(s)
+		"https://",                  // 无 host
+		"not a url at all \x01\x02", // 解析失败/非法
 	}
 	for _, raw := range cases {
 		q := url.Values{}
 		q.Set("url", raw)
 		req := httptest.NewRequest(http.MethodGet, "/probe?"+q.Encode(), nil)
 		rec := httptest.NewRecorder()
-		handleProbe(rec, req)
+		testEngine().handleProbe(rec, req)
 		if rec.Code != http.StatusBadRequest {
 			t.Fatalf("url=%q status=%d want 400", raw, rec.Code)
 		}
@@ -133,7 +162,7 @@ func TestProbeUpstreamError(t *testing.T) {
 	defer upstream.Close()
 
 	rec := httptest.NewRecorder()
-	handleProbe(rec, probeRequest(t, upstream.URL+"/live.m3u8", ""))
+	testEngine().handleProbe(rec, probeRequest(t, upstream.URL+"/live.m3u8", ""))
 	if rec.Code != http.StatusBadGateway {
 		t.Fatalf("上游 403 应映射 502: status=%d", rec.Code)
 	}
@@ -148,7 +177,7 @@ func TestProbeUpstreamUnavailable(t *testing.T) {
 	upstream.Close() // 立即关闭，制造连接失败
 
 	rec := httptest.NewRecorder()
-	handleProbe(rec, probeRequest(t, upstream.URL+"/live.m3u8", ""))
+	testEngine().handleProbe(rec, probeRequest(t, upstream.URL+"/live.m3u8", ""))
 	if rec.Code != http.StatusBadGateway {
 		t.Fatalf("上游不可达应映射 502: status=%d", rec.Code)
 	}

@@ -6,7 +6,10 @@
 package core
 
 import (
+	"bytes"
 	"errors"
+	"fmt"
+	"os"
 
 	"github.com/0panwang0/go-catcher/internal/fmp4"
 )
@@ -48,6 +51,23 @@ type NormState interface {
 	Finish(path string) error
 }
 
+// ProbeInfo 校验所需的、与具体容器无关的上下文。
+type ProbeInfo struct {
+	Encrypted bool // 播放列表声明了 #EXT-X-KEY（内容本应是解密后的媒体）
+	Segments  int  // 预期分片数（0 = 未知 / 直播）
+	// MinBytes > 0 时要求成品严格大于该字节数。
+	// fMP4 用它兜住最典型的一种"看起来下完了"：只有 init 段、分片一个都没写进去。
+	// 传的是 init 段实际写入长度，而不是拍脑袋的常数——不会误伤小文件。
+	MinBytes int64
+}
+
+// ValidateFunc 容器校验器：head 是开头样本，mid 是中部样本（可能为空）。
+// 返回非 nil 表示「已确证内容不符合该容器特征」，调用方据此判定产物损坏。
+//
+// 约定（很重要）：校验器必须保守 —— 样本不足/特征模糊时必须放行。
+// 它的职责是「确证损坏」，不是「确证正常」；误伤会让正常下载失败。
+type ValidateFunc func(head, mid []byte, info ProbeInfo) error
+
 // Container 一种媒体容器格式的完整描述（纯静态事实，不含算法）。
 type Container struct {
 	ID     string
@@ -58,6 +78,9 @@ type Container struct {
 	// NewState 创建该容器的跨分片规范化状态；nil = 无状态（generic）。
 	// 状态自带数据变换（normalize）与收尾（finish），容器条目本身不携带算法。
 	NewState func() NormState
+	// Validate 内容合法性校验（探测期看首片、落盘前看成品抽样）。
+	// nil = 不做该校验（未知格式不做无根据的判断）。
+	Validate ValidateFunc
 }
 
 // ---- 魔数探测 ----
@@ -132,17 +155,11 @@ func isAVI(p []byte) bool {
 	return len(p) >= 12 && string(p[0:4]) == "RIFF" && string(p[8:12]) == "AVI "
 }
 
+// containsBytes 报告 p 中是否出现子串 s。
+// 原先是自造的逐字节比较（循环内还把切片转成 string，每次迭代都可能分配）；
+// 标准库 bytes.Contains 更快，也没有这层分配。
 func containsBytes(p []byte, s string) bool {
-	return len(p) >= len(s) && indexBytes(p, []byte(s)) >= 0
-}
-
-func indexBytes(hay, needle []byte) int {
-	for i := 0; i+len(needle) <= len(hay); i++ {
-		if string(hay[i:i+len(needle)]) == string(needle) {
-			return i
-		}
-	}
-	return -1
+	return bytes.Contains(p, []byte(s))
 }
 
 // ---- 注册表 ----
@@ -151,15 +168,19 @@ func indexBytes(hay, needle []byte) int {
 // 此处即编译期验证：*fmp4.normState 的方法集满足 NormState 接口。
 func fmp4State() NormState { return fmp4.NewState() }
 
-// containerRegistry 按序探测（先命中的格式优先）。fmp4 有两个条目：
-//   - 首片自带 ftyp（完整 init 内联）→ 无需 #EXT-X-MAP，裸拼即可
-//   - 首片是 styp/moof（纯媒体分片）→ 需要 #EXT-X-MAP 提供的 init 段
+// containerRegistry 按序探测（先命中的格式优先）。fmp4 有两个条目，用不同 ID
+// 区分（原先两条同 ID，逼得 findContainerByID 必须特判 Init 字段才能挑对）：
+//   - "fmp4"     首片自带 ftyp（完整 init 内联）→ 无需 #EXT-X-MAP，裸拼即可
+//   - "fmp4-map" 首片是 styp/moof（纯媒体分片）→ 需要 #EXT-X-MAP 提供的 init 段
+//
+// ID 沿用 "fmp4" 作内联条目，旧状态文件里的 containerID 无需迁移：
+// 续传只用到 NewState，两条目共用同一个工厂。
 //
 // generic 恒真 Detect 兜底，必须保持在最后。
 var containerRegistry = []Container{
-	{ID: "ts", Ext: ".ts", Detect: isTS, Init: InitNone, Concat: ConcatAppend},
-	{ID: "fmp4", Ext: ".mp4", Detect: hasFtyp, Init: InitNone, Concat: ConcatAppend, NewState: fmp4State},
-	{ID: "fmp4", Ext: ".mp4", Detect: hasMoof, Init: InitFromMap, Concat: ConcatInitAppend, NewState: fmp4State},
+	{ID: "ts", Ext: ".ts", Detect: isTS, Init: InitNone, Concat: ConcatAppend, Validate: validateTS},
+	{ID: "fmp4", Ext: ".mp4", Detect: hasFtyp, Init: InitNone, Concat: ConcatAppend, NewState: fmp4State, Validate: validateFMP4},
+	{ID: "fmp4-map", Ext: ".mp4", Detect: hasMoof, Init: InitFromMap, Concat: ConcatInitAppend, NewState: fmp4State, Validate: validateFMP4},
 	{ID: "flv", Ext: ".flv", Detect: isFLV, Init: InitNone, Concat: ConcatAppend},
 	{ID: "webm", Ext: ".webm", Detect: isWebM, Init: InitNone, Concat: ConcatAppend},
 	{ID: "mkv", Ext: ".mkv", Detect: isMKV, Init: InitNone, Concat: ConcatAppend},
@@ -168,27 +189,20 @@ var containerRegistry = []Container{
 	{ID: "wav", Ext: ".wav", Detect: isWAV, Init: InitNone, Concat: ConcatAppend},
 	{ID: "ogg", Ext: ".ogg", Detect: isOgg, Init: InitNone, Concat: ConcatAppend},
 	{ID: "avi", Ext: ".avi", Detect: isAVI, Init: InitNone, Concat: ConcatAppend},
-	// 未知二进制（普通文件等）：保持原扩展名、裸拼
-	{ID: "generic", Ext: "", Detect: func([]byte) bool { return true }, Init: InitNone, Concat: ConcatAppend},
+	// 未知二进制（普通文件等）：保持原扩展名、裸拼。
+	// Validate 只对"声明了加密"的流生效（见 validateGenericMedia）。
+	{ID: "generic", Ext: "", Detect: func([]byte) bool { return true }, Init: InitNone, Concat: ConcatAppend, Validate: validateGenericMedia},
 }
 
 // findContainerByID 按 ID 找回容器（断点续传时恢复规范化等格式相关行为）。
-// fmp4 在注册表有两个条目（内联 init / #EXT-X-MAP）：续传时文件已有 init 段，
-// 状态行为（NewState）两条目相同，统一返回 #EXT-X-MAP 形态的条目。
+// ID 在注册表内唯一，无需任何特判。
 func findContainerByID(id string) *Container {
-	var fallback *Container
 	for i := range containerRegistry {
-		if containerRegistry[i].ID != id {
-			continue
-		}
-		if containerRegistry[i].Init == InitFromMap {
+		if containerRegistry[i].ID == id {
 			return &containerRegistry[i]
 		}
-		if fallback == nil {
-			fallback = &containerRegistry[i]
-		}
 	}
-	return fallback
+	return nil
 }
 
 // looksLikeMedia 宽松判断数据是否具有可识别的媒体特征。
@@ -213,35 +227,135 @@ func looksLikeMedia(p []byte) bool {
 	return false
 }
 
-// guardGenericMedia 加密流误判守卫。
-// 管线按首个分片探测到 generic 容器（"识别不出已知媒体格式"）时调用：
-//
-//   - key == nil（明文流/直链）：generic 是合法结果（可能是任意文件），放行。
-//   - key != nil（播放列表声明了 #EXT-X-KEY，应解密成媒体）：
-//     此时首个分片若在解密后仍无任何媒体特征，几乎必然意味着解密未生效
-//     或源被加扰，当前正把密文/垃圾当成品保存——这是比"下载失败"更隐蔽的
-//     数据损坏。返回描述性错误让任务判失败，而不是静默产出不可播文件。
-//
-// 已解密出明确媒体格式的分片不会走到这里（detectContainer 会命中 ts/fmp4/...），
-// 因此本守卫只对"真出问题"的加密流生效，不误伤正常下载。
-func guardGenericMedia(container *Container, key *KeyInfo, pre []byte) error {
-	if container == nil || container.ID != "generic" {
+// ============================================================
+// 容器校验器
+// ------------------------------------------------------------
+// 每个容器条目自带 Validate，探测期与落盘前共用同一份判据：
+// 新增格式时校验规则与魔数探测写在一起，不必再往管线里塞特例分支。
+// ============================================================
+
+// tsSyncRate 统计样本在 188 字节网格上命中 0x47 同步字节的比例。
+// 从首字节起按 188 步进（TS 分片/文件都以包边界开头）。样本不足一包返回 0。
+func tsSyncRate(p []byte) float64 {
+	if len(p) < 188*2 {
+		return 0
+	}
+	total, hit := 0, 0
+	for i := 0; i+1 < len(p); i += 188 {
+		total++
+		if p[i] == 0x47 {
+			hit++
+		}
+	}
+	if total == 0 {
+		return 0
+	}
+	return float64(hit) / float64(total)
+}
+
+// validateTS 校验 TS 的 188 字节同步网格。
+// 样本短于 4 个包（752B）时无法可靠判断，放行——避免把短样本误判成损坏。
+func validateTS(head, mid []byte, info ProbeInfo) error {
+	const minSample = 188 * 4
+	if len(head) < minSample && len(mid) < minSample {
 		return nil
 	}
-	if key == nil {
+	if tsSyncRate(head) >= 0.5 || tsSyncRate(mid) >= 0.5 {
 		return nil
 	}
-	if looksLikeMedia(pre) {
-		// 数据具备媒体特征但未被严格识别（罕见容器变体）：放行，避免误伤。
+	return errContainerMismatch("ts")
+}
+
+// validateFMP4 校验 ISO BMFF 的 box 头。init 段以 ftyp/moov 开头，
+// 纯媒体分片以 styp/moof 开头；中段样本能见到 moof 也视为通过。
+func validateFMP4(head, mid []byte, info ProbeInfo) error {
+	if len(head) >= 8 {
+		switch string(head[4:8]) {
+		case "ftyp", "moov", "styp", "moof":
+			return nil
+		}
+	}
+	if len(head) >= 4 && string(head[0:4]) == "moof" {
 		return nil
+	}
+	if containsBytes(head, "moov") || containsBytes(mid, "moof") {
+		return nil
+	}
+	if len(head) < 8 && len(mid) < 8 {
+		return nil // 样本太短，无法判断
+	}
+	return errContainerMismatch("fmp4")
+}
+
+// validateGenericMedia generic 兜底容器的校验器，也是加密流误判守卫本体：
+//
+//   - 未声明加密：generic 是合法结果（用户可能就是在下一个未知格式文件），放行。
+//   - 声明了加密：解密后应当出现可识别的媒体特征。若连媒体特征都没有，
+//     几乎必然是解密未生效或源被加扰 —— 此时保存的是密文/垃圾，
+//     属于比"下载失败"更隐蔽的数据损坏，必须判失败而不是静默产出不可播文件。
+func validateGenericMedia(head, mid []byte, info ProbeInfo) error {
+	if !info.Encrypted {
+		return nil
+	}
+	if looksLikeMedia(head) || looksLikeMedia(mid) {
+		return nil // 有媒体特征但未被严格识别（罕见容器变体）：放行，避免误伤
 	}
 	return errDecryptProbeFailed
 }
 
-// errDecryptProbeFailed generic + 声明加密 + 解密后首片无媒体特征 → 判定解密失败。
+// errDecryptProbeFailed generic + 声明加密 + 解密后无媒体特征 → 判定解密失败。
 var errDecryptProbeFailed = errors.New(
-	"探测到视频已声明 AES 加密(#EXT-X-KEY)，但解密后的首个分片不包含任何可识别的媒体数据，" +
+	"探测到视频已声明 AES 加密(#EXT-X-KEY)，但解密后的内容不包含任何可识别的媒体数据，" +
 		"疑似解密失败或视频源被加扰，已中止下载以避免保存损坏文件")
+
+// errContainerMismatch 内容与容器特征不符。
+func errContainerMismatch(id string) error {
+	return fmt.Errorf("产物校验失败：内容不符合 %s 容器特征（疑似下载或解密过程中损坏）", id)
+}
+
+// runValidator 用容器自带的校验器检查样本；无校验器 = 放行。
+func runValidator(c *Container, head, mid []byte, info ProbeInfo) error {
+	if c == nil || c.Validate == nil {
+		return nil
+	}
+	return c.Validate(head, mid, info)
+}
+
+// guardGenericMedia 探测期守卫：拿到首片明文后立刻校验，尽快失败。
+// 包装成这个签名是为了让调用点读起来直白（容器 + 是否声明加密 + 首片样本）。
+func guardGenericMedia(container *Container, key *KeyInfo, pre []byte) error {
+	return runValidator(container, pre, nil, ProbeInfo{Encrypted: key != nil})
+}
+
+// validateOutput 落盘前对成品抽样校验（探测期守卫只看首片，这里补看头与中段）。
+// 任何"读不到 / 样本不足 / 无校验器"的情况一律放行：它只负责确证损坏。
+func validateOutput(c *Container, path string, info ProbeInfo) error {
+	if c == nil || c.Validate == nil {
+		return nil
+	}
+	head, err := readHead(path, 256<<10)
+	if err != nil || len(head) == 0 {
+		return nil
+	}
+	var mid []byte
+	if fi, serr := os.Stat(path); serr == nil && fi.Size() > 1<<20 {
+		if f, oerr := os.Open(path); oerr == nil {
+			buf := make([]byte, 64<<10)
+			n, _ := f.ReadAt(buf, fi.Size()/2)
+			mid = buf[:n]
+			f.Close()
+		}
+	}
+	// 体量下限：只有 fMP4 这类需要 init 段的容器才会带上 MinBytes。
+	// 文件大小没超过 init 段本身 → 一个分片都没写进去，只是"看起来下完了"。
+	if info.MinBytes > 0 {
+		if fi, serr := os.Stat(path); serr == nil && fi.Size() <= info.MinBytes {
+			return fmt.Errorf("产物校验失败：文件仅 %d 字节，未超过初始化段（%d 字节），"+
+				"说明没有任何媒体分片成功写入", fi.Size(), info.MinBytes)
+		}
+	}
+	return c.Validate(head, mid, info)
+}
 
 // detectContainer 根据首个分片的开头字节 + 播放列表元信息识别容器。
 //
@@ -252,7 +366,7 @@ var errDecryptProbeFailed = errors.New(
 //   - 全部不匹配 → generic（普通文件，保持调用方给的扩展名）
 func detectContainer(peek []byte, hasMap bool) *Container {
 	if hasMap && !hasFtyp(peek) {
-		return findContainerByID("fmp4")
+		return findContainerByID("fmp4-map")
 	}
 	for i := range containerRegistry {
 		if containerRegistry[i].Detect(peek) {
@@ -260,7 +374,7 @@ func detectContainer(peek []byte, hasMap bool) *Container {
 		}
 	}
 	if hasMap {
-		return findContainerByID("fmp4")
+		return findContainerByID("fmp4-map")
 	}
 	return findContainerByID("generic")
 }

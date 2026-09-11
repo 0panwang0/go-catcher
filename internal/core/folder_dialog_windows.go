@@ -48,32 +48,37 @@ const (
 	SIGDN_FILESYSPATH = 0x80058000
 )
 
-// COM 接口 vtable 调用辅助：跳一个 method index，返回 HRESULT
-func comCall3(iface uintptr, idx int, a1, a2, a3 uintptr) (hr uintptr) {
-	vt := *(*uintptr)(unsafe.Pointer(iface)) // vtable 指针
-	method := *(*uintptr)(unsafe.Pointer(vt + uintptr(idx)*unsafe.Sizeof(uintptr(0))))
-	r0, _, _ := syscall.SyscallN(method, iface, a1, a2, a3)
+// comMethod 取 COM 接口的第 idx 个虚函数地址。
+// 用 [N]uintptr 数组视图而不是 uintptr 算术：后者要写
+// unsafe.Pointer(vt + idx*8)，会被 go vet 判为 possible misuse of unsafe.Pointer，
+// 而且 uintptr 中间值不是引用，语义上也不该拿来存地址。
+func comMethod(iface unsafe.Pointer, idx int) uintptr {
+	vtable := *(*unsafe.Pointer)(iface) // 接口对象首字 = vtable 指针
+	return (*[1 << 10]uintptr)(vtable)[idx]
+}
+
+// COM 接口 vtable 调用辅助：跳一个 method index，返回 HRESULT。
+//
+// iface 用 unsafe.Pointer 而不是 uintptr：COM 接口指针本质是指针，用 uintptr
+// 存着会被 go vet 判为 possible misuse of unsafe.Pointer。调用 SyscallN 时才
+// 转成 uintptr，这是官方认可的写法。
+func comCall3(iface unsafe.Pointer, idx int, a1, a2, a3 uintptr) (hr uintptr) {
+	r0, _, _ := syscall.SyscallN(comMethod(iface, idx), uintptr(iface), a1, a2, a3)
 	return r0
 }
 
-func comCall2(iface uintptr, idx int, a1, a2 uintptr) (hr uintptr) {
-	vt := *(*uintptr)(unsafe.Pointer(iface))
-	method := *(*uintptr)(unsafe.Pointer(vt + uintptr(idx)*unsafe.Sizeof(uintptr(0))))
-	r0, _, _ := syscall.SyscallN(method, iface, a1, a2)
+func comCall2(iface unsafe.Pointer, idx int, a1, a2 uintptr) (hr uintptr) {
+	r0, _, _ := syscall.SyscallN(comMethod(iface, idx), uintptr(iface), a1, a2)
 	return r0
 }
 
-func comCall1(iface uintptr, idx int, a1 uintptr) (hr uintptr) {
-	vt := *(*uintptr)(unsafe.Pointer(iface))
-	method := *(*uintptr)(unsafe.Pointer(vt + uintptr(idx)*unsafe.Sizeof(uintptr(0))))
-	r0, _, _ := syscall.SyscallN(method, iface, a1)
+func comCall1(iface unsafe.Pointer, idx int, a1 uintptr) (hr uintptr) {
+	r0, _, _ := syscall.SyscallN(comMethod(iface, idx), uintptr(iface), a1)
 	return r0
 }
 
-func comCall0(iface uintptr, idx int) (hr uintptr) {
-	vt := *(*uintptr)(unsafe.Pointer(iface))
-	method := *(*uintptr)(unsafe.Pointer(vt + uintptr(idx)*unsafe.Sizeof(uintptr(0))))
-	r0, _, _ := syscall.SyscallN(method, iface)
+func comCall0(iface unsafe.Pointer, idx int) (hr uintptr) {
+	r0, _, _ := syscall.SyscallN(comMethod(iface, idx), uintptr(iface))
 	return r0
 }
 
@@ -106,7 +111,7 @@ func pickFolder(ownerHwnd uintptr, title string) (string, error) {
 	defer procCoUninit.Call()
 
 	// CoCreateInstance(CLSID_FileOpenDialog, nil, CLSCTX_INPROC_SERVER=1, IID_IFileOpenDialog, &ptr)
-	var dialogPtr uintptr
+	var dialogPtr unsafe.Pointer
 	hr, _, _ := procCoCreateInst.Call(
 		uintptr(unsafe.Pointer(&clsidFileOpenDialog)),
 		0,
@@ -144,25 +149,25 @@ func pickFolder(ownerHwnd uintptr, title string) (string, error) {
 	}
 
 	// GetResult(&shellItem) — vtable index 20（IFileDialog::GetResult 一个参数）
-	var itemPtr uintptr
+	var itemPtr unsafe.Pointer
 	if err := hrErr(comCall1(dialogPtr, 20, uintptr(unsafe.Pointer(&itemPtr)))); err != nil {
 		return "", err
 	}
-	if itemPtr == 0 {
+	if itemPtr == nil {
 		return "", fmt.Errorf("no result")
 	}
 	defer comCall0(itemPtr, 2) // Release shellItem
 
 	// IShellItem::GetDisplayName(SIGDN_FILESYSPATH, &name) — vtable index 5
-	var namePtr uintptr
+	var namePtr unsafe.Pointer
 	if err := hrErr(comCall2(itemPtr, 5, SIGDN_FILESYSPATH, uintptr(unsafe.Pointer(&namePtr)))); err != nil {
 		return "", err
 	}
-	defer procCoTaskMemFr.Call(namePtr) // 释放 CoTaskMemAlloc 出来的字符串
+	defer procCoTaskMemFr.Call(uintptr(namePtr)) // 释放 CoTaskMemAlloc 出来的字符串
 
-	if namePtr == 0 {
+	if namePtr == nil {
 		return "", fmt.Errorf("empty path")
 	}
-	path := windows.UTF16ToString((*[1 << 20]uint16)(unsafe.Pointer(namePtr))[:])
+	path := windows.UTF16ToString((*[1 << 20]uint16)(namePtr)[:])
 	return path, nil
 }

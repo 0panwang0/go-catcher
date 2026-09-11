@@ -6,29 +6,97 @@
 package core
 
 import (
+	"fmt"
 	"strings"
 
 	"golang.org/x/sys/windows/registry"
 )
 
-// systemProxyAddr 读当前用户 WinINET 系统代理。变量形式便于测试注入。
-// 返回规范化 http://host:port；未启用/读取失败返回 ""（= 直连）。
-var systemProxyAddr = func() string {
+// systemProxyReading 一次注册表读取的结果。
+type systemProxyReading struct {
+	server  string // ProxyServer 原始值
+	enabled bool   // ProxyEnable != 0 且读取成功
+}
+
+// readSystemProxy 读当前用户的 WinINET 代理设置。
+func readSystemProxy() systemProxyReading {
 	k, err := registry.OpenKey(registry.CURRENT_USER,
 		`Software\Microsoft\Windows\CurrentVersion\Internet Settings`, registry.QUERY_VALUE)
 	if err != nil {
-		return ""
+		return systemProxyReading{}
 	}
 	defer k.Close()
 	enable, _, err := k.GetIntegerValue("ProxyEnable")
 	if err != nil || enable == 0 {
-		return ""
+		return systemProxyReading{}
 	}
 	server, _, err := k.GetStringValue("ProxyServer")
 	if err != nil {
+		return systemProxyReading{}
+	}
+	return systemProxyReading{server: server, enabled: true}
+}
+
+// realSystemProxyAddr 读当前用户 WinINET 系统代理（Runtime.systemProxyAddrFn
+// 的默认实现；测试可向 Runtime 注入桩函数）。
+// 返回规范化 http://host:port；未启用/读取失败返回 ""（= 直连）。
+func realSystemProxyAddr() string {
+	r := readSystemProxy()
+	if !r.enabled {
 		return ""
 	}
-	return normalizeSystemProxy(server)
+	return normalizeSystemProxy(r.server)
+}
+
+// systemProxyWarning 报告"系统代理已启用、但本引擎用不了"的原因（空 = 无需提示）。
+//
+// socks5:// 之类的协议无法走 HTTP CONNECT 隧道，normalizeSystemProxy 会返回空串
+// ——效果是静默直连。用户以为走了代理、实际暴露真实 IP，这种"安静的降级"必须
+// 显式说出来，否则排查时完全看不出问题在哪。
+func (rt *Runtime) systemProxyWarning() string {
+	if !strings.EqualFold(strings.TrimSpace(rt.getProxyAddr()), "system") {
+		return "" // 手动/直连模式与系统代理无关
+	}
+	r := readSystemProxy()
+	if !r.enabled {
+		return ""
+	}
+	if normalizeSystemProxy(r.server) != "" {
+		return "" // 解析成功，没有可提示的
+	}
+	return systemProxyNotice(r.server)
+}
+
+// systemProxyNotice 解释 ProxyServer 为何不可用；无法归因时返回通用提示。
+func systemProxyNotice(server string) string {
+	s := strings.TrimSpace(server)
+	if s == "" {
+		return ""
+	}
+	const rule = "本工具只支持 http:// 代理（socks5 等无法走 CONNECT 隧道），已按直连处理"
+	if !strings.Contains(s, "=") {
+		if i := strings.Index(s, "://"); i > 0 {
+			return fmt.Sprintf("系统代理协议为 %s，%s", strings.ToLower(s[:i]), rule)
+		}
+		return ""
+	}
+	var protos []string
+	hasHTTP := false
+	for _, kv := range strings.Split(s, ";") {
+		eq := strings.Index(kv, "=")
+		if eq <= 0 {
+			continue
+		}
+		p := strings.ToLower(strings.TrimSpace(kv[:eq]))
+		protos = append(protos, p)
+		if p == "http" || p == "https" {
+			hasHTTP = true
+		}
+	}
+	if !hasHTTP && len(protos) > 0 {
+		return fmt.Sprintf("系统代理只配置了 %s，%s", strings.Join(protos, "/"), rule)
+	}
+	return ""
 }
 
 // normalizeSystemProxy 规范化 ProxyServer 值：可能是 "host:port"、

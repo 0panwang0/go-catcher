@@ -14,7 +14,7 @@ func callCancel(t *testing.T, id string) {
 	t.Helper()
 	w := httptest.NewRecorder()
 	r := httptest.NewRequest("GET", "/cancel?id="+id, nil)
-	handleCancel(w, r)
+	testEngine().handleCancel(w, r)
 	if w.Code != 200 {
 		t.Fatalf("cancel HTTP %d: %s", w.Code, w.Body.String())
 	}
@@ -47,12 +47,12 @@ func TestHandleCancelPausedTask(t *testing.T) {
 	_, cancelFn := context.WithCancel(context.Background())
 	cancelFn()
 
-	te := &taskEntry{cancel: cancelFn, st: taskState{
+	te := &taskEntry{rt: testStd, cancel: cancelFn, st: taskState{
 		id: "tp", paused: true, stage: "已暂停",
 		filename: "video.ts", saveDir: dir, finalPath: final,
 		segDone: 100, segTot: 200,
 	}}
-	tasks[te.st.id] = te
+	testStd.tasks[te.st.id] = te
 
 	callCancel(t, "tp")
 
@@ -78,11 +78,11 @@ func TestHandleCancelQueuedTask(t *testing.T) {
 	final := filepath.Join(dir, "q.ts")
 	part, _ := writePart(t, final)
 
-	te := &taskEntry{st: taskState{
+	te := &taskEntry{rt: testStd, st: taskState{
 		id: "tq", queued: true, stage: "排队中",
 		filename: "q.ts", saveDir: dir, finalPath: final,
 	}}
-	tasks[te.st.id] = te
+	testStd.tasks[te.st.id] = te
 
 	callCancel(t, "tq")
 
@@ -102,8 +102,8 @@ func TestHandleCancelQueuedTask(t *testing.T) {
 func TestHandleCancelRunningTaskDelegatesToWorker(t *testing.T) {
 	saveRestoreState(t)
 	ctx, cancelFn := context.WithCancel(context.Background())
-	te := &taskEntry{cancel: cancelFn, st: taskState{id: "tr", running: true, stage: "下载分片中"}}
-	tasks[te.st.id] = te
+	te := &taskEntry{rt: testStd, cancel: cancelFn, st: taskState{id: "tr", running: true, stage: "下载分片中"}}
+	testStd.tasks[te.st.id] = te
 
 	workerDone := make(chan struct{})
 	go func() { // 模拟 pipeline：等 ctx 取消后走标准收尾
@@ -132,11 +132,11 @@ func TestHandleCancelDoneTask(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	te := &taskEntry{st: taskState{
+	te := &taskEntry{rt: testStd, st: taskState{
 		id: "td", done: true, stage: "已保存",
 		filename: "ok.ts", saveDir: dir, finalPath: final,
 	}}
-	tasks[te.st.id] = te
+	testStd.tasks[te.st.id] = te
 
 	callCancel(t, "td")
 

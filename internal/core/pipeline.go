@@ -3,6 +3,7 @@ package core
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -16,7 +17,7 @@ func runDiskPipeline(te *taskEntry) {
 	defer func() {
 		// 释放并发槽，让排队的下一个任务进场
 		if acquired {
-			limiter.release()
+			te.rt.limiter.release()
 		}
 	}()
 
@@ -31,10 +32,10 @@ func runDiskPipeline(te *taskEntry) {
 	te.st.stage = "排队中"
 	te.mu.Unlock()
 	defer cancel()
-	markDirty()
+	te.rt.markDirty()
 
 	// 等待并发槽位（超过当前上限的新任务在此排队；队列中可被暂停/取消打断）
-	if !limiter.acquire(ctx) {
+	if !te.rt.limiter.acquire(ctx) {
 		finishInterrupt(te)
 		return
 	}
@@ -54,9 +55,10 @@ func runDiskPipeline(te *taskEntry) {
 		te.st.finalPath = st.finalPath
 	}
 	te.mu.Unlock()
-	markDirty()
+	te.rt.markDirty()
 
 	job := &dlJob{
+		rt:      te.rt,
 		id:      st.id,
 		m3u8URL: st.m3u8URL,
 		referer: st.referer,
@@ -84,7 +86,7 @@ func runDiskPipeline(te *taskEntry) {
 	fail := func(msg string) {
 		fmt.Printf("[disk] FAIL: %s\n", msg)
 		failTask(te, msg)
-		markDirty()
+		te.rt.markDirty()
 	}
 
 	// 先确保目标目录存在（用户可能在弹框里选了一个还没创建的子目录）
@@ -122,7 +124,7 @@ func runDiskPipeline(te *taskEntry) {
 		te.st.finalPath = st.finalPath
 		te.st.stage = "下载直链文件中"
 		te.mu.Unlock()
-		markDirty()
+		te.rt.markDirty()
 		fmt.Printf("[disk] id=%s 直链文件下载 -> %s\n", st.id, st.finalPath)
 		if err := job.downloadDirect(ctx, partPath); err != nil {
 			if ctx.Err() != nil {
@@ -146,7 +148,7 @@ func runDiskPipeline(te *taskEntry) {
 		te.st.errorMsg = ""
 		te.st.finished = time.Now()
 		te.mu.Unlock()
-		markDirty()
+		te.rt.markDirty()
 		return
 	}
 
@@ -154,6 +156,11 @@ func runDiskPipeline(te *taskEntry) {
 	pl := parsePlaylist(m3u8Content, baseURL)
 	if len(pl.segments) == 0 {
 		fail("播放列表中没有找到任何媒体分片（响应可能被加密或压缩）")
+		return
+	}
+	// 中途换 key 的流按当前实现会解错前面的分片：宁可失败也不产出损坏文件
+	if kerr := ensureSingleKey(pl); kerr != nil {
+		fail(kerr.Error())
 		return
 	}
 	// 加密流装配解密器（拉取 key 并按 METHOD 建解密器）；失败任务即失败。
@@ -172,100 +179,44 @@ func runDiskPipeline(te *taskEntry) {
 	//    续传（from>0）时格式已定、扩展名已修正、init 已在文件头，全部跳过，
 	//    但规范化仍需进行：用持久化的容器 ID 恢复（旧版本任务从 .part 头嗅探）。
 	if from == 0 {
-		pre, perr := fetchSegment(ctx, job, pl.segments[0])
-		if perr != nil {
+		container, cerr := probeContainer(ctx, job, &pl, pl.segments[0])
+		if cerr != nil {
 			if ctx.Err() != nil {
 				finishInterrupt(te)
 				return
 			}
-			fail("探测视频格式失败（首个分片）: " + perr.Error())
+			fail(cerr.Error())
 			return
-		}
-		// 加密流：探测分片先解密（容器魔数在密文上看不出，识别必须基于明文）
-		if pre, perr = job.decryptSegmentIfAny(pl.mediaSeq, pre); perr != nil {
-			fail("解密首个分片失败: " + perr.Error())
-			return
-		}
-		job.pre = pre
-		job.preURL = pl.segments[0]
-
-		container := detectContainer(pre, pl.hasMap)
-		// 加密流误判守卫：识别为 generic 但播放列表声明了加密时，
-		// 解密后的首片若无媒体特征，判为"解密失败/源被加扰"，中止下载，
-		// 避免把仍处密文的流静默存成不可播文件（此前会报"已保存"成功）。
-		if gerr := guardGenericMedia(container, pl.key, pre); gerr != nil {
-			fail(gerr.Error())
-			return
-		}
-		job.container = container
-		// 规范化状态由容器工厂创建（generic 等无状态容器为 nil）
-		if container.NewState != nil {
-			job.norm = container.NewState()
 		}
 		// 输出扩展名跟随真实容器（fMP4 内容绝不能存成 .ts）
-		if container.Ext != "" && !strings.HasSuffix(strings.ToLower(st.filename), container.Ext) {
-			st.filename = strings.TrimSuffix(st.filename, filepath.Ext(st.filename)) + container.Ext
+		if nf := correctExtName(st.filename, container); nf != st.filename {
+			st.filename = nf
 			st.finalPath = uniquePath(filepath.Join(st.saveDir, st.filename))
 			st.filename = filepath.Base(st.finalPath)
 			partPath = st.finalPath + ".part"
 		}
-		if container.Init == InitFromMap {
-			if pl.mapURI == "" {
-				fail("识别为 fMP4 分片流，但播放列表没有 #EXT-X-MAP 初始化段，无法生成可播放文件")
+		if werr := writeInitSegmentFor(ctx, job, &pl, partPath); werr != nil {
+			if ctx.Err() != nil {
+				finishInterrupt(te)
 				return
 			}
-			initData, ferr := fetchSegment(ctx, job, pl.mapURI)
-			if ferr != nil {
-				if ctx.Err() != nil {
-					finishInterrupt(te)
-					return
-				}
-				fail("获取 fMP4 init 段失败: " + ferr.Error())
-				return
-			}
-			// 补 mehd 占位（fMP4 总时长声明）并解析轨道类型与回填位置
-			// （Normalize 对含 moov 的数据自动走 init 消费，幂等）
-			nd, nerr := job.norm.Normalize(initData)
-			if nerr != nil {
-				fail("处理 fMP4 init 段失败: " + nerr.Error())
-				return
-			}
-			if werr := writeInitSegment(partPath, nd); werr != nil {
-				fail("写入 init 段失败: " + werr.Error())
-				return
-			}
+			fail(werr.Error())
+			return
 		}
 		te.mu.Lock()
 		te.st.filename = st.filename
 		te.st.finalPath = st.finalPath
 		te.st.containerID = container.ID
-			if job.norm != nil {
-				te.st.normState = job.norm.Snapshot()
-			}
-		te.mu.Unlock()
-		markDirty()
-	} else {
-		if c := findContainerByID(st.containerID); c != nil {
-			job.container = c
-			if c.NewState != nil {
-				job.norm = c.NewState()
-			}
-		} else if head, herr := readHead(partPath, 4096); herr == nil && len(head) > 0 {
-			job.container = detectContainer(head, true) // 旧版本任务：从 .part 文件头嗅探
-			if job.container.NewState != nil {
-				job.norm = job.container.NewState()
-			}
-		}
-		// 恢复全部跨分片状态（tfdt 基准 + 结束时间 + init 信息，一个不透明字节包）。
-		// 旧版本任务（未持久化 normState）回退为从 .part 文件头重新解析 init
-		// （mehd 占位已在首次运行时写入，Normalize 内 consumeInit 幂等不会重复插入）
 		if job.norm != nil {
-			if b := te.st.normState; len(b) > 0 {
-				job.norm.Restore(b)
-			} else if head, herr := readHead(partPath, 64<<10); herr == nil && len(head) > 8 {
-				job.norm.Normalize(head)
-			}
+			te.st.normState = job.norm.Snapshot()
 		}
+		te.mu.Unlock()
+		te.rt.markDirty()
+	} else {
+		te.mu.Lock()
+		normState := te.st.normState
+		te.mu.Unlock()
+		restoreContainer(job, st.containerID, partPath, normState)
 	}
 
 	// 4. 下载：直播跟随（循环拉取增量追加）vs 点播（一次性并发）
@@ -311,7 +262,25 @@ func runDiskPipeline(te *taskEntry) {
 		return
 	}
 
-	// 5. 落盘：先做容器收尾处理（fMP4 回填总时长 mehd/mvhd），再 .part → 正式文件
+	// 5. 落盘前抽样校验：探测期守卫只看首片，这里对成品头/中段再确认一次。
+	//    判定损坏时直接丢弃 .part —— 重试只会重下出同样的坏数据，
+	//    留着它只会让"重试"反复失败并占着断点。
+	valSegs := len(pl.segments)
+	if isLive {
+		valSegs = 0 // 直播窗口大小不代表总量，体量合理性检查不适用
+	}
+	if verr := validateOutput(job.container, partPath, ProbeInfo{
+		Encrypted: pl.key != nil,
+		Segments:  valSegs,
+		MinBytes:  int64(job.initLen),
+	}); verr != nil {
+		os.Remove(partPath)
+		os.Remove(partPath + ".meta")
+		fail(verr.Error() + "（已丢弃损坏的临时文件）")
+		return
+	}
+
+	// 6. 落盘：先做容器收尾处理（fMP4 回填总时长 mehd/mvhd），再 .part → 正式文件
 	if jerr := job.backfill(partPath); jerr != nil {
 		fmt.Printf("[disk] WARN: 容器收尾处理失败: %v\n", jerr)
 	}
@@ -330,7 +299,7 @@ func runDiskPipeline(te *taskEntry) {
 	te.st.segDone = te.st.segTot
 	te.st.finished = time.Now()
 	te.mu.Unlock()
-	markDirty()
+	te.rt.markDirty()
 }
 
 // finishInterrupt 处理"下载被 ctx 中断"的收尾：按用户意图标记暂停或取消。
@@ -378,10 +347,107 @@ func finishInterrupt(te *taskEntry) {
 		}
 		fmt.Printf("[disk] id=%s 已暂停，断点 %d\n", id, segDone)
 	}
-	markDirty()
+	te.rt.markDirty()
 }
 
-// uniquePath 若 path 已存在则返回 "name (1).ext"、"name (2).ext"… 直到不冲突
+// ============================================================
+// 容器装配（GUI 任务与 CLI 共用）
+// ------------------------------------------------------------
+// 这两条路径原先各自实现了一遍「探测首片 → 识别容器 → 写 init 段」，
+// 差异直接变成了产物差异：CLI 从不给 job.container / job.norm 赋值，
+// 于是同一份 fMP4 源在 CLI 下不做分片时间戳归一化、不写 mehd 占位、
+// 收尾也不回填总时长。统一到这里，两边行为由同一段代码决定。
+// ============================================================
+
+// probeContainer 拉取首个分片 → 解密 → 识别容器 → 执行探测期守卫。
+// 成功后 job.container / job.norm / job.pre / job.preURL 均已就位。
+// 返回的错误已带上下文；调用方需先查 ctx.Err() 以区分「用户中断」与真实失败。
+func probeContainer(ctx context.Context, job *dlJob, pl *playlistInfo, firstSegURL string) (*Container, error) {
+	pre, err := fetchSegment(ctx, job, firstSegURL)
+	if err != nil {
+		return nil, fmt.Errorf("探测视频格式失败（首个分片）: %w", err)
+	}
+	// 加密流：探测分片先解密（容器魔数在密文上看不出，识别必须基于明文）
+	if pre, err = job.decryptSegmentIfAny(pl.mediaSeq, pre); err != nil {
+		return nil, fmt.Errorf("解密首个分片失败: %w", err)
+	}
+	job.pre = pre
+	job.preURL = firstSegURL
+
+	container := detectContainer(pre, pl.hasMap)
+	// 探测期守卫（含加密流误判）：尽早失败，不要下完几个 GB 才发现存的是密文
+	if err := guardGenericMedia(container, pl.key, pre); err != nil {
+		return nil, err
+	}
+	job.container = container
+	// 规范化状态由容器工厂创建（generic 等无状态容器为 nil）
+	if container.NewState != nil {
+		job.norm = container.NewState()
+	}
+	return container, nil
+}
+
+// writeInitSegmentFor 按容器策略拉取 #EXT-X-MAP 初始化段，规范化后写入 .part 头。
+// 非 fMP4(#EXT-X-MAP) 容器为空操作；重复调用安全（.part 已有内容时不写）。
+func writeInitSegmentFor(ctx context.Context, job *dlJob, pl *playlistInfo, partPath string) error {
+	c := job.container
+	if c == nil || c.Init != InitFromMap {
+		return nil
+	}
+	if pl.mapURI == "" {
+		return errors.New("识别为 fMP4 分片流，但播放列表没有 #EXT-X-MAP 初始化段，无法生成可播放文件")
+	}
+	initData, err := fetchSegment(ctx, job, pl.mapURI)
+	if err != nil {
+		return fmt.Errorf("获取 fMP4 init 段失败: %w", err)
+	}
+	nd := initData
+	if job.norm != nil {
+		// 补 mehd 占位并解析轨道类型与回填位置（幂等）
+		if nd, err = job.norm.Normalize(initData); err != nil {
+			return fmt.Errorf("处理 fMP4 init 段失败: %w", err)
+		}
+	}
+	if err := writeInitSegment(partPath, nd); err != nil {
+		return fmt.Errorf("写入 init 段失败: %w", err)
+	}
+	job.initLen = len(nd)
+	return nil
+}
+
+// restoreContainer 断点续传（from>0）时恢复格式相关行为：
+// 优先按持久化的容器 ID 找回条目，旧版本任务回退为从 .part 文件头嗅探；
+// 随后恢复跨分片规范化状态（无持久化字节时从 .part 头部重新解析 init，幂等）。
+func restoreContainer(job *dlJob, containerID, partPath string, normState []byte) {
+	if c := findContainerByID(containerID); c != nil {
+		job.container = c
+		if c.NewState != nil {
+			job.norm = c.NewState()
+		}
+	} else if head, err := readHead(partPath, 4096); err == nil && len(head) > 0 {
+		job.container = detectContainer(head, true)
+		if job.container.NewState != nil {
+			job.norm = job.container.NewState()
+		}
+	}
+	if job.norm == nil {
+		return
+	}
+	if len(normState) > 0 {
+		job.norm.Restore(normState)
+	} else if head, err := readHead(partPath, 64<<10); err == nil && len(head) > 8 {
+		job.norm.Normalize(head)
+	}
+}
+
+// correctExtName 按容器输出扩展名修正文件名（fMP4 内容绝不能存成 .ts）。
+// 无需修正时原样返回。
+func correctExtName(fname string, c *Container) string {
+	if c == nil || c.Ext == "" || strings.HasSuffix(strings.ToLower(fname), c.Ext) {
+		return fname
+	}
+	return strings.TrimSuffix(fname, filepath.Ext(fname)) + c.Ext
+}
 
 // readHead 读取文件开头最多 n 字节（续传时嗅探 .part 文件头识别容器）。
 func readHead(path string, n int) ([]byte, error) {

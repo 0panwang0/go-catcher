@@ -113,12 +113,21 @@ async function analyzeList(list) {
   const todo = list.filter((it) => !it.analyzed).slice(0, ANALYZE_LIMIT);
   for (const item of todo) {
     await analyzeItem(item);
-    // 分析完一条就保存并重绘，主视频尽早浮上来
-    const { m3u8_list = [] } = await chrome.storage.local.get("m3u8_list");
-    const cur = m3u8_list.find((it) => it.url === item.url);
-    if (cur) Object.assign(cur, item);
-    await chrome.storage.local.set({ m3u8_list });
-    if (!running) renderList(m3u8_list);
+    // 分析完一条就保存并重绘，主视频尽早浮上来。
+    // 写事务委托给 service worker（与嗅探写入共用同一把 storage 写锁）：页面与
+    // SW 是两个独立 JS 上下文，各自直接写 storage 时无法互相串行化，会互相覆盖。
+    try {
+      await chrome.runtime.sendMessage({
+        type: "updateMediaItem",
+        key: "m3u8_list",
+        url: item.url,
+        patch: item,
+      });
+    } catch {}
+    if (!running) {
+      const { m3u8_list = [] } = await chrome.storage.local.get("m3u8_list");
+      renderList(m3u8_list);
+    }
   }
 }
 
@@ -293,6 +302,16 @@ async function startDownload(m3u8URL, pageURL, videoName, forcedPlaylistURL = ""
     }
 
     // 3. 解析分片（接受任意扩展名，兼容 .jpeg 伪装分片）
+    // 先拦截加密流：本页的下载在浏览器侧合并分片，**没有解密能力**（不处理
+    // #EXT-X-KEY）。对加密流硬下只会产出无法播放的密文文件，且会报"已保存"——
+    // 这正是最隐蔽的一类损坏。这里明确拒绝，引导到有解密与产物校验的 Go 侧。
+    const keyMethod = playlistKeyMethod(text);
+    if (keyMethod) {
+      throw new Error(
+        `该视频使用 ${keyMethod} 加密，浏览器内下载不支持解密（会产出无法播放的文件）。` +
+          `请改用网页上的悬停下载按钮（由本地 Go 服务完成），或使用下方「复制命令到终端」兜底。`
+      );
+    }
     const segments = parseSegments(text, playlistURL);
     if (!segments.length) throw new Error("未解析到任何分片");
     log(`解析到 ${segments.length} 个分片`);
@@ -432,6 +451,22 @@ function parseSegments(text, baseURL) {
     list.push(new URL(line, baseURL).href);
   }
   return list;
+}
+
+// playlistKeyMethod 返回播放列表声明的加密方式（#EXT-X-KEY:METHOD=…），
+// 明文（无 KEY 行，或 METHOD=NONE）返回空串。
+// 后一条 KEY 行覆盖前一条，与 m3u8 语义一致；用于在本页下载前拦下加密流。
+function playlistKeyMethod(text) {
+  const keyRe = /#EXT-X-KEY:[^\n]*/gi;
+  let method = "";
+  let line;
+  while ((line = keyRe.exec(text)) !== null) {
+    const m = /METHOD\s*=\s*([A-Za-z0-9-]+)/i.exec(line[0]);
+    if (!m) continue;
+    const v = m[1].toUpperCase();
+    method = v === "NONE" ? "" : v;
+  }
+  return method;
 }
 
 // 画质选择器：等用户点选后 resolve 选中的档位（取消则 resolve null）

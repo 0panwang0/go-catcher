@@ -40,10 +40,10 @@ func TestParseKeyLine(t *testing.T) {
 			wantIV: make([]byte, 16),
 		},
 		{
-			name:     "无IV属性",
-			line:     `#EXT-X-KEY:METHOD=AES-128,URI="https://cdn.example.com/key"`,
-			base:     "https://vv.example.com/play/x/index.m3u8",
-			method:   "AES-128", uri: "https://cdn.example.com/key",
+			name:   "无IV属性",
+			line:   `#EXT-X-KEY:METHOD=AES-128,URI="https://cdn.example.com/key"`,
+			base:   "https://vv.example.com/play/x/index.m3u8",
+			method: "AES-128", uri: "https://cdn.example.com/key",
 			wantNoIV: true,
 		},
 		{
@@ -251,7 +251,7 @@ func TestKeyFingerprint(t *testing.T) {
 // ---- 单元：ensureDecryptor ----
 
 func TestEnsureDecryptorUnsupportedMethod(t *testing.T) {
-	j := &dlJob{}
+	j := &dlJob{rt: testStd}
 	err := j.ensureDecryptor(context.Background(), &KeyInfo{Method: "SAMPLE-AES", URI: "https://x/k"})
 	if err == nil || !strings.Contains(err.Error(), "不支持") {
 		t.Fatalf("未注册方法应报不支持错误, got %v", err)
@@ -279,7 +279,7 @@ func TestEnsureDecryptorIdempotent(t *testing.T) {
 	}))
 	t.Cleanup(srv.Close)
 
-	j := &dlJob{}
+	j := &dlJob{rt: testStd}
 	k1 := &KeyInfo{Method: "AES-128", URI: srv.URL + "/k1", IV: []byte{1}}
 	if err := j.ensureDecryptor(context.Background(), k1); err != nil {
 		t.Fatalf("首次装配: %v", err)
@@ -318,12 +318,12 @@ func TestEnsureDecryptorIdempotent(t *testing.T) {
 // ivMode "explicit" 用全零 IV 属性；"seq" 不带 IV（按 mediaSeq+序号派生），
 // 并带 #EXT-X-MEDIA-SEQUENCE 起始值验证序号基准换算。
 type encStreamServer struct {
-	srv     *httptest.Server
-	key     []byte
+	srv      *httptest.Server
+	key      []byte
 	mediaSeq uint64
-	plain   [][]byte // 各分片明文（校验落盘内容用）
-	mu      sync.Mutex
-	hits    map[string]int
+	plain    [][]byte // 各分片明文（校验落盘内容用）
+	mu       sync.Mutex
+	hits     map[string]int
 }
 
 func newEncStreamServer(t *testing.T, n int, ivMode string) *encStreamServer {
@@ -377,19 +377,19 @@ func newEncStreamServer(t *testing.T, n int, ivMode string) *encStreamServer {
 // runEncPipeline 用 runDiskPipeline 跑一次完整加密流任务，返回任务条目与落盘内容。
 func runEncPipeline(t *testing.T, m3u8URL, saveDir string) (*taskEntry, []byte) {
 	t.Helper()
-	te := &taskEntry{intent: intentNone}
+	te := &taskEntry{rt: testStd, intent: intentNone}
 	te.st = taskState{
 		id: "tenc", queued: true, started: time.Now(),
 		m3u8URL: m3u8URL, filename: "enc.ts", saveDir: saveDir,
 		finalPath: filepath.Join(saveDir, "enc.ts"),
 	}
-	tasksMu.Lock()
-	tasks[te.st.id] = te
-	tasksMu.Unlock()
+	testStd.tasksMu.Lock()
+	testStd.tasks[te.st.id] = te
+	testStd.tasksMu.Unlock()
 	t.Cleanup(func() {
-		tasksMu.Lock()
-		delete(tasks, te.st.id)
-		tasksMu.Unlock()
+		testStd.tasksMu.Lock()
+		delete(testStd.tasks, te.st.id)
+		testStd.tasksMu.Unlock()
 	})
 
 	go runDiskPipeline(te)
@@ -407,10 +407,10 @@ func runEncPipeline(t *testing.T, m3u8URL, saveDir string) (*taskEntry, []byte) 
 func TestEncryptedPlaylistE2E(t *testing.T) {
 	t.Run("显式IV", func(t *testing.T) {
 		saveRestoreState(t)
-		oldLimiter, oldConc, oldRetries := limiter, concurrency, maxRetries
-		limiter = newResizableSem(2)
-		concurrency, maxRetries = 4, 1
-		t.Cleanup(func() { limiter, concurrency, maxRetries = oldLimiter, oldConc, oldRetries })
+		oldLimiter, oldConc, oldRetries := testStd.limiter, testStd.concurrencyNow(), testStd.maxRetriesNow()
+		testStd.limiter = newResizableSem(2)
+		testStd.setDownloadTuning(4, 1)
+		t.Cleanup(func() { testStd.limiter = oldLimiter; testStd.setDownloadTuning(oldConc, oldRetries) })
 
 		e := newEncStreamServer(t, 3, "explicit")
 		_, data := runEncPipeline(t, e.srv.URL+"/index.m3u8", t.TempDir())
@@ -427,10 +427,10 @@ func TestEncryptedPlaylistE2E(t *testing.T) {
 
 	t.Run("序号派生IV带MEDIA-SEQUENCE偏移", func(t *testing.T) {
 		saveRestoreState(t)
-		oldLimiter, oldConc, oldRetries := limiter, concurrency, maxRetries
-		limiter = newResizableSem(2)
-		concurrency, maxRetries = 4, 1
-		t.Cleanup(func() { limiter, concurrency, maxRetries = oldLimiter, oldConc, oldRetries })
+		oldLimiter, oldConc, oldRetries := testStd.limiter, testStd.concurrencyNow(), testStd.maxRetriesNow()
+		testStd.limiter = newResizableSem(2)
+		testStd.setDownloadTuning(4, 1)
+		t.Cleanup(func() { testStd.limiter = oldLimiter; testStd.setDownloadTuning(oldConc, oldRetries) })
 
 		// mediaSeq=5：分片 i 的 IV = mediaSeqIV(5+i)，验证管线把
 		// MEDIA-SEQUENCE 偏移正确换算进每个分片的派生 IV
@@ -450,10 +450,10 @@ func TestEncryptedPlaylistE2E(t *testing.T) {
 
 func TestEncryptedPlaylistKeyFetchFail(t *testing.T) {
 	saveRestoreState(t)
-	oldLimiter, oldConc, oldRetries := limiter, concurrency, maxRetries
-	limiter = newResizableSem(2)
-	concurrency, maxRetries = 4, 1
-	t.Cleanup(func() { limiter, concurrency, maxRetries = oldLimiter, oldConc, oldRetries })
+	oldLimiter, oldConc, oldRetries := testStd.limiter, testStd.concurrencyNow(), testStd.maxRetriesNow()
+	testStd.limiter = newResizableSem(2)
+	testStd.setDownloadTuning(4, 1)
+	t.Cleanup(func() { testStd.limiter = oldLimiter; testStd.setDownloadTuning(oldConc, oldRetries) })
 
 	// key 永久 404：任务应失败且错误信息明确指向密钥
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -466,19 +466,19 @@ func TestEncryptedPlaylistKeyFetchFail(t *testing.T) {
 	}))
 	t.Cleanup(srv.Close)
 
-	te := &taskEntry{intent: intentNone}
+	te := &taskEntry{rt: testStd, intent: intentNone}
 	te.st = taskState{
 		id: "tkey404", queued: true, started: time.Now(),
 		m3u8URL: srv.URL + "/i.m3u8", filename: "x.ts", saveDir: t.TempDir(),
 		finalPath: filepath.Join(t.TempDir(), "x.ts"),
 	}
-	tasksMu.Lock()
-	tasks[te.st.id] = te
-	tasksMu.Unlock()
+	testStd.tasksMu.Lock()
+	testStd.tasks[te.st.id] = te
+	testStd.tasksMu.Unlock()
 	t.Cleanup(func() {
-		tasksMu.Lock()
-		delete(tasks, te.st.id)
-		tasksMu.Unlock()
+		testStd.tasksMu.Lock()
+		delete(testStd.tasks, te.st.id)
+		testStd.tasksMu.Unlock()
 	})
 
 	go runDiskPipeline(te)
@@ -496,4 +496,41 @@ func mustHex(t *testing.T, s string) []byte {
 		t.Fatal(err)
 	}
 	return b
+}
+
+// TestEnsureSingleKey 中途换 key（key rotation）必须显式失败，而不是静默解错
+// 前面的分片；重复同一条 key（逐分片重复声明，合法且常见）不得误报。
+func TestEnsureSingleKey(t *testing.T) {
+	base := "https://x.com/a.m3u8"
+	rotated := "#EXTM3U\n" +
+		`#EXT-X-KEY:METHOD=AES-128,URI="k1"` + "\n#EXTINF:1.0,\ns1.ts\n" +
+		`#EXT-X-KEY:METHOD=AES-128,URI="k2"` + "\n#EXTINF:1.0,\ns2.ts\n#EXT-X-ENDLIST\n"
+	if err := ensureSingleKey(parsePlaylist(rotated, base)); err == nil {
+		t.Fatal("中途换 key 应报错")
+	}
+
+	repeated := "#EXTM3U\n"
+	for i := 0; i < 3; i++ {
+		repeated += `#EXT-X-KEY:METHOD=AES-128,URI="k1"` + "\n#EXTINF:1.0,\ns.ts\n"
+	}
+	repeated += "#EXT-X-ENDLIST\n"
+	if err := ensureSingleKey(parsePlaylist(repeated, base)); err != nil {
+		t.Fatalf("重复同一条 key 不应报错: %v", err)
+	}
+
+	// IV 变化同样算轮换
+	ivChanged := "#EXTM3U\n" +
+		`#EXT-X-KEY:METHOD=AES-128,URI="k1",IV=0x00000000000000000000000000000000` + "\n#EXTINF:1.0,\ns1.ts\n" +
+		`#EXT-X-KEY:METHOD=AES-128,URI="k1",IV=0x11111111111111111111111111111111` + "\n#EXTINF:1.0,\ns2.ts\n#EXT-X-ENDLIST\n"
+	if err := ensureSingleKey(parsePlaylist(ivChanged, base)); err == nil {
+		t.Fatal("换 IV 应报错")
+	}
+
+	// key 声明在首个分片之前切换（没有分片用过旧 key）不算轮换
+	earlyChange := "#EXTM3U\n" +
+		`#EXT-X-KEY:METHOD=AES-128,URI="k1"` + "\n" +
+		`#EXT-X-KEY:METHOD=AES-128,URI="k2"` + "\n#EXTINF:1.0,\ns1.ts\n#EXT-X-ENDLIST\n"
+	if err := ensureSingleKey(parsePlaylist(earlyChange, base)); err != nil {
+		t.Fatalf("未有分片使用旧 key 时的切换不应报错: %v", err)
+	}
 }

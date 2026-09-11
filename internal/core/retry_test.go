@@ -43,7 +43,7 @@ func waitLimiterDrained(t *testing.T) {
 	t.Helper()
 	deadline := time.Now().Add(5 * time.Second)
 	for {
-		if active, _ := limiter.current(); active == 0 {
+		if active, _ := testStd.limiter.current(); active == 0 {
 			return
 		}
 		if time.Now().After(deadline) {
@@ -55,10 +55,13 @@ func waitLimiterDrained(t *testing.T) {
 
 func TestRetryAfterFailureKeepsFinalPath(t *testing.T) {
 	saveRestoreState(t)
-	oldLimiter, oldConc, oldRetries := limiter, concurrency, maxRetries
-	limiter = newResizableSem(2)
-	concurrency, maxRetries = 4, 1 // 单次尝试即失败，缩短测试耗时
-	t.Cleanup(func() { limiter, concurrency, maxRetries = oldLimiter, oldConc, oldRetries })
+	oldLimiter, oldConc, oldRetries := testStd.limiter, testStd.concurrencyNow(), testStd.maxRetriesNow()
+	testStd.limiter = newResizableSem(2)
+	testStd.setDownloadTuning(4, 1) // 单次尝试即失败，缩短测试耗时
+	t.Cleanup(func() {
+		testStd.limiter = oldLimiter
+		testStd.setDownloadTuning(oldConc, oldRetries)
+	})
 
 	var mu sync.Mutex
 	broken := true // 首片成功（留断点），其余 404；修复后全部 200
@@ -83,11 +86,11 @@ func TestRetryAfterFailureKeepsFinalPath(t *testing.T) {
 
 	dir := t.TempDir()
 	final := filepath.Join(dir, "vod.ts")
-	te := &taskEntry{st: taskState{
+	te := &taskEntry{rt: testStd, st: taskState{
 		id: "tr", queued: true, stage: "排队中", started: time.Now(),
 		m3u8URL: srv.URL + "/vod.m3u8", filename: "vod.ts", saveDir: dir, finalPath: final,
 	}}
-	tasks[te.st.id] = te
+	testStd.tasks[te.st.id] = te
 
 	// 第一轮：分片 1/2 失败 → 任务失败，但首片已写（断点 = 1）
 	go runDiskPipeline(te)
@@ -112,7 +115,7 @@ func TestRetryAfterFailureKeepsFinalPath(t *testing.T) {
 	mu.Unlock()
 
 	w := httptest.NewRecorder()
-	handleResume(w, httptest.NewRequest("GET", "/resume?id=tr", nil))
+	testEngine().handleResume(w, httptest.NewRequest("GET", "/resume?id=tr", nil))
 	if w.Code != 200 {
 		t.Fatalf("resume HTTP %d: %s", w.Code, w.Body.String())
 	}

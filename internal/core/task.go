@@ -4,6 +4,7 @@ package core
 import (
 	"context"
 	"fmt"
+	"math"
 	"os"
 	"sort"
 	"sync"
@@ -57,6 +58,9 @@ const (
 )
 
 type taskEntry struct {
+	// rt 是任务所属的运行时（创建任务时注入）。pipeline / 持久化 / 控制端点
+	// 通过它访问 limiter、任务表、状态落盘等运行时状态。
+	rt     *Runtime
 	mu     sync.Mutex
 	st     taskState          // 对外状态快照（受 mu 保护）
 	job    *dlJob             // 任务上下文（运行时 segDone/segTot 原子值直接读）
@@ -64,14 +68,7 @@ type taskEntry struct {
 	intent int                // intentNone / intentPause / intentCancel
 }
 
-var (
-	saveDirMu      sync.Mutex // 保护 defaultSaveDir
-	defaultSaveDir string     // /pickdir 选中的目录，供后续 /download?mode=disk 使用
-	tasksMu        sync.Mutex
-	tasks          = map[string]*taskEntry{}
-	// 并发槽位：用 resizableSem（config.go），运行中可调整上限
-	seqID int64
-)
+// saveDirMu / defaultSaveDir / tasksMu / tasks / seqID 均为 Runtime 字段（见 runtime.go）。
 
 // snapshot 返回某任务当前对外状态（segDone 实时从 job 原子取，stage/error 从缓存取）
 
@@ -119,11 +116,11 @@ func failTask(te *taskEntry, msg string) {
 
 // newTaskID 生成自增任务 ID
 
-func newTaskID() string {
-	tasksMu.Lock()
-	seqID++
-	id := fmt.Sprintf("t%d", seqID)
-	tasksMu.Unlock()
+func (r *Runtime) newTaskID() string {
+	r.tasksMu.Lock()
+	r.seqID++
+	id := fmt.Sprintf("t%d", r.seqID)
+	r.tasksMu.Unlock()
 	return id
 }
 
@@ -132,16 +129,16 @@ func newTaskID() string {
 
 const maxKeptTasks = 100
 
-func pruneOldTasks() {
-	tasksMu.Lock()
-	defer tasksMu.Unlock()
+func (r *Runtime) pruneOldTasks() {
+	r.tasksMu.Lock()
+	defer r.tasksMu.Unlock()
 	// 统计已完成任务并按 started 排序保留最新的 maxKeptTasks 个
 	type doneItem struct {
 		id      string
 		started time.Time
 	}
 	var dones []doneItem
-	for id, te := range tasks {
+	for id, te := range r.tasks {
 		te.mu.Lock()
 		finished := te.st.done
 		st := te.st.started
@@ -155,40 +152,76 @@ func pruneOldTasks() {
 	}
 	sort.Slice(dones, func(i, j int) bool { return dones[i].started.Before(dones[j].started) })
 	for _, d := range dones[:len(dones)-maxKeptTasks] {
-		delete(tasks, d.id)
+		delete(r.tasks, d.id)
 	}
 }
 
-func taskStateJSON(t taskState) string {
+// taskStateDTO 是 /status 对外暴露的任务状态字段集（字段名即前端契约，改动需同步 web/）。
+//
+// 为什么用 encoding/json 而不是 fmt.Sprintf 拼串：errorMsg 的来源是远端异常串
+// （HTTP 状态、URL、响应头），可能含控制字符；而 %q 走 strconv.Quote，会产生
+// \x01 这类 JSON 非法转义（JSON 只认 \u0001）。一旦命中，前端 JSON.parse 直接
+// 抛错、任务列表整块渲染失败。
+type taskStateDTO struct {
+	ID          string  `json:"id"`
+	Queued      bool    `json:"queued"`
+	Running     bool    `json:"running"`
+	Paused      bool    `json:"paused"`
+	Canceled    bool    `json:"canceled"`
+	Stage       string  `json:"stage"`
+	Done        bool    `json:"done"`
+	Live        bool    `json:"live"`
+	FileMissing bool    `json:"fileMissing"`
+	Pct         float64 `json:"pct"`
+	SegDone     int64   `json:"segDone"`
+	SegTot      int64   `json:"segTot"`
+	FinalPath   string  `json:"finalPath"`
+	OpenPath    string  `json:"openPath"`
+	Error       string  `json:"error"`
+	M3U8URL     string  `json:"m3u8URL"`
+	Referer     string  `json:"referer"`
+	Filename    string  `json:"filename"`
+	SaveDir     string  `json:"saveDir"`
+	Started     string  `json:"started"`
+	Finished    string  `json:"finished"`
+}
+
+// toTaskStateDTO 计算派生字段（pct / fileMissing）并转换结构。
+func toTaskStateDTO(t taskState) taskStateDTO {
 	pct := 0.0
 	if t.segTot > 0 {
 		pct = float64(t.segDone) / float64(t.segTot) * 100
 		if pct > 100 {
 			pct = 100
 		}
+		// 保留一位小数（沿用原 %.1f 的精度），顺带避免浮点尾数让前端签名抖动
+		pct = math.Round(pct*10) / 10
 	}
 	// 已完成但成品文件已不在磁盘（被移动/删除）：前端显示"已失效"而不是"完成 · 已保存"。
 	// snapshot 已按磁盘实况计算 openPath（文件存在时 == finalPath），据此判断无需再 Stat 一次。
 	// 失败/取消任务不算失效：它们的成品本来就不存在（openPath 指向 .part），语义是"失败"。
 	fileMissing := t.done && t.errorMsg == "" && !t.canceled && t.finalPath != "" && t.openPath != t.finalPath
-	return fmt.Sprintf(
-		`{"id":%q,"queued":%v,"running":%v,"paused":%v,"canceled":%v,"stage":%q,"done":%v,"live":%v,"fileMissing":%v,"pct":%.1f,"segDone":%d,"segTot":%d,"finalPath":%q,"openPath":%q,"error":%q,"m3u8URL":%q,"referer":%q,"filename":%q,"saveDir":%q,"started":%q,"finished":%q}`,
-		t.id, t.queued, t.running, t.paused, t.canceled, t.stage, t.done, t.live, fileMissing, pct,
-		t.segDone, t.segTot, t.finalPath, t.openPath, t.errorMsg, t.m3u8URL, t.referer,
-		t.filename, t.saveDir,
-		t.started.Format(time.RFC3339), t.finished.Format(time.RFC3339))
+	return taskStateDTO{
+		ID: t.id, Queued: t.queued, Running: t.running, Paused: t.paused,
+		Canceled: t.canceled, Stage: t.stage, Done: t.done, Live: t.live,
+		FileMissing: fileMissing, Pct: pct, SegDone: t.segDone, SegTot: t.segTot,
+		FinalPath: t.finalPath, OpenPath: t.openPath, Error: t.errorMsg,
+		M3U8URL: t.m3u8URL, Referer: t.referer, Filename: t.filename, SaveDir: t.saveDir,
+		Started:  t.started.Format(time.RFC3339),
+		Finished: t.finished.Format(time.RFC3339),
+	}
 }
 
 // 列出所有任务状态：未结束的（含暂停）在前，已结束的在后；组内按开始时间倒序（新→旧）。
 // 前端据此按天分组展示，最新的任务永远在最上面。
 
-func listTasks() []taskState {
-	tasksMu.Lock()
-	entries := make([]*taskEntry, 0, len(tasks))
-	for _, te := range tasks {
+func (r *Runtime) listTasks() []taskState {
+	r.tasksMu.Lock()
+	entries := make([]*taskEntry, 0, len(r.tasks))
+	for _, te := range r.tasks {
 		entries = append(entries, te)
 	}
-	tasksMu.Unlock()
+	r.tasksMu.Unlock()
 	out := make([]taskState, 0, len(entries))
 	for _, te := range entries {
 		out = append(out, snapshot(te))

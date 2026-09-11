@@ -9,10 +9,16 @@
   const MIN_W = 200;
   const MIN_H = 120;
   const BTN_GAP = 8; // 按钮与视频边缘的间距
-  const SRC_RECHECK_MS = 2000; // "暂无链接"视频的重复检查间隔（播放后嗅探需要时间）
+  const SRC_RECHECK_MS = 900; // "暂无链接"视频的重复检查间隔（播放后嗅探需要时间）
+  const MEDIA_RECHECK_MS = 700; // 指针停在媒体上时的复查周期（应对 DOM 重建/链接晚到）
   const SEGMENT_WINDOW_MS = 15000;
   const CONCURRENCY = 8;
   const MAX_RETRIES = 3;
+  const DEBUG = false; // true 时在页面控制台输出悬停判定日志（排查按钮不出现用）
+
+  function dbg(...args) {
+    if (DEBUG) console.log("[M3U8 Catcher]", ...args);
+  }
 
   let currentBtn = null;
   // currentTarget 悬停目标：{el, src, pageUrl}。
@@ -25,6 +31,8 @@
   let deniedAt = 0;
   let gateToken = 0; // 悬停检查令牌：仅最新一次悬停的结果生效
   let gatePending = null; // 正在检查链接的目标元素
+  let lastPointer = { x: -1, y: -1 }; // 最近一次指针位置（复查用）
+  let recheckTimer = null;
   let panel = null;
   let activeTaskId = null; // 多任务并发：本次下载的 server 任务 id，轮询用
   let activePaused = false; // 当前任务是否处于暂停态（控制按钮切换用）
@@ -72,8 +80,43 @@
   function init() {
     initBridge();
     document.addEventListener("mouseover", onHover, true);
+    // 记录指针位置：mediaRecheck 定时器据此在「指针没动但页面变了」时补显示按钮
+    document.addEventListener(
+      "mousemove",
+      (e) => {
+        lastPointer.x = e.clientX;
+        lastPointer.y = e.clientY;
+      },
+      true
+    );
     document.documentElement.addEventListener("mouseleave", hideButton);
     document.addEventListener("click", onDocumentClick, true);
+    startMediaRecheck();
+  }
+
+  // startMediaRecheck 周期性复查「指针当前压着的那块媒体」并保证按钮状态正确。
+  // 只靠 mouseover 一次性判定有两个硬伤：
+  //   1) 页面在指针静止时重建了 player（iframe 被替换 / 站点提示层重排），
+  //      旧的 currentTarget 变成游离节点，按钮跟着消失且不再回来；
+  //   2) 首帧嗅探还没落库（分片/playlist 请求比 hover 晚），一次性判定失败后
+  //      就再没有第二次机会（除非常用户再次移动鼠标触发 mouseover）。
+  // 定时复查用「坐标」而不是「元素引用」重新定位目标，天然免疫元素重建。
+  function startMediaRecheck() {
+    if (recheckTimer) return;
+    recheckTimer = setInterval(() => {
+      const { x, y } = lastPointer;
+      if (x < 0 || y < 0) return;
+      let target = null;
+      try {
+        target = findMediaTargetAtPoint(x, y, true);
+      } catch {
+        return;
+      }
+      if (!target) return; // 指针不在媒体上：交给 mouseover/hideButton 处理
+      if (currentTarget && currentTarget.el === target.el && target.el.isConnected) return;
+      dbg("recheck 命中媒体，重新判定按钮", target.el.tagName, target.pageUrl);
+      showButtonIfSniffed(target);
+    }, MEDIA_RECHECK_MS);
   }
 
   function onHover(e) {
@@ -90,33 +133,76 @@
   // src 直链 + 分片目录信号都可用）；没有 video 再找大尺寸 iframe（跨域播放器，
   // video 在 frame 内拿不到，但 iframe.src 就是后台记录的 frameUrl，可直接匹配）。
   // 广告/统计类小 iframe 被尺寸门槛（MIN_W×MIN_H）挡掉。
-  function findMediaTargetAtPoint(x, y) {
+  //
+  // allowGeom=false 时只做命中测试（mouseover 高频路径，必须便宜）；
+  // allowGeom=true 时再用几何扫描兜底（仅定时复查调用，700ms 一次）。
+  //   站点在播放器上盖一层透明层（提示层 / 点击劫持广告层 / 弹幕 canvas）时，
+  //   底下的 video / iframe 不是遮挡层的祖先，命中测试永远拿不到它们；几何扫描
+  //   只比矩形，透过任何遮挡层都能命中。
+  function findMediaTargetAtPoint(x, y, allowGeom = false) {
     let stack = [];
     try {
       stack = document.elementsFromPoint(x, y) || [];
     } catch {
-      return null;
+      stack = [];
     }
+    const direct = pickTargetFromStack(stack);
+    if (direct) return direct;
+    if (!allowGeom) return null;
+    return pickTargetByRect(x, y);
+  }
+
+  // pickTargetFromStack 命中栈里找目标：video 优先（本 frame 直连），其次 iframe
+  function pickTargetFromStack(stack) {
     for (const el of stack) {
-      if (el instanceof HTMLVideoElement) {
-        const rect = el.getBoundingClientRect();
-        if (rect.width < MIN_W || rect.height < MIN_H) continue;
-        const style = getComputedStyle(el);
-        if (style.display === "none" || style.visibility === "hidden") continue;
+      if (el instanceof HTMLVideoElement && isUsableMediaElement(el)) {
         return { el, src: el.currentSrc || el.src || "", pageUrl: location.href };
       }
     }
     for (const el of stack) {
-      if (!(el instanceof HTMLIFrameElement)) continue;
-      const rect = el.getBoundingClientRect();
-      if (rect.width < MIN_W || rect.height < MIN_H) continue;
-      const style = getComputedStyle(el);
-      if (style.display === "none" || style.visibility === "hidden") continue;
-      // 只认 http(s) 的 iframe（about:blank/javascript: 等无匹配价值）
-      if (!/^https?:/i.test(el.src || "")) continue;
-      return { el, src: "", pageUrl: el.src };
+      if (el instanceof HTMLIFrameElement && isUsableMediaElement(el)) {
+        return { el, src: "", pageUrl: el.src };
+      }
     }
     return null;
+  }
+
+  // pickTargetByRect 几何兜底：遍历文档里的 video/iframe，取「包含该坐标且面积
+  // 最小」的一个（最小面积 = 最内层、最贴近该点的那块播放器）。
+  function pickTargetByRect(x, y) {
+    let best = null;
+    let bestArea = Infinity;
+    let nodes = [];
+    try {
+      nodes = document.querySelectorAll("video, iframe");
+    } catch {
+      return null;
+    }
+    for (const el of nodes) {
+      if (!isUsableMediaElement(el)) continue;
+      const r = el.getBoundingClientRect();
+      if (x < r.left || x > r.right || y < r.top || y > r.bottom) continue;
+      const area = r.width * r.height;
+      if (area >= bestArea) continue;
+      bestArea = area;
+      best = el;
+    }
+    if (!best) return null;
+    return best instanceof HTMLVideoElement
+      ? { el: best, src: best.currentSrc || best.src || "", pageUrl: location.href }
+      : { el: best, src: "", pageUrl: best.src };
+  }
+
+  // isUsableMediaElement 可下载媒体元素的基本门槛：在文档里、尺寸够大、可见、
+  // iframe 必须是 http(s)（about:blank / javascript: 无匹配价值）。
+  function isUsableMediaElement(el) {
+    if (!el || !el.isConnected) return false;
+    const rect = el.getBoundingClientRect();
+    if (rect.width < MIN_W || rect.height < MIN_H) return false;
+    const style = getComputedStyle(el);
+    if (style.display === "none" || style.visibility === "hidden") return false;
+    if (el instanceof HTMLIFrameElement && !/^https?:/i.test(el.src || "")) return false;
+    return true;
   }
 
   function onDocumentClick(e) {
@@ -131,6 +217,8 @@
   // 判定用 getVideoSource 的候选匹配（与列表数据同源于同站嗅探记录）：
   //   video  → pageUrl = 本 frame URL（含跨域解析页 frame 内直接命中）
   //   iframe → pageUrl = iframe.src（顶层 frame，匹配后台记录的 frameUrl）
+  //           另外把 src 里 ?url= 编码的目标地址作为 embedUrl 传下去，供后台
+  //           精确命中（解析页跳转到别的主机播放时，同站匹配会全部落空）
   async function showButtonIfSniffed(target) {
     if (currentTarget && currentTarget.el === target.el) return;
     if (gatePending === target.el) return; // 同一目标的检查在途
@@ -145,22 +233,45 @@
           type: "getVideoSource",
           src: target.src,
           pageUrl: target.pageUrl,
+          embedUrl: extractEmbedUrl(target),
           segmentDir: target.src ? recentSegmentDir() : "",
           title: document.title || "",
         });
         found = !!(resp && resp.ok && resp.source);
       }
-    } catch {
+    } catch (e) {
       // 扩展上下文失效等异常：按无链接处理
+      dbg("getVideoSource 查询异常", e);
     }
     if (gatePending === target.el) gatePending = null;
     if (token !== gateToken) return; // 期间鼠标已移到别的目标
     if (found) {
+      dbg("命中链接，显示按钮", target.pageUrl);
       showButton(target);
     } else {
+      dbg("未嗅探到该目标，暂不显示按钮", target.pageUrl);
       deniedEl = target.el;
       deniedAt = Date.now();
     }
+  }
+
+  // extractEmbedUrl 解析页 iframe 的 src 常形如
+  //   https://parser.example/play/?url=<目标地址>
+  // 取出 ?url= 里的目标地址（常见的苹果CMS 解析页签名）。解析页往往会跳到
+  // 另一个主机去播放，后台按 frameUrl 同站匹配就会落空，这个参数是最可靠的锚点。
+  function extractEmbedUrl(target) {
+    if (!target || target.src || !target.pageUrl) return "";
+    let u;
+    try {
+      u = new URL(target.pageUrl);
+    } catch {
+      return "";
+    }
+    for (const key of ["url", "v", "vid", "video"]) {
+      const q = u.searchParams.get(key);
+      if (q && /^https?:/i.test(q)) return q;
+    }
+    return "";
   }
 
   function showButton(target) {
@@ -216,6 +327,12 @@
 
   function repositionButton() {
     if (!currentBtn || !currentTarget) return;
+    // 目标被页面重建（播放器重挂载）后引用会变成游离节点，矩形全为 0：
+    // 先收起，交给 mediaRecheck 按坐标重新定位、重新显示
+    if (!currentTarget.el.isConnected) {
+      hideButton();
+      return;
+    }
     const rect = currentTarget.el.getBoundingClientRect();
     if (rect.width === 0 || rect.height === 0) {
       hideButton();
@@ -284,6 +401,7 @@
         type: "getVideoSources",
         src,
         pageUrl,
+        embedUrl: extractEmbedUrl(target),
       });
       if (!resp || !resp.ok || !Array.isArray(resp.sources) || !resp.sources.length) {
         showPanel("error", (resp && resp.error) || "未能识别该视频，请先播放一会儿再试。");
@@ -314,17 +432,6 @@
       });
     } finally {
       analyzing = false;
-    }
-  }
-
-  async function startDownload(source) {
-    if (abortController) abortController.abort();
-    abortController = new AbortController();
-
-    if (source.type === "mp4") {
-      await downloadMP4(source.url, source.pageUrl, source.title, source.quality || "");
-    } else {
-      await downloadTS(source.url, source.pageUrl, source.title, source.quality || "");
     }
   }
 
@@ -508,11 +615,23 @@
     } catch {
       serverBase = null;
     }
+    // 本地服务要求访问令牌（挡住任意网页驱动本机服务）；令牌经 background 内部通道取得，
+    // 不写进页面世界。取不到就退回页面主世界 fetch（下面 probeFetch 失败时会自动回退）。
+    let apiToken = "";
+    if (serverBase) {
+      try {
+        const r = await chrome.runtime.sendMessage({ type: "getApiToken" });
+        if (r && r.ok) apiToken = r.token || "";
+      } catch {
+        apiToken = "";
+      }
+    }
     const probeFetch = async (url) => {
       if (!serverBase) return null;
       try {
         const resp = await fetch(
           `${serverBase}/probe?url=${encodeURIComponent(url)}&referer=${encodeURIComponent(pageUrl)}`
+            + (apiToken ? `&t=${encodeURIComponent(apiToken)}` : "")
         );
         if (!resp.ok) return null;
         return (await resp.text()) || null;
@@ -744,191 +863,6 @@
     return options;
   }
 
-  // ============================================================
-  // TS 下载：m3u8 → 分片 → 合并
-  // ============================================================
-  async function downloadTS(m3u8URL, pageUrl, title, quality) {
-    showPanel("progress", { title: title || "下载该视频", text: "正在获取播放列表…" });
-
-    try {
-      const playlistText = await pageFetch(m3u8URL, "text");
-      // master playlist：弹出画质选择
-      if (playlistText.includes("#EXT-X-STREAM-INF")) {
-        const variants = parseVariants(playlistText, m3u8URL);
-        if (variants.length > 1) {
-          renderVariantsPanel({
-            type: "ts",
-            url: m3u8URL,
-            title,
-            pageUrl,
-            variants,
-          });
-          return;
-        }
-        if (variants.length === 1) {
-          return await downloadTSVariant(variants[0].url, pageUrl, title, variants[0].quality || quality);
-        }
-      }
-      await downloadTSVariant(m3u8URL, pageUrl, title, quality);
-    } catch (e) {
-      // 浏览器侧拿不到 m3u8（典型 CORP/opaque 阻断）→ 直接出兜底面板，不再抛
-      showPanel("error", {
-        message: "获取播放列表失败: " + (e && e.message ? e.message : String(e)),
-        m3u8Url: m3u8URL,
-        pageUrl: pageUrl || location.href,
-        title: title || "",
-      });
-    }
-  }
-
-  async function downloadTSVariant(playlistURL, pageUrl, title, quality) {
-    showPanel("progress", { title: title || "下载该视频", text: "正在解析分片…" });
-    const log = (msg) => updateProgressText(msg);
-
-    let segments;
-    try {
-      const playlistText = await pageFetch(playlistURL, "text");
-      segments = parseSegments(playlistText, playlistURL);
-    } catch (e) {
-      // 浏览器侧 fetch 失败 → 切到 Go 下载器方案
-      showPanel("error", {
-        message: "浏览器无法直接获取视频: " + e.message,
-        m3u8Url: playlistURL,
-        pageUrl: pageUrl || location.href,
-        title,
-      });
-      return;
-    }
-    if (!segments.length) {
-      showPanel("error", {
-        message: "未解析到视频分片",
-        m3u8Url: playlistURL,
-        pageUrl,
-        title,
-      });
-      return;
-    }
-
-    const duration = parseDuration(playlistText);
-    log(`共 ${segments.length} 个分片，预计时长 ${fmtDur(duration)}，开始并发下载…`);
-
-    const parts = await downloadSegments(segments, log, playlistURL, pageUrl, title);
-    log("分片下载完成，正在合并…");
-    const blob = new Blob(parts, { type: "video/mp2t" });
-    const filename = makeFilename(playlistURL, title, quality, ".ts");
-    saveBlob(blob, filename);
-    log(`已保存: ${filename}`);
-    setTimeout(closePanel, 1200);
-  }
-
-  async function downloadSegments(urls, log, m3u8Url, pageUrl, title) {
-    const parts = new Array(urls.length);
-    let done = 0;
-    let failed = 0;
-    const queue = urls.map((url, idx) => ({ url, idx }));
-    const workers = [];
-
-    for (let w = 0; w < CONCURRENCY; w++) {
-      workers.push(
-        (async () => {
-          while (true) {
-            const job = queue.shift();
-            if (!job) return;
-            const { url, idx } = job;
-            for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
-              try {
-                if (abortController && abortController.signal.aborted) throw new Error("已取消");
-                const buf = await pageFetch(url, "arraybuffer");
-                parts[idx] = buf;
-                done++;
-                updateProgressBar(done / urls.length);
-                if (done % 10 === 0 || done === urls.length) log(`下载进度 ${done}/${urls.length}`);
-                break;
-              } catch (e) {
-                if (attempt === MAX_RETRIES) {
-                  failed++;
-                  throw new Error(`分片 ${idx + 1} 下载失败: ${e.message}`);
-                }
-                await sleep(500 * attempt);
-              }
-            }
-          }
-        })()
-      );
-    }
-
-    try {
-      await Promise.all(workers);
-    } catch (e) {
-      // 浏览器侧分片下载失败（CORS/CORP）→ 提示用户使用 Go 下载器
-      showPanel("error", {
-        message: `分片下载失败 (${e.message})，浏览器无法绕过 CDN 跨域保护。`,
-        m3u8Url: m3u8Url || "",
-        pageUrl: pageUrl || location.href,
-        title: title || "",
-      });
-      throw e;
-    }
-    if (failed > 0) throw new Error(`${failed} 个分片下载失败`);
-    return parts;
-  }
-
-  // ============================================================
-  // MP4 直链下载
-  // ============================================================
-  async function downloadMP4(url, pageUrl, title, quality) {
-    showPanel("progress", { title: title || "下载该视频", text: "正在下载 MP4…" });
-    try {
-      const buf = await pageFetch(url, "arraybuffer");
-      const blob = new Blob([buf], { type: "video/mp4" });
-      const filename = makeFilename(url, title, quality, ".mp4");
-      saveBlob(blob, filename);
-      updateProgressText(`已保存: ${filename}`);
-      updateProgressBar(1);
-      setTimeout(closePanel, 1200);
-    } catch (e) {
-      showPanel("error", {
-        message: "MP4 下载失败: " + e.message,
-        m3u8Url: url,
-        pageUrl: pageUrl || location.href,
-        title: title || "",
-      });
-    }
-  }
-
-  // ============================================================
-  // 保存 / 文件名
-  // ============================================================
-  function saveBlob(blob, filename) {
-    const a = document.createElement("a");
-    a.href = URL.createObjectURL(blob);
-    a.download = filename;
-    a.style.display = "none";
-    document.body.appendChild(a);
-    a.click();
-    setTimeout(() => {
-      URL.revokeObjectURL(a.href);
-      a.remove();
-    }, 1000);
-  }
-
-  function makeFilename(url, title, quality, ext) {
-    const suffix = quality ? `_${quality}` : "";
-    if (title) {
-      const clean = String(title)
-        .replace(/[\\/:*?"<>|]/g, "_")
-        .replace(/\s+/g, " ")
-        .trim()
-        .slice(0, 80);
-      if (clean) return clean + suffix + ext;
-    }
-    try {
-      const parts = new URL(url).pathname.split("/").filter((p) => p && !p.endsWith(".m3u8"));
-      if (parts.length) return parts.join("_") + suffix + ext;
-    } catch {}
-    return `video_${Date.now()}${suffix}${ext}`;
-  }
-
   function fmtDur(sec) {
     const h = Math.floor(sec / 3600);
     const m = Math.floor((sec % 3600) / 60);
@@ -936,10 +870,6 @@
     return h > 0
       ? `${h}:${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}`
       : `${m}:${String(s).padStart(2, "0")}`;
-  }
-
-  function sleep(ms) {
-    return new Promise((r) => setTimeout(r, ms));
   }
 
   // ============================================================
@@ -1043,27 +973,6 @@
           }
         });
       }
-    } else if (state === "progress") {
-      const p = payload || {};
-      panel.innerHTML = panelShell(
-        p.title || "下载该视频",
-        `<div style="padding:24px 28px;">
-          <div id="m3u8-catcher-progress-text" style="margin-bottom:12px;color:#374151;font-size:13px;">${escapeHtml(p.text || "准备中…")}</div>
-          <div style="width:100%;height:8px;background:#e5e7eb;border-radius:4px;overflow:hidden;">
-            <div id="m3u8-catcher-progress-fill" style="width:0%;height:100%;background:#3b82f6;transition:width .2s;"></div>
-          </div>
-          <div id="m3u8-catcher-progress-cancel" style="margin-top:14px;text-align:right;">
-            <button style="padding:4px 12px;font-size:12px;border:1px solid #d1d5db;background:#fff;border-radius:4px;cursor:pointer;">取消</button>
-          </div>
-        </div>`
-      );
-      const cancel = panel.querySelector("#m3u8-catcher-progress-cancel button");
-      if (cancel) {
-        cancel.addEventListener("click", () => {
-          if (abortController) abortController.abort();
-          closePanel();
-        });
-      }
     } else if (state === "initiating") {
       // 正在请求 Go：弹文件夹框 + 启动 disk 下载（都是后台快速请求，理应很快返回）
       panel.innerHTML = panelShell(
@@ -1121,21 +1030,6 @@
       if (ccBtn) ccBtn.addEventListener("click", closePanel);
     }
     bindClose();
-  }
-
-  function updateProgressText(text, cls) {
-    if (!panel) return;
-    const el = panel.querySelector("#m3u8-catcher-progress-text");
-    if (!el) return;
-    el.textContent = text;
-    if (cls === "error") el.style.color = "#d32f2f";
-  }
-
-  function updateProgressBar(ratio) {
-    if (!panel) return;
-    const el = panel.querySelector("#m3u8-catcher-progress-fill");
-    if (!el) return;
-    el.style.width = `${Math.max(0, Math.min(1, ratio)) * 100}%`;
   }
 
   // ============================================================
@@ -1209,50 +1103,6 @@
         if (o) {
           // 选中链接 → 进入确认面板核验 URL，再触发下载
           renderConfirmPanel(o);
-        }
-      });
-    });
-  }
-
-  function renderVariantsPanel(source) {
-    if (!panel) createPanel();
-
-    const rows = source.variants
-      .map((v, idx) => {
-        return `
-        <div class="m3u8-catcher-row" data-idx="${idx}" style="display:flex;align-items:center;padding:10px 14px;border-bottom:1px solid #f3f4f6;cursor:pointer;">
-          <div style="flex:1;min-width:0;">
-            <div style="font-size:14px;color:#111;font-weight:600;">${escapeHtml(v.label)}</div>
-            <div style="font-size:11px;color:#9ca3af;margin-top:2px;">${escapeHtml(v.codec)}</div>
-          </div>
-          <div style="margin-left:10px;padding:4px 10px;background:#3b82f6;color:#fff;font-size:12px;border-radius:4px;font-weight:600;">下载</div>
-        </div>
-      `;
-      })
-      .join("");
-
-    panel.innerHTML = panelShell(
-      `下载该视频 - ${escapeHtml(source.title || "")}`,
-      `<div style="overflow-y:auto;max-height:60vh;">${rows}</div>
-       <div style="padding:12px 18px;border-top:1px solid #e5e7eb;background:#f8f9fb;color:#6b7280;font-size:12px;">点击对应画质即可开始下载。下载过程中可以选择保存位置。</div>`
-    );
-
-    bindClose();
-    panel.querySelectorAll(".m3u8-catcher-row").forEach((row) => {
-      row.addEventListener("mouseenter", () => (row.style.background = "#f0f7ff"));
-      row.addEventListener("mouseleave", () => (row.style.background = "transparent"));
-      row.addEventListener("click", () => {
-        const idx = parseInt(row.dataset.idx, 10);
-        const variant = source.variants[idx];
-        if (variant) {
-          // 选画质后进入确认面板，由用户再次确认 URL + 触发下载
-          renderConfirmPanel({
-            url: variant.url,
-            type: source.type || "ts",
-            quality: variant.quality || "",
-            title: source.title,
-            pageUrl: source.pageUrl,
-          });
         }
       });
     });
@@ -1491,14 +1341,6 @@
     }
   }
 
-  function fmtBytes(n) {
-    if (!n) return "0 B";
-    const units = ["B", "KB", "MB", "GB", "TB"];
-    let i = 0;
-    while (n >= 1024 && i < units.length - 1) { n /= 1024; i++; }
-    return `${n.toFixed(i === 0 ? 0 : 1)} ${units[i]}`;
-  }
-
   function bindClose() {
     const close = panel.querySelector("#m3u8-catcher-close");
     if (close) close.addEventListener("click", closePanel);
@@ -1546,7 +1388,7 @@
     if (m3u8Url) goArgs.push(`--url="${m3u8Url}"`);
     if (pageUrl) goArgs.push(`--referer="${pageUrl}"`);
 
-    // -o 输出文件名：视频标题 + 画质，跟浏览器端 makeFilename 保持一致
+    // -o 输出文件名：视频标题 + 画质（由 buildOutputName 统一构造）
     const outName = buildOutputName(m3u8Url, title);
     if (outName) goArgs.push(`-o "${outName}"`);
 

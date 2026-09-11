@@ -62,6 +62,27 @@ go-catcher.exe --url="https://cdn.example.com/video/1080p/video.m3u8" --referer=
 
 > 首次使用需先启动 GoCatcher（双击 `go-catcher.exe`），扩展会自动检测服务状态并给出提示。
 
+### 扩展开发
+
+扩展源码在 `edge_extension/src/background/`（ES 模块），由 esbuild 打包为 `background.js`：
+`background.js` 仍是单文件 IIFE 且**提交进仓库**，因此"加载解压缩的扩展"无需任何构建步骤；
+改了 `src/` 之后需要重新构建再提交：
+
+```
+make ext          # 等价于 cd edge_extension && node build.mjs（首次自动 npm install）
+```
+
+或手工执行：
+
+```
+cd edge_extension
+npm install
+node build.mjs
+```
+
+CI 会校验 `background.js` 与 `src/` 是否一致（不一致即失败）；提交前跑 `make ext-check`
+可以在本地先拦下"改了 `src/` 忘了重新打包"。
+
 ## 技术架构
 
 单进程架构：下载引擎与 GUI 外壳合并在一个可执行文件内，进程内通过生命周期 API 协同。
@@ -73,26 +94,78 @@ go-catcher.exe
 └── internal/app    # GUI 外壳：WebView2 窗口（内嵌监控页）、系统托盘、单实例互斥
 ```
 
-- **引擎**（`internal/core`）：核心下载逻辑，独立于 UI，可被 GUI、无头服务、CLI 三种模式复用
+- **引擎**（`internal/core`）：核心下载逻辑，独立于 UI，可被 GUI、无头服务、CLI 三种模式复用；
+  全部可变运行状态收在 `Runtime` 结构（`runtime.go`）上，Engine / CLI 各持一份实例，
+  可多实例化或作为库引用
 - **外壳**（`internal/app`）：基于 WebView2（系统自带 Edge 运行时，不打包浏览器）+ 系统托盘，与引擎通过 `Start/Stop/Running` 交互
 - **监控页**：同一份 Web UI 供客户端内嵌、浏览器直访、无头模式共用
 
 ## 数据与隐私
 
-- 所有数据仅存本地：`gocatcher_config.json`（运行配置）、`gocatcher_state.json`（任务历史），位于 exe 同目录
+- 所有数据仅存本地：`gocatcher_config.json`（运行配置）、`gocatcher_state.json`（任务历史）、
+  `gocatcher.log`（诊断日志，超过 2MB 自动轮转为 `gocatcher.log.1`），均位于 exe 同目录
 - 下载服务只绑定 `127.0.0.1`，外部无法访问
+- **访问令牌**：服务首次启动会生成一枚随机令牌存进 `gocatcher_config.json`，之后所有请求
+  （`/health`、`/svc/info`、页面本身除外）都必须带上它——`?t=<token>` 或 `X-GoCatcher-Token` 头。
+  原因：「只监听 127.0.0.1」并不等于安全，浏览器里任何网页都能向 `127.0.0.1` 发简单请求，
+  而本服务具备「按给定路径写文件」和「执行程序」两种能力。令牌之外还有两道：
+  Host 头必须是本机地址（挡 DNS rebinding），未通过令牌校验的响应不带 CORS 头（网页读不到响应体）。
+  内嵌监控页由服务端把令牌注入 HTML，浏览器扩展则通过 `/svc/info` 握手自动获取，用户无需配置。
+- **诊断日志**：GUI 模式编译为 `windowsgui` 子系统、没有控制台，所有诊断输出（重试、回退、
+  落盘失败原因等）会带时间戳写入 `gocatcher.log`。查看方式：直接打开该文件，或请求
+  受令牌保护的 `GET /log`（返回最后 200 行）。
+
+## 已知限制
+
+拿到一个流之前，先对照这张表可以少走弯路：
+
+| 限制 | 说明 |
+|---|---|
+| 只支持 HLS(m3u8) 与直链 MP4 | 不支持 DASH(`.mpd`)、HLS over WebSocket |
+| 加密只支持 AES-128 | SAMPLE-AES / Widevine 会明确报错（不支持的 METHOD） |
+| 全程必须同一把密钥 | 播放列表中途换 key（key rotation）会明确报错而不是产出损坏文件 |
+| 明文 `http://` 同样走代理 | 已修正：此前只有 https 走 CONNECT 隧道，明文请求会绕过代理直连 |
+| 代理只支持 `http://` | `socks5://` 系统代理会在启动横幅与 `/config` 的 `systemProxyWarning` 里提示"已按直连处理" |
+| 强制 HTTP/1.1 | 覆写 ALPN，牺牲部分吞吐换兼容性（应对仅支持 1.1 的 CDN） |
+| 仅 Windows | 依赖 WebView2、注册表、ShellExecute（`_windows.go` 已按 build tag 隔离） |
 
 ## 从源码构建
 
 需要 Go 1.24+（Makefile 依赖 GNU Make，其余构建工具由 `go run` 按需拉取）。
 
 ```powershell
-make build
+make all     # exe + Edge 扩展一起编；只想要 exe 用 make build
 ```
 
-> 等价于：先生成 Windows 资源，再 `go build -ldflags "-H=windowsgui -s -w" -o go-catcher.exe ./cmd/go-catcher`。`-H=windowsgui` 用于 GUI 模式不弹出终端窗口。
+> `make build` 等价于：先生成 Windows 资源，再 `go build -ldflags "-H=windowsgui -s -w" -o go-catcher.exe ./cmd/go-catcher`。`-H=windowsgui` 用于 GUI 模式不弹出终端窗口。
+> `make all` = `make build` + `make ext`（扩展打包成 `edge_extension/background.js`）。
 
-其他目标：`make test`（全量测试，含竞态检测）、`make cover`（覆盖率报告）、`make clean`。
+其他目标：
+
+| 目标 | 作用 |
+|---|---|
+| `make all` | **一次编译全部产物**：exe（GUI / 无头服务 / CLI 三合一）+ Edge 扩展 |
+| `make build` | 只编 exe |
+| `make test` | 全量测试（含竞态检测） |
+| `make check` | Go 侧质量门，与 CI 的 go job 同一套判定：gofmt / go vet / go test -race |
+| `make ext` | 打包 Edge 扩展：`src/background/*.js` → `edge_extension/background.js` |
+| `make ext-check` | 扩展侧质量门，与 CI 的 extension job 同一套判定：打包 → bundle 一致性 → 语法 → 回归测试 |
+| `make check-all` | `check` + `ext-check`，等价于 CI 两个 job |
+| `make cover` | 覆盖率报告 |
+| `make clean` | 清理构建产物 |
+
+> 注意：请在 MSYS2 MinGW64 终端里跑 `make`。从 Git Bash 等非 MSYS2 环境启动时，MSYS2 的 make
+> 会重建自己的环境并丢掉 `TMP`/`TEMP`/`USERPROFILE`/`GOPATH`，go 会报 `module cache not found`、
+> `mkdir C:\WINDOWS\go-build: Access is denied`，或 `GOCACHE is not defined and %LocalAppData% is not defined`；
+> 此时直接跑 go 命令，或把变量显式传进来：
+>
+> ```powershell
+> make all TMP="$TMP" TEMP="$TEMP" USERPROFILE="$USERPROFILE" `
+>          LOCALAPPDATA="$LOCALAPPDATA" GOCACHE="$LOCALAPPDATA/go-build" `
+>          GOPATH="$HOME/go" GOPROXY=https://goproxy.cn,direct
+> ```
+>
+> （`GOPROXY` 走国内镜像；`ext`/`ext-check` 只用 Node 和 git、不碰 go，不受此影响。）
 
 ### Windows 资源（图标 / 清单）
 

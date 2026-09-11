@@ -343,7 +343,7 @@ func tfhdFullBox(trackID uint32) []byte {
 	p := make([]byte, 28)
 	binary.BigEndian.PutUint32(p[0:], trackID)
 	binary.BigEndian.PutUint64(p[4:], 12345) // base_data_offset
-	binary.BigEndian.PutUint32(p[12:], 2)   // sample_description_index
+	binary.BigEndian.PutUint32(p[12:], 2)    // sample_description_index
 	binary.BigEndian.PutUint32(p[16:], 3000) // default_sample_duration
 	binary.BigEndian.PutUint32(p[20:], 100)  // default_sample_size
 	binary.BigEndian.PutUint32(p[24:], 0)    // default_sample_flags

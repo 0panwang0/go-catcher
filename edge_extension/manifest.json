@@ -6,9 +6,7 @@
   "permissions": [
     "storage",
     "webRequest",
-    "declarativeNetRequest",
-    "downloads",
-    "downloads.ui"
+    "declarativeNetRequest"
   ],
   "host_permissions": [
     "http://*/*",

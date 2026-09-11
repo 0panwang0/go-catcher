@@ -1,0 +1,26 @@
+# 统一行尾：仓库内所有文本一律 LF。
+# 背景：Windows 的 core.autocrlf=true 会把 checkout 出的 .go 转成 CRLF，
+# 而 gofmt 会把 CRLF 视为「需要重新格式化」——于是本地 gofmt 全绿、CI 却挂在 gofmt。
+# 这里显式锁 eol=lf，任何平台 checkout 都是 LF，杜绝这类差异。
+
+* text=auto
+
+# 源码 / 文本：强制 LF
+*.go     text eol=lf
+*.mod    text eol=lf
+*.sum    text eol=lf
+*.js     text eol=lf
+*.json   text eol=lf
+*.html   text eol=lf
+*.yml    text eol=lf
+*.yaml   text eol=lf
+*.md     text eol=lf
+*.manifest text eol=lf
+Makefile text eol=lf
+.gitattributes text eol=lf
+.gitignore text eol=lf
+
+# 二进制：不做任何转换
+*.ico  binary
+*.png  binary
+*.syso binary
