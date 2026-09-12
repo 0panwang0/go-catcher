@@ -89,14 +89,17 @@ CI 会校验 `background.js` 与 `src/` 是否一致（不一致即失败）；�
 
 ```
 go-catcher.exe
-├── internal/core   # 下载引擎：HTTP 服务（127.0.0.1:7891）、任务调度、m3u8 解析、持久化
-│   └── web/        # 内嵌监控页（go:embed）
-└── internal/app    # GUI 外壳：WebView2 窗口（内嵌监控页）、系统托盘、单实例互斥
+├── internal/core       # 下载引擎：HTTP 服务（127.0.0.1:7891）、任务调度、m3u8 解析、持久化
+│   └── web/            # 内嵌监控页（go:embed）
+├── internal/platform   # 平台层：Windows 控制台挂接、文件夹对话框、日志落盘、系统代理、Shell 操作
+└── internal/app        # GUI 外壳：WebView2 窗口（内嵌监控页）、系统托盘、单实例互斥
 ```
 
 - **引擎**（`internal/core`）：核心下载逻辑，独立于 UI，可被 GUI、无头服务、CLI 三种模式复用；
   全部可变运行状态收在 `Runtime` 结构（`runtime.go`）上，Engine / CLI 各持一份实例，
   可多实例化或作为库引用
+- **平台层**（`internal/platform`）：Windows 特定能力的独立包（`//go:build windows` 隔离），
+  core 与 app 只依赖其导出函数，不直接触碰系统 API——未来移植到其它系统时只需替换此包
 - **外壳**（`internal/app`）：基于 WebView2（系统自带 Edge 运行时，不打包浏览器）+ 系统托盘，与引擎通过 `Start/Stop/Running` 交互
 - **监控页**：同一份 Web UI 供客户端内嵌、浏览器直访、无头模式共用
 

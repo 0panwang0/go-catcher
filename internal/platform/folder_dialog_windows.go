@@ -1,6 +1,6 @@
 //go:build windows
 
-package core
+package platform
 
 // Windows 原生"选择文件夹"对话框（IFileOpenDialog + FOS_PICKFOLDERS）。
 // 纯 COM 手工调用，不依赖第三方库，返回用户选中的绝对路径。
@@ -93,8 +93,8 @@ func hrErr(hr uintptr) error {
 	return fmt.Errorf("COM HRESULT 0x%08X", uint32(hr))
 }
 
-// pickFolder 弹原生文件夹选择框，返回绝对路径。用户取消返回 ("", error 含 cancelled)。
-func pickFolder(ownerHwnd uintptr, title string) (string, error) {
+// PickFolder 弹原生文件夹选择框，返回绝对路径。用户取消返回 ("", error 含 cancelled)。
+func PickFolder(ownerHwnd uintptr, title string) (string, error) {
 	// STA COM 对象必须固定在同一个 OS 线程创建和使用。
 	// Go goroutine 默认会在线程间迁移，会导致 CoInitialize 的线程与
 	// 后续 COM 调用线程不一致 → 崩溃或 HRESULT 错误。锁线程规避。

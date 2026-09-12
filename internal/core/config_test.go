@@ -272,28 +272,6 @@ func TestLoadConfigFallsBack(t *testing.T) {
 	}
 }
 
-// TestValidProxyAddr 代理地址校验：仅 http://host[:port]（CONNECT 隧道）。
-func TestValidProxyAddr(t *testing.T) {
-	cases := []struct {
-		p    string
-		want bool
-	}{
-		{"http://127.0.0.1:7890", true},
-		{"http://proxy.example.com", true},
-		{"http://proxy.example.com:8080", true},
-		{"127.0.0.1:7890", false},  // 缺 scheme：url.Parse 会把 host 当 scheme
-		{"socks5://x:1080", false}, // 不支持 SOCKS
-		{"https://x:8443", false},  // 不支持 TLS-to-proxy
-		{"", false},
-		{"http://", false},
-	}
-	for _, c := range cases {
-		if got := validProxyAddr(c.p); got != c.want {
-			t.Fatalf("validProxyAddr(%q)=%v want %v", c.p, got, c.want)
-		}
-	}
-}
-
 // TestSaveConfigLocked 落盘为可解析的 JSON，字段与 cfg 一致。
 func TestSaveConfigLocked(t *testing.T) {
 	dir := t.TempDir()

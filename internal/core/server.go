@@ -7,6 +7,8 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	"github.com/0panwang0/go-catcher/internal/platform"
 )
 
 // routeDef 一条路由表项：路径、允许的方法、是否要求令牌、handler 工厂。
@@ -79,7 +81,7 @@ func handleHealth(w http.ResponseWriter, r *http.Request) {
 // GUI 是 windowsgui 子系统、没有控制台，这份日志是排障的唯一入口；
 // 内容含本机路径，因此走令牌鉴权（不在 guard 的免鉴权白名单里）。
 func handleLog(w http.ResponseWriter, r *http.Request) {
-	tail, err := LogTail(logTailLines)
+	tail, err := platform.LogTail(platform.LogTailLines)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusNotFound)
 		return

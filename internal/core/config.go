@@ -6,11 +6,12 @@ package core
 import (
 	"context"
 	"encoding/json"
-	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
+
+	"github.com/0panwang0/go-catcher/internal/platform"
 )
 
 // ============================================================
@@ -193,7 +194,7 @@ func (r *Runtime) loadConfig() {
 			fileC.Proxy = strings.TrimSpace(fileC.Proxy)
 			if strings.EqualFold(fileC.Proxy, "system") {
 				fileC.Proxy = "system"
-			} else if fileC.Proxy == "" || (!isDirectStr(fileC.Proxy) && !validProxyAddr(fileC.Proxy)) {
+			} else if fileC.Proxy == "" || (!isDirectStr(fileC.Proxy) && !platform.ValidProxyAddr(fileC.Proxy)) {
 				fileC.Proxy = c.Proxy
 			}
 			c = fileC
@@ -215,13 +216,6 @@ func clamp(v *int, lo, hi int) bool {
 		ok = false
 	}
 	return ok
-}
-
-// validProxyAddr 校验代理地址：仅支持 http://host[:port]（dialTLSContext 走
-// HTTP CONNECT 隧道，socks5/https 代理无法工作）。
-func validProxyAddr(p string) bool {
-	u, err := url.Parse(p)
-	return err == nil && u.Scheme == "http" && u.Host != ""
 }
 
 // applyConfigLocked 把 cfg 写入运行时变量（调用方须持 cfgMu）。

@@ -21,6 +21,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/0panwang0/go-catcher/internal/platform"
 )
 
 // defaultUserAgent 请求伪造的浏览器 UA（CLI 与 GUI 共用）。
@@ -102,7 +104,7 @@ func newRuntime() *Runtime {
 		livePollInterval:  3 * time.Second,
 		liveMaxEmptyPolls: 25,
 	}
-	r.systemProxyAddrFn = realSystemProxyAddr
+	r.systemProxyAddrFn = platform.RealSystemProxyAddr
 	// 原包级 init()：热路径原子变量的默认值
 	r.segConcurrency.Store(10)
 	r.retryLimit.Store(3)

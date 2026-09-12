@@ -1,7 +1,7 @@
 //go:build windows
 
 // 日志尾部读取 + 异步落盘器测试（GUI 无控制台时 /log 是排障唯一入口）。
-package core
+package platform
 
 import (
 	"os"
@@ -21,7 +21,7 @@ func TestTailLines(t *testing.T) {
 	if got := tailLines("a\nb\n", 100); got != "a\nb\n" {
 		t.Fatalf("行数不足应全给 = %q", got)
 	}
-	// n 非法时回退到 logTailLines 上限
+	// n 非法时回退到 LogTailLines 上限
 	if got := tailLines("a\nb\n", 0); got != "a\nb\n" {
 		t.Fatalf("n=0 应回退上限 = %q", got)
 	}
@@ -36,12 +36,12 @@ func TestTailLines(t *testing.T) {
 
 	// 超大输入按行数截断，不裁剪行内容
 	var big strings.Builder
-	for i := 0; i < logTailLines*3; i++ {
+	for i := 0; i < LogTailLines*3; i++ {
 		big.WriteString("line\n")
 	}
-	got := tailLines(big.String(), logTailLines)
-	if n := strings.Count(got, "\n"); n != logTailLines {
-		t.Fatalf("应恰好返回 %d 行, got %d", logTailLines, n)
+	got := tailLines(big.String(), LogTailLines)
+	if n := strings.Count(got, "\n"); n != LogTailLines {
+		t.Fatalf("应恰好返回 %d 行, got %d", LogTailLines, n)
 	}
 }
 

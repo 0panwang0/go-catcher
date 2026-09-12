@@ -8,6 +8,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	"github.com/0panwang0/go-catcher/internal/platform"
 )
 
 // ============================================================
@@ -235,7 +237,7 @@ func (e *Engine) handleOpenFile(w http.ResponseWriter, r *http.Request) {
 	}
 	// 直接 ShellExecute（x/sys/windows），不经过 cmd/powershell/explorer 子进程。
 	// 避免 detached 服务进程 fork 外部 shell 后 GUI 无法送上交互桌面的问题。
-	if err := shellOpen(target); err != nil {
+	if err := platform.ShellOpen(target); err != nil {
 		jsonError(w, http.StatusInternalServerError, "open file: "+err.Error())
 		return
 	}
@@ -300,7 +302,7 @@ type pickDirResp struct {
 }
 
 func (e *Engine) handlePickDir(w http.ResponseWriter, r *http.Request) {
-	dir, err := pickFolder(0, "选择视频保存文件夹")
+	dir, err := platform.PickFolder(0, "选择视频保存文件夹")
 	if err != nil {
 		// 用户取消，err 带 cancelled 标记
 		writeJSON(w, http.StatusOK, pickDirResp{Cancelled: true, Error: err.Error()})
@@ -379,7 +381,7 @@ func (e *Engine) handleOpenFolder(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// shellReveal：文件→explorer /select 打开父目录并选中；目录→直接打开。
-	if err := shellReveal(target); err != nil {
+	if err := platform.ShellReveal(target); err != nil {
 		jsonError(w, http.StatusInternalServerError, "reveal in explorer: "+err.Error())
 		return
 	}
@@ -423,7 +425,7 @@ func (e *Engine) handleConfig(w http.ResponseWriter, r *http.Request) {
 			UIView:             cur.UIView,
 			Proxy:              cur.Proxy,
 			SystemProxy:        e.rt.systemProxyAddr(),
-			SystemProxyWarning: e.rt.systemProxyWarning(),
+			SystemProxyWarning: platform.SystemProxyWarning(e.rt.getProxyAddr()),
 			RestartRequired:    restartRequired,
 			Clamped:            clamped,
 		}
@@ -458,7 +460,7 @@ func (e *Engine) handleConfig(w http.ResponseWriter, r *http.Request) {
 			p = "direct" // 空输入语义 = 直连；落盘为显式 direct，重载时不被当旧配置回退默认
 		case strings.EqualFold(p, "system"):
 			p = "system"
-		case isDirectStr(p), validProxyAddr(p):
+		case isDirectStr(p), platform.ValidProxyAddr(p):
 		default:
 			jsonError(w, http.StatusBadRequest, "代理地址无效：应为 http://host:port、system 跟随系统或 direct 直连")
 			return

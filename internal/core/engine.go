@@ -10,6 +10,8 @@ import (
 	"net/http"
 	"sync"
 	"time"
+
+	"github.com/0panwang0/go-catcher/internal/platform"
 )
 
 // DefaultPort 监控页 / Edge 扩展默认端口
@@ -89,7 +91,7 @@ func (e *Engine) Start() error {
 	fmt.Printf("  监听地址: http://%s:%d\n", e.rt.bindAddr, port)
 	fmt.Printf("  最大并发下载: %d / %d 运行\n", active, limit)
 	fmt.Printf("  访问令牌: %s\n", maskToken(e.rt.ensureAPIToken()))
-	if w := e.rt.systemProxyWarning(); w != "" {
+	if w := platform.SystemProxyWarning(e.rt.getProxyAddr()); w != "" {
 		// 静默降级成直连必须说出来：用户以为走了代理、实际暴露真实 IP，
 		// 不提示的话排查时完全看不出问题在哪。
 		fmt.Printf("  [!] %s\n", w)

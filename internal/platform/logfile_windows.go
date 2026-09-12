@@ -1,12 +1,13 @@
 //go:build windows
 
+package platform
+
 // 诊断日志落盘。
 //
 // GUI 模式编译为 windowsgui 子系统，没有控制台：下载引擎里大量的 fmt.Printf
 // 诊断信息（重试、回退、规范化、落盘失败原因…）全部进了黑洞，排障只能靠猜。
 // 这里把标准输出/错误复制一份到 exe 同目录的 gocatcher.log，并给每段输出加
 // 时间戳；已有控制台时保持一致（控制台照旧打印，文件留档）。
-package core
 
 import (
 	"fmt"
@@ -35,14 +36,14 @@ const logMaxWriteErrors = 3
 // 盯着一个关不掉的窗口——排不掉就放弃，剩下的行本来就是"磁盘跟不上"的产物。
 const logCloseTimeout = 2 * time.Second
 
-// logTailLines /log 端点回给前端的行数上限。
-const logTailLines = 200
+// LogTailLines /log 端点回给前端的行数上限。
+const LogTailLines = 200
 
 // activeLog 当前落盘器（进程级单例），供退出路径排空队列。
 //
 // ⚠️ 这里**刻意**用一个包级变量，是 G1「禁止新增包级可变变量」的明确例外：
 // 日志是被 SetupFileLogging 劫持 os.Stdout 换来的**进程级**设施，天然不属于某个
-// Runtime（core 可以多实例化，但一个进程只有一个 stdout）。G1 要防的是引擎状态
+// 引擎实例（core 可以多实例化，但一个进程只有一个 stdout）。G1 要防的是引擎状态
 // 散落到包级导致无法多实例化，这条不在此列。除 SetupFileLogging /
 // CloseFileLogging 外，任何代码都不该碰它。
 var activeLog atomic.Pointer[logWriter]
@@ -304,10 +305,10 @@ func LogTail(n int) (string, error) {
 	return tailLines(string(data), n), nil
 }
 
-// tailLines 取文本最后最多 n 行（n<=0 或超上限时取 logTailLines 行）。
+// tailLines 取文本最后最多 n 行（n<=0 或超上限时取 LogTailLines 行）。
 func tailLines(s string, n int) string {
-	if n <= 0 || n > logTailLines {
-		n = logTailLines
+	if n <= 0 || n > LogTailLines {
+		n = LogTailLines
 	}
 	s = strings.TrimRight(s, "\n")
 	if s == "" {
