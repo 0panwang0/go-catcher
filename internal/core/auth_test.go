@@ -134,7 +134,7 @@ func TestGuardCORSOnlyWithToken(t *testing.T) {
 	// 免令牌路径：放行，但绝不能带 CORS 头——它们是"不含秘密"才被豁免的，
 	// 而 /svc/info 的响应体里就有令牌、/ 与 /settings 的 HTML 里注入了令牌。
 	for _, p := range []string{"/health", "/svc/info", "/", "/settings"} {
-		if !isTokenFreePath(p) {
+		if !tokenFreePath(p) {
 			t.Fatalf("%s 不在免令牌清单里，本用例已失效", p)
 		}
 		w := guardedDo(t, "GET", p, "127.0.0.1:7891", evil)

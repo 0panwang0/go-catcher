@@ -159,7 +159,7 @@ Go 二进制（`go-catcher.exe`）已经预设好：
 
 ```
 edge_extension/
-├── manifest.json      # MV3 清单
+├── manifest.json      # MV3 清单（version 由 build.mjs 从 package.json 注入，单一来源）
 ├── src/background/    # service worker 源码（ES 模块，esbuild 打包成 background.js）
 │   └── m3u8-parse.js  # 全项目唯一的 m3u8/画质解析实现（downloader 页面直接 import）
 ├── background.js      # 打包产物（提交进仓库，改 src/ 后跑 make ext 重建）
@@ -169,10 +169,12 @@ edge_extension/
 ├── downloader.html    # 下载器页面（工具栏图标打开；手动下载 + 嗅探列表 + 设置）
 ├── downloader.js      # 下载器页面逻辑（ES 模块；只调服务，不自己下载）
 └── tests/             # Node 回归测试（不参与扩展运行）
-    ├── embedmatch.test.js   # 页面归属判定
-    ├── probes.test.js       # webRequest 注册参数 + 无扩展名通道判据
-    ├── storage.test.js      # 嗅探列表并发写入与淘汰
-    └── downloader.test.js   # 下载器页面：无第二套下载实现 + 文件名/兜底命令
+    ├── embedmatch.test.js      # 页面归属判定
+    ├── probes.test.js          # webRequest 注册参数 + 无扩展名通道判据
+    ├── storage.test.js         # 嗅探列表并发写入与淘汰
+    ├── downloader.test.js      # 下载器页面：无第二套下载实现 + 文件名/兜底命令
+    ├── refererrules.test.js    # DNR Referer 规则定向清理（多页签隔离 / sweep）
+    └── manifest.test.js        # manifest 与 package.json 版本一致性
 ```
 
 跑测试：`node tests/*.test.js`（或项目根 `make ext-check`，会连打包一致性、语法检查一起校验）。

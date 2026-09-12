@@ -80,14 +80,22 @@ ext:
 #   本地改了 src/ 还没提交时 git diff 必然非空（那是正常的，不该报错）；
 #   hash 判据只在"改了 src 却没重新打包"时命中，两种场景都对。
 #   CI 那边用的是 git diff --exit-code（对已提交的 blob 比对），fresh checkout 下等价。
+# manifest.json 用同一判据：build.mjs 会把 package.json 版本注入 manifest，
+# 改了版本没跑 build 时在这里被拦下（版本单一来源）。
 ext-check:
 	@cd $(EXT_DIR) && \
 	before=$$(sha1sum background.js 2>/dev/null | cut -d' ' -f1); \
+	mf_before=$$(sha1sum manifest.json 2>/dev/null | cut -d' ' -f1); \
 	{ [ -d node_modules ] || npm install --no-audit --no-fund >/dev/null; } || exit 1; \
 	node build.mjs || exit 1; \
 	after=$$(sha1sum background.js | cut -d' ' -f1); \
 	if [ "$$before" != "$$after" ]; then \
 		echo "background.js 与 src/ 不一致（重新打包后内容有变），请提交更新后的 bundle"; \
+		exit 1; \
+	fi; \
+	mf_after=$$(sha1sum manifest.json | cut -d' ' -f1); \
+	if [ "$$mf_before" != "$$mf_after" ]; then \
+		echo "manifest.json 版本与 package.json 不一致，请提交 build.mjs 同步后的 manifest"; \
 		exit 1; \
 	fi; \
 	echo "bundle 一致性 OK"; \

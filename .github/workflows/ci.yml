@@ -62,8 +62,10 @@ jobs:
         run: |
           npm install --no-audit --no-fund
           node build.mjs
-          # 打包产物应与仓库中提交的 bundle 一致（防止改了 src/ 忘了重新构建）
-          git diff --exit-code -- background.js || (echo "background.js 与 src/ 不一致，请本地跑 node build.mjs 后提交" && exit 1)
+          # 打包产物应与仓库中提交的 bundle 一致（防止改了 src/ 忘了重新构建）；
+          # manifest.json 同理——build.mjs 会把 package.json 的版本注入 manifest，
+          # 只改了 package.json 没跑 build 提交时，这里同样拦下（版本单一来源）。
+          git diff --exit-code -- background.js manifest.json || (echo "background.js 或 manifest.json 与源不一致，请本地跑 node build.mjs 后提交" && exit 1)
 
       - name: 语法检查
         run: |

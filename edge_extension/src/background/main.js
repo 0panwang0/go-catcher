@@ -18,7 +18,7 @@ import {
 } from "./list-store.js";
 import { installSniffProbes, contentTypeMediaType, isLikelyFullFile } from "./sniff-probes.js";
 import { sameSite, isCandidateURL, findSniffedByURL } from "./page-match.js";
-import { getVideoOptions, getVideoSources, getVideoSource, openDownloader } from "./video-source.js";
+import { getVideoSources, getVideoSource, openDownloader } from "./video-source.js";
 import {
   getSettings,
   getApiToken,
@@ -28,7 +28,7 @@ import {
   queryDownload,
   controlTask,
 } from "./server-api.js";
-import { setRefererRules } from "./referer-rules.js";
+import { setRefererRules, clearRefererRules, sweepStaleRules } from "./referer-rules.js";
 
 // 点击工具栏图标：打开下载器页面
 chrome.action.onClicked.addListener(() => {
@@ -42,12 +42,6 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (msg.type === "setReferers") {
     setRefererRules(msg.tabId, msg.pairs)
       .then(() => sendResponse({ ok: true }))
-      .catch((e) => sendResponse({ ok: false, error: String(e) }));
-    return true;
-  }
-  if (msg.type === "getVideoOptions") {
-    getVideoOptions(sender.tab)
-      .then((res) => sendResponse({ ok: true, options: res }))
       .catch((e) => sendResponse({ ok: false, error: String(e) }));
     return true;
   }
@@ -123,10 +117,20 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 
 installSniffProbes();
 
+// 下载器页签关闭时清掉它的 Referer 规则：规则按 tabId 生效，tab 没了规则
+// 就永远匹配不到请求，只会占用动态规则配额（Chrome 上限 5000 条）。
+// 监听器必须在顶层同步注册（MV3 事件唤醒机制的要求）。
+chrome.tabs.onRemoved.addListener((tabId) => {
+  clearRefererRules(tabId).catch(() => {});
+});
+
 // SW 每次唤醒（页面导航/webRequest/消息都会唤醒）都探测一次 exe 路径。
 // 兜底命令可能在从未发起过下载时出现（如"视频未嗅探到"错误面板），
 // 不能只依赖下载流程里 pingServer 的顺带探测。
 detectExePath();
+
+// SW 休眠期间错过的 tabs.onRemoved 无法追补，每次唤醒扫一遍死 tab 的规则。
+sweepStaleRules().catch(() => {});
 
 // ============================================================
 // 测试导出面（node tests 通过 new Function + chrome 桩加载本 bundle 后取用）
@@ -146,4 +150,8 @@ export const __test__ = {
   // 探测器判据（纯函数，供 tests/probes.test.js 直接断言）
   contentTypeMediaType,
   isLikelyFullFile,
+  // DNR Referer 规则管理（tests/refererrules.test.js）
+  setRefererRules,
+  clearRefererRules,
+  sweepStaleRules,
 };

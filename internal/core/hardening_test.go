@@ -9,6 +9,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -105,46 +106,40 @@ func TestSnapshotIgnoresEmptyPart(t *testing.T) {
 
 // TestHandlersRejectWrongMethod 端点只接受约定的方法（P2-2）。
 // 跨源"简单请求"只限 GET/POST/HEAD，方法校验能挡掉 <img src>、<form> 这类
-// 不需要 CORS 就能发出去的噪声请求。
+// 不需要 CORS 就能发出去的噪声请求。方法约束收敛在路由表（routeDefs）里由
+// methodGuard 统一执行，本测试遍历整张表，保证任何端点都不会漏声明方法。
 func TestHandlersRejectWrongMethod(t *testing.T) {
-	e := testEngine()
-	getOnly := []struct {
-		path string
-		h    http.HandlerFunc
-	}{
-		{"/status", e.handleStatus},
-		{"/pause", e.handlePause},
-		{"/resume", e.handleResume},
-		{"/cancel", e.handleCancel},
-		{"/remove", e.handleRemove},
-		{"/openfile", e.handleOpenFile},
-		{"/openfolder", e.handleOpenFolder},
-		{"/pickdir", e.handlePickDir},
-		{"/log", handleLog},
-		{"/download", e.handleDownload},
-	}
-	for _, c := range getOnly {
-		w := httptest.NewRecorder()
-		c.h(w, httptest.NewRequest(http.MethodPost, c.path, nil))
-		if w.Code != http.StatusMethodNotAllowed {
-			t.Errorf("POST %s 应 405，得到 %d", c.path, w.Code)
-		}
-		if w.Header().Get("Allow") != http.MethodGet {
-			t.Errorf("%s 的 405 应声明 Allow: GET，得到 %q", c.path, w.Header().Get("Allow"))
-		}
-	}
+	setTestToken(t, "method-token")
+	h := testStd.guard(newMux(testEngine()))
 
-	// /svc/info 只认 GET
-	w := httptest.NewRecorder()
-	handleSvcInfo(w, httptest.NewRequest(http.MethodPost, "/svc/info", nil), e)
-	if w.Code != http.StatusMethodNotAllowed {
-		t.Errorf("POST /svc/info 应 405，得到 %d", w.Code)
-	}
-	// /svc/stop 只认 POST —— 且 GET 不能真的把服务停掉
-	w = httptest.NewRecorder()
-	handleSvcStop(w, httptest.NewRequest(http.MethodGet, "/svc/stop", nil), e)
-	if w.Code != http.StatusMethodNotAllowed {
-		t.Errorf("GET /svc/stop 应 405，得到 %d", w.Code)
+	candidate := []string{http.MethodGet, http.MethodPost, http.MethodPut, http.MethodDelete}
+	for _, rd := range routeDefs {
+		// 挑一个不在该端点方法集里的方法作反面样本
+		var bad string
+		for _, m := range candidate {
+			if !slices.Contains(rd.methods, m) {
+				bad = m
+				break
+			}
+		}
+		if bad == "" {
+			continue // 端点声明了全部候选方法（当前不存在）
+		}
+		w := httptest.NewRecorder()
+		r := httptest.NewRequest(bad, rd.path, nil)
+		r.Host = "127.0.0.1:7891"
+		if rd.needToken {
+			q := r.URL.Query()
+			q.Set("t", "method-token")
+			r.URL.RawQuery = q.Encode()
+		}
+		h.ServeHTTP(w, r)
+		if w.Code != http.StatusMethodNotAllowed {
+			t.Errorf("%s %s 应 405，得到 %d", bad, rd.path, w.Code)
+		}
+		if got := w.Header().Get("Allow"); got != strings.Join(rd.methods, ", ") {
+			t.Errorf("%s 的 Allow 应为 %q，得到 %q", rd.path, strings.Join(rd.methods, ", "), got)
+		}
 	}
 }
 
@@ -166,7 +161,7 @@ func TestSvcInfoJSONWellFormed(t *testing.T) {
 	rt.cfgMu.Unlock()
 
 	w := httptest.NewRecorder()
-	handleSvcInfo(w, httptest.NewRequest(http.MethodGet, "/svc/info", nil), &Engine{rt: rt})
+	(&Engine{rt: rt}).handleSvcInfo(w, httptest.NewRequest(http.MethodGet, "/svc/info", nil))
 
 	if ct := w.Header().Get("Content-Type"); !strings.HasPrefix(ct, "application/json") {
 		t.Fatalf("Content-Type 应为 JSON，得到 %q", ct)

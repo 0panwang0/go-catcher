@@ -16,7 +16,11 @@ const chrome = {
   action: { onClicked: noop, setBadgeText() {}, setBadgeBackgroundColor() {} },
   webRequest: { onCompleted: noop },
   runtime: { onMessage: noop },
-  tabs: { get() {}, create() {} },
+  tabs: { get() {}, create() {}, onRemoved: noop, query: async () => [] },
+  declarativeNetRequest: {
+    getDynamicRules: async () => [],
+    updateDynamicRules: async () => {},
+  },
   storage: {
     onChanged: noop,
     local: {

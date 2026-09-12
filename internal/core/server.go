@@ -9,26 +9,65 @@ import (
 	"time"
 )
 
-// newMux 装配全部路由；传入 Engine 供 /svc/stop 触发停机与端点访问运行时状态。
+// routeDef 一条路由表项：路径、允许的方法、是否要求令牌、handler 工厂。
+// 端点的一切约束都收敛在这里——新增端点 = 加一行表项，不再需要同时改
+// mux 装配、handler 内的方法检查、auth 的免令牌白名单三处（评审 P2-3）。
+// needToken 默认语义为要求令牌；false 仅限响应体不含秘密的端点。
+type routeDef struct {
+	path      string
+	methods   []string
+	needToken bool
+	new       func(*Engine) http.HandlerFunc
+}
+
+// routeDefs 全部端点一览表。免令牌端点只有 4 个：探活 / 握手 / 两个页面。
+// 新增免令牌端点前必须想清楚：它的响应体是否含秘密（令牌）、是否会被 CORS
+// 读到（豁免成立的前提见 auth.go 的说明）。
+var routeDefs = []routeDef{
+	{"/health", []string{http.MethodGet}, false, func(*Engine) http.HandlerFunc { return handleHealth }},
+	{"/svc/info", []string{http.MethodGet}, false, func(e *Engine) http.HandlerFunc { return e.handleSvcInfo }},
+	{"/", []string{http.MethodGet}, false, func(e *Engine) http.HandlerFunc { return e.handleHomePage }},
+	{"/settings", []string{http.MethodGet}, false, func(e *Engine) http.HandlerFunc { return e.handleSettingsPage }},
+
+	{"/pickdir", []string{http.MethodGet}, true, func(e *Engine) http.HandlerFunc { return e.handlePickDir }},
+	{"/status", []string{http.MethodGet}, true, func(e *Engine) http.HandlerFunc { return e.handleStatus }},
+	{"/download", []string{http.MethodGet}, true, func(e *Engine) http.HandlerFunc { return e.handleDownload }},
+	{"/probe", []string{http.MethodGet}, true, func(e *Engine) http.HandlerFunc { return e.handleProbe }},
+	{"/pause", []string{http.MethodGet}, true, func(e *Engine) http.HandlerFunc { return e.handlePause }},
+	{"/resume", []string{http.MethodGet}, true, func(e *Engine) http.HandlerFunc { return e.handleResume }},
+	{"/cancel", []string{http.MethodGet}, true, func(e *Engine) http.HandlerFunc { return e.handleCancel }},
+	{"/remove", []string{http.MethodGet}, true, func(e *Engine) http.HandlerFunc { return e.handleRemove }},
+	{"/openfolder", []string{http.MethodGet}, true, func(e *Engine) http.HandlerFunc { return e.handleOpenFolder }},
+	{"/openfile", []string{http.MethodGet}, true, func(e *Engine) http.HandlerFunc { return e.handleOpenFile }},
+	{"/config", []string{http.MethodGet, http.MethodPost}, true, func(e *Engine) http.HandlerFunc { return e.handleConfig }},
+	{"/log", []string{http.MethodGet}, true, func(*Engine) http.HandlerFunc { return handleLog }},
+	{"/svc/stop", []string{http.MethodPost}, true, func(e *Engine) http.HandlerFunc { return e.handleSvcStop }},
+}
+
+// newMux 装配全部路由。鉴权（Host / 令牌 / CORS）由 engine.go 在 mux 外层
+// 的 guard 统一完成；方法校验在这里按路由表包一层，handler 内不再各自写。
 func newMux(e *Engine) *http.ServeMux {
 	mux := http.NewServeMux()
-	mux.HandleFunc("/health", handleHealth)
-	mux.HandleFunc("/pickdir", e.handlePickDir)
-	mux.HandleFunc("/status", e.handleStatus)
-	mux.HandleFunc("/download", e.handleDownload)
-	mux.HandleFunc("/probe", e.handleProbe) // 扩展预检：服务端代拉 m3u8 文本（绕浏览器 CORS 限制）
-	mux.HandleFunc("/pause", e.handlePause)
-	mux.HandleFunc("/resume", e.handleResume)
-	mux.HandleFunc("/cancel", e.handleCancel)
-	mux.HandleFunc("/remove", e.handleRemove)
-	mux.HandleFunc("/openfolder", e.handleOpenFolder)
-	mux.HandleFunc("/openfile", e.handleOpenFile)
-	mux.HandleFunc("/config", e.handleConfig)
-	mux.HandleFunc("/log", handleLog)                 // 最近日志（排障用；受令牌保护，可能含本机路径）
-	mux.HandleFunc("/settings", e.handleSettingsPage) // 独立设置页（监控页 ⚙ 跳转进入）
-	mux.HandleFunc("/", e.handleHomePage)             // 下载监控页
-	registerSvcRoutes(mux, e)                         // /svc/stop（工具条"停止服务"按钮 / 扩展兜底）
+	for _, rd := range routeDefs {
+		mux.HandleFunc(rd.path, methodGuard(rd, rd.new(e)))
+	}
 	return mux
+}
+
+// methodGuard 校验请求方法：不在表内的方法回 405 并带 Allow 头。
+// 方法校验本身不构成防线（真正的防线是令牌），但它能挡掉 <img src>、<form>
+// 这类不需要 CORS 就发出的噪声请求，也让端点的契约明确。
+func methodGuard(rd routeDef, h http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		for _, m := range rd.methods {
+			if r.Method == m {
+				h(w, r)
+				return
+			}
+		}
+		w.Header().Set("Allow", strings.Join(rd.methods, ", "))
+		jsonError(w, http.StatusMethodNotAllowed, "method not allowed")
+	}
 }
 
 func handleHealth(w http.ResponseWriter, r *http.Request) {
@@ -40,9 +79,6 @@ func handleHealth(w http.ResponseWriter, r *http.Request) {
 // GUI 是 windowsgui 子系统、没有控制台，这份日志是排障的唯一入口；
 // 内容含本机路径，因此走令牌鉴权（不在 guard 的免鉴权白名单里）。
 func handleLog(w http.ResponseWriter, r *http.Request) {
-	if !requireMethod(w, r, http.MethodGet) {
-		return
-	}
 	tail, err := LogTail(logTailLines)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusNotFound)
@@ -54,9 +90,6 @@ func handleLog(w http.ResponseWriter, r *http.Request) {
 }
 
 func (e *Engine) handleDownload(w http.ResponseWriter, r *http.Request) {
-	if !requireMethod(w, r, http.MethodGet) {
-		return
-	}
 	q := r.URL.Query()
 	m3u8URL := q.Get("m3u8")
 	refererParam := q.Get("referer")

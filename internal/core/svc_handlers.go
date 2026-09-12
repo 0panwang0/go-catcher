@@ -1,6 +1,8 @@
-// 服务自我控制端点 /svc/*：停止服务。
-// 单进程架构里这不是进程退出——Engine.Stop 只停下载服务（任务转暂停、断点落盘、关监听），
-// GUI 外壳继续活着显示降级面板；无头 --server 模式则由 Done() 通道触发进程退出。
+// 服务自我控制端点 /svc/*：停止服务与握手信息。
+// 路由已折叠进 routeDefs（server.go），这里只保留两个 handler。
+// 单进程架构里 /svc/stop 不是进程退出——Engine.Stop 只停下载服务（任务转暂停、
+// 断点落盘、关监听），GUI 外壳继续活着显示降级面板；无头 --server 模式则由
+// Done() 通道触发进程退出。
 package core
 
 import (
@@ -8,15 +10,6 @@ import (
 	"net/http"
 	"os"
 )
-
-func registerSvcRoutes(mux *http.ServeMux, e *Engine) {
-	mux.HandleFunc("/svc/stop", func(w http.ResponseWriter, r *http.Request) {
-		handleSvcStop(w, r, e)
-	})
-	mux.HandleFunc("/svc/info", func(w http.ResponseWriter, r *http.Request) {
-		handleSvcInfo(w, r, e)
-	})
-}
 
 // svcInfoResp /svc/info 的响应体（字段名是扩展的契约，改动需同步 server-api.js）。
 type svcInfoResp struct {
@@ -35,10 +28,7 @@ type svcInfoResp struct {
 // 挡住 DNS rebinding，浏览器里只能得到一个 opaque 响应（连 body 都读不出）。
 // 本机进程倒是能读到，但本机进程本来就能直接读配置文件，不在本层防御范围内
 // （见 auth.go 文件头）。
-func handleSvcInfo(w http.ResponseWriter, r *http.Request, e *Engine) {
-	if !requireMethod(w, r, http.MethodGet) {
-		return
-	}
+func (e *Engine) handleSvcInfo(w http.ResponseWriter, r *http.Request) {
 	exe, err := os.Executable()
 	if err != nil {
 		exe = ""
@@ -47,10 +37,7 @@ func handleSvcInfo(w http.ResponseWriter, r *http.Request, e *Engine) {
 }
 
 // POST /svc/stop → 优雅停止引擎（先回一句确认再停）。
-func handleSvcStop(w http.ResponseWriter, r *http.Request, e *Engine) {
-	if !requireMethod(w, r, http.MethodPost) {
-		return
-	}
+func (e *Engine) handleSvcStop(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, struct {
 		OK       bool `json:"ok"`
 		Stopping bool `json:"stopping"`
