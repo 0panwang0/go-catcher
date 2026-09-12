@@ -57,6 +57,7 @@ func PrintUsage() {
 	fmt.Println("示例: go-catcher.exe --url=https://cdn.example.com/xxx/1080p/video.m3u8 --referer=https://example.com/watch/123 -o \"视频名.ts\"")
 	fmt.Println("可选: --limit=N 只下前 N 片试片")
 	fmt.Println("代理: --proxy=system 跟随系统代理（默认）| http://host:port 手动 | direct 直连")
+	fmt.Println("注意: CLI 不做断点续传；若输出文件旁存在 .part 半成品，会被丢弃后重下（需续传请用 GUI 客户端）")
 	fmt.Println("其它: --server [--port=端口] 无头服务模式 | 不带任何参数启动 GUI 客户端")
 }
 
@@ -131,8 +132,8 @@ func RunCLI(o CLIOptions) int {
 		fmt.Println("播放列表中没有找到任何媒体分片（响应可能被加密或压缩）")
 		return 1
 	}
-	if kerr := ensureSingleKey(pl); kerr != nil {
-		fmt.Printf("%v\n", kerr)
+	if verr := validatePlaylist(pl); verr != nil {
+		fmt.Printf("%v\n", verr)
 		return 1
 	}
 	segURLs := pl.segments
@@ -168,6 +169,10 @@ func RunCLI(o CLIOptions) int {
 		outAbs, _ = filepath.Abs(finalOut)
 		partPath = outAbs + ".part"
 		fmt.Printf("识别为 %s 容器，输出扩展名修正为 %s\n", container.ID, finalOut)
+	}
+	if resetErr := resetPartForRerun(partPath); resetErr != nil {
+		fmt.Printf("%v\n", resetErr)
+		return 1
 	}
 	if werr := writeInitSegmentFor(dlCtx, job, &pl, partPath); werr != nil {
 		fmt.Printf("%v\n", werr)
@@ -216,4 +221,55 @@ func RunCLI(o CLIOptions) int {
 
 	fmt.Printf("\n全部完成，耗时 %s\n", time.Since(start).Round(time.Second))
 	return 0
+}
+
+// resetPartForRerun CLI 的 HLS 路径不做断点续传：`<输出>.part` 一旦存在，
+// 必须丢弃后重下。
+//
+// 为什么不能直接续跑（2026-09-11 评审 P1-2）：streamWriter 以 O_APPEND 打开
+// 目标文件、startIdx 恒为 0（见 newStreamWriter），而磁盘上可能还留着上一次失败
+// 写下的几百 MB。旧代码既不截断也不推进 startIdx，新一轮内容会从文件末尾再写
+// 一遍 —— 产物是一个"视频播两遍"的合法 TS，validateOutput 的同步字节判据发现
+// 不了，用户拿到的是静默损坏、体积翻倍的文件。
+//
+// 选择"丢弃"而不是"按长度反推断点"：分片边界在字节层面不可复原（没有持久化
+// 已写分片数），猜错就是错位。清掉至少是确定的正确。
+//
+// GUI 路径无此问题：新任务经 uniquePath 拿到不冲突的文件名，不会复用旧 .part。
+func resetPartForRerun(partPath string) error {
+	info, err := os.Stat(partPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return fmt.Errorf("检查临时文件失败: %w", err)
+	}
+	if info.IsDir() {
+		return nil
+	}
+	if info.Size() > 0 {
+		fmt.Printf("检测到上次未完成的临时文件（%s，%s）——CLI 不做断点续传，已丢弃并重新下载\n",
+			partPath, humanBytes(info.Size()))
+	}
+	// 删除失败必须中止：留着旧内容继续写就是"内容写两遍"那个 bug。
+	if rmErr := os.Remove(partPath); rmErr != nil && !os.IsNotExist(rmErr) {
+		return fmt.Errorf("丢弃临时文件失败（请手动删除后重试）: %s: %w", partPath, rmErr)
+	}
+	// 分片位图是直链分片续传的元数据，与本次全新下载无关，一并清掉避免误用
+	if rmErr := os.Remove(chunkMetaPath(partPath)); rmErr != nil && !os.IsNotExist(rmErr) {
+		fmt.Printf("[warn] 清理分片位图失败 %s: %v\n", chunkMetaPath(partPath), rmErr)
+	}
+	return nil
+}
+
+// humanBytes 把字节数格式化成便于阅读的 GB/MB（仅用于提示信息）。
+func humanBytes(n int64) string {
+	switch {
+	case n >= 1<<30:
+		return fmt.Sprintf("%.2f GB", float64(n)/float64(int64(1)<<30))
+	case n >= 1<<20:
+		return fmt.Sprintf("%.1f MB", float64(n)/float64(int64(1)<<20))
+	default:
+		return fmt.Sprintf("%d KB", n/(1<<10))
+	}
 }

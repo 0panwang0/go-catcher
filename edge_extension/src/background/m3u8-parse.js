@@ -1,5 +1,8 @@
-// m3u8 / 画质解析工具（downloader.js 侧保留一份等价实现：它是页面脚本，
-// 与 SW 无法共享模块——改动两处时务必同步语义）。
+// m3u8 / 画质解析工具 —— 全项目唯一的解析实现。
+// service worker 打包时内联它；downloader 页面（ES 模块）直接 import 同一份文件，
+// 所以不存在"改一处忘另一处"。新增解析逻辑请加在这里。
+// 唯一例外是 content.js：它是经典 content script（非模块，无法 import），
+// 仍带一份等价实现，改动语义时要手动同步（并在那边注释里注明）。
 
 export function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));

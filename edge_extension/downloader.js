@@ -1,17 +1,31 @@
 // M3U8 Video Catcher - 下载器页面
-// 所有下载在扩展页面内完成（浏览器真实 TLS 指纹 + 系统代理），无需 uTLS
+//
+// 职责边界：本页只做「列列表 + 选画质 + 调服务」。
+// **实际下载一律委托给本地 Go 服务**（downloadViaServer 消息 → /download?mode=disk），
+// 因为只有它能做这些事：AES-128 解密、#EXT-X-MAP init 段写入、fMP4 的 tfdt 归一化
+// 与 mvhd 回填、落盘前的产物抽样校验、以及断点续传。
+//
+// 历史包袱：这里曾有一套自己的实现——分片 fetch 回来 Blob 原样拼接。它对加密流
+// （没有解密能力）和 fMP4（init 段不在分片列表里）必然产出打不开的文件，而日志
+// 照样打印"已保存"，是最隐蔽的一类损坏。那套实现连同它自带的 m3u8 解析已整体删除。
+//
+// 解析现在只有一份源码：src/background/m3u8-parse.js（service worker 打包时用的
+// 也是它）。本文件是 ES 模块，直接 import 同一份——不再有"改一处忘另一处"。
+// ⚠ 下面这行 import 必须保持**单行**：tests/downloader.test.js 在 node 里靠
+//   「去掉 import 行 + 前置展开 m3u8-parse.js」来加载本文件（node 无法直接 import
+//   扩展页脚本，也不值得为它改 package.json 的 type）。
+import { fetchText, parseDuration, parseSegments, parseVariants, shortQuality, qualityFromURL } from "./src/background/m3u8-parse.js";
 
-const CONCURRENCY = 8;
-const MAX_RETRIES = 3;
-const ANALYZE_LIMIT = 12;    // 最多分析的嗅探条数
-const MAIN_VIDEO_MIN = 60;   // 时长 >= 60s 判定为主视频
+const ANALYZE_LIMIT = 12; // 最多分析的嗅探条数
+const MAIN_VIDEO_MIN = 60; // 时长 >= 60s 判定为主视频
+const POLL_INTERVAL_MS = 700; // 轮询服务端任务状态的间隔
+const POLL_MAX_MISSES = 15; // 连续查不到任务多少次后放弃（≈10s，服务重启过）
 
 const $ = (sel) => document.querySelector(sel);
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-// isCandidateURL 与 background.js 同名实现保持一致（service worker 上下文
-// 隔离无法共享）：过滤路径无媒体扩展名、靠 ?url= 参数尾部伪装 .m3u8 的
-// 解析页假链接，点它下载拉回 HTML 网页任务必失败。
+// isCandidateURL 与 background 侧同名实现保持一致（两个 JS 上下文隔离，无法共享）：
+// 过滤路径无媒体扩展名、靠 ?url= 参数尾部伪装 .m3u8 的解析页假链接——点它下载
+// 拉回的是 HTML 网页，任务必然失败。
 function isCandidateURL(u) {
   try {
     const p = new URL(u);
@@ -21,25 +35,33 @@ function isCandidateURL(u) {
   }
 }
 
+// isPlaylistURL 是否是 m3u8 播放列表地址。用它把"要不要先解析档位"和"直接下 MP4
+// 直链"分开：对 MP4 直链去 fetchText 会把整个视频当文本读进内存，纯粹是浪费。
+function isPlaylistURL(u) {
+  try {
+    return /\.m3u8$/i.test(new URL(u).pathname);
+  } catch {
+    return false;
+  }
+}
+
 let running = false;
+let lastCommand = ""; // 最近一次失败时生成的终端兜底命令
 
 document.addEventListener("DOMContentLoaded", async () => {
-  // 如果是从页面选择面板跳转过来的，自动填入并下载该视频
+  // 如果是从页面选择面板跳转过来的，自动填入并下载该视频。
+  // 此时 URL 已经是用户选定的具体档位（不是 master），所以走 forcedPlaylistURL
+  // 跳过选画质那一步；TS 与 MP4 都走同一条服务端路径。
   const params = new URLSearchParams(location.search);
   const autoUrl = params.get("url");
   const autoTitle = params.get("title") || "";
   const autoPage = params.get("pageUrl") || "";
   const autoQuality = params.get("quality") || "";
-  const autoFormat = params.get("format") || "ts";
   if (autoUrl) {
     $("#manualUrl").value = autoUrl;
     $("#manualName").value = autoTitle;
     history.replaceState({}, "", location.pathname);
-    if (autoFormat === "mp4") {
-      downloadMP4(autoUrl, autoPage, autoTitle, autoQuality);
-    } else {
-      startDownload(autoUrl, autoPage, autoTitle, autoUrl, autoQuality);
-    }
+    startDownload(autoUrl, autoPage, autoTitle, autoUrl, autoQuality);
   }
 
   refreshList();
@@ -74,6 +96,20 @@ document.addEventListener("DOMContentLoaded", async () => {
     await chrome.runtime.sendMessage({ type: "clearList" });
     refreshList();
   });
+  // 兜底命令复制（服务不可用时用）
+  $("#btnCopyCmd").addEventListener("click", async () => {
+    const fb = $("#copyFeedback");
+    try {
+      await navigator.clipboard.writeText(lastCommand);
+      fb.textContent = "✓ 已复制";
+      fb.style.color = "#67c23a";
+    } catch {
+      fb.textContent = "复制失败，请手动选中命令";
+      fb.style.color = "#f56c6c";
+    }
+    fb.style.display = "inline";
+    setTimeout(() => (fb.style.display = "none"), 2000);
+  });
   // 嗅探列表变化时自动刷新（页面保持打开也能看到新视频）
   chrome.storage.onChanged.addListener((changes) => {
     if (changes.m3u8_list && !running) refreshList();
@@ -85,15 +121,15 @@ document.addEventListener("DOMContentLoaded", async () => {
 // ============================================================
 async function refreshList() {
   const { m3u8_list = [] } = await chrome.storage.local.get("m3u8_list");
-  // 自愈过滤历史误录的解析页假链接（路径无 .m3u8 扩展名、靠 ?url= 参数尾部
-  // 伪装）：点它下载拉回 HTML 网页，任务必失败
+  // 自愈过滤历史误录的解析页假链接
   const list = m3u8_list.filter(isCandidateURL);
   renderList(list);
   if (list.some((it) => !it.analyzed)) analyzeList(list);
 }
 
 async function analyzeList(list) {
-  // 注入 Referer + Origin 规则（每个 host+来源页一条）
+  // 注入 Referer + Origin 规则（每个 host+来源页一条）。必须在本页发请求——
+  // 规则是按 tabId 生效的，service worker 的请求拿不到，会被 CDN 403。
   try {
     const tab = await chrome.tabs.getCurrent();
     if (!tab) return;
@@ -231,15 +267,6 @@ function escapeHtml(s) {
   }[c]));
 }
 
-// m3u8 总时长（秒）：累加 #EXTINF
-function parseDuration(text) {
-  let total = 0;
-  for (const m of text.matchAll(/#EXTINF:([\d.]+)/g)) {
-    total += parseFloat(m[1]);
-  }
-  return total;
-}
-
 function fmtDur(sec) {
   const h = Math.floor(sec / 3600);
   const m = Math.floor((sec % 3600) / 60);
@@ -250,114 +277,64 @@ function fmtDur(sec) {
 }
 
 // ============================================================
-// 下载主流程
+// 下载主流程（本页不下载，只调服务 + 报进度）
 // ============================================================
 async function startDownload(m3u8URL, pageURL, videoName, forcedPlaylistURL = "", forcedQuality = "") {
   if (running) return;
   running = true;
   const btns = document.querySelectorAll("button");
   btns.forEach((b) => (b.disabled = true));
-
-  const logBox = $("#log");
-  logBox.style.display = "block";
-  logBox.textContent = "";
-  const log = (msg, cls) => {
-    const line = document.createElement("div");
-    if (cls) line.className = cls;
-    line.textContent = `[${new Date().toLocaleTimeString()}] ${msg}`;
-    logBox.appendChild(line);
-    logBox.scrollTop = logBox.scrollHeight;
-  };
+  hideFallback();
+  const log = openLog();
 
   try {
-    // 1. 注入 Referer + Origin 规则（扩展页 fetch 的 Origin 头会导致 CDN 403）
-    const tab = await chrome.tabs.getCurrent();
-    let host = "";
-    try { host = new URL(m3u8URL).hostname; } catch {}
-    if (tab && host) {
-      await chrome.runtime.sendMessage({
-        type: "setReferers",
-        tabId: tab.id,
-        pairs: [{ host, referer: pageURL || "" }],
-      });
-    }
-    log(`已伪装 Referer/Origin: ${pageURL || "（无来源页，未伪装）"}`);
-
-    // 2. 获取 m3u8；若是 master playlist 且未指定子播放列表，则解析画质让用户选
+    // 1. 定下要下载的播放列表。
+    //    forcedPlaylistURL 有值 = 调用方已指定具体档位，直接用；否则若还是 master
+    //    playlist，先让用户选一档。这一步是**可选增强**，CDN 拒绝/网络不通都只降级
+    //    为"不选档位"，照样把原 URL 交给服务端（它会自己取最高码率）。
     let playlistURL = forcedPlaylistURL || m3u8URL;
-    let qualityShort = forcedQuality || qualityFromURL(m3u8URL);
-    let text = await fetchText(playlistURL);
-    if (!forcedPlaylistURL && text.includes("#EXT-X-STREAM-INF")) {
-      const variants = parseVariants(text, playlistURL);
-      log(`Master playlist，检测到 ${variants.length} 个画质档位`);
-      const choice = await pickQuality(variants);
-      if (!choice) {
-        log("已取消");
-        return;
-      }
-      playlistURL = choice.url;
-      qualityShort = shortQuality(choice);
-      log(`已选择画质: ${choice.label}`);
-      text = await fetchText(playlistURL);
-    }
-
-    // 3. 解析分片（接受任意扩展名，兼容 .jpeg 伪装分片）
-    // 先拦截加密流：本页的下载在浏览器侧合并分片，**没有解密能力**（不处理
-    // #EXT-X-KEY）。对加密流硬下只会产出无法播放的密文文件，且会报"已保存"——
-    // 这正是最隐蔽的一类损坏。这里明确拒绝，引导到有解密与产物校验的 Go 侧。
-    const keyMethod = playlistKeyMethod(text);
-    if (keyMethod) {
-      throw new Error(
-        `该视频使用 ${keyMethod} 加密，浏览器内下载不支持解密（会产出无法播放的文件）。` +
-          `请改用网页上的悬停下载按钮（由本地 Go 服务完成），或使用下方「复制命令到终端」兜底。`
-      );
-    }
-    const segments = parseSegments(text, playlistURL);
-    if (!segments.length) throw new Error("未解析到任何分片");
-    log(`解析到 ${segments.length} 个分片`);
-
-    // 4. 并发下载
-    const parts = new Array(segments.length);
-    let done = 0;
-    let bytes = 0;
-    const t0 = performance.now();
-    showProgress(0, segments.length, 0, 0);
-
-    let aborted = false;
-    let firstErr = null;
-    let cursor = 0;
-
-    const worker = async () => {
-      while (!aborted && cursor < segments.length) {
-        const i = cursor++;
-        try {
-          const buf = await fetchSegment(segments[i]);
-          parts[i] = buf;
-          done++;
-          bytes += buf.byteLength;
-        } catch (e) {
-          if (!firstErr) firstErr = `[${i}] ${e.message}`;
-          aborted = true;
+    let quality = forcedQuality || qualityFromURL(m3u8URL);
+    if (!forcedPlaylistURL && isPlaylistURL(m3u8URL)) {
+      await injectReferer(m3u8URL, pageURL);
+      const variants = await fetchMasterVariants(m3u8URL);
+      if (variants && variants.length) {
+        log(`Master playlist，检测到 ${variants.length} 个画质档位`);
+        const choice = await pickQuality(variants);
+        if (!choice) {
+          log("已取消");
           return;
         }
-        const secs = (performance.now() - t0) / 1000;
-        showProgress(done, segments.length, bytes, secs);
+        playlistURL = choice.url;
+        quality = shortQuality(choice);
+        log(`已选择画质: ${choice.label}`);
       }
-    };
-    await Promise.all(Array.from({ length: CONCURRENCY }, worker));
-    if (firstErr) throw new Error(`分片下载失败: ${firstErr}`);
+    }
 
-    // 5. 合并保存
-    log("下载完成，正在合并…");
-    const blob = new Blob(parts, { type: "video/mp2t" });
-    const filename = makeFilename(playlistURL, videoName, qualityShort, "ts");
-    saveBlob(blob, filename);
-    const secs = (performance.now() - t0) / 1000;
-    log(`已保存 ${filename}（${(bytes / 1024 / 1024).toFixed(1)} MB，耗时 ${secs.toFixed(0)}s）`, "ok");
-    log("提示：如果浏览器没有弹出保存框，请检查本页面右上角是否被拦截了多个文件下载", "ok");
+    // 2. 交给本地服务下载：解密 / init 段 / 产物校验都在那边做。
+    //    扩展名给 .ts 即可——服务端会按实际探测到的容器改名（TS 保持 .ts，fMP4 改 .mp4）。
+    const filename = makeFilename(playlistURL, videoName, quality);
+    log(`交给本地服务下载：${filename}`);
+    const resp = await chrome.runtime.sendMessage({
+      type: "downloadViaServer",
+      m3u8Url: playlistURL,
+      referer: pageURL || "",
+      title: videoName || "",
+      filename,
+    });
+    if (!resp) throw new Error("扩展后台未响应");
+    if (!resp.ok) {
+      if (resp.code === "USER_CANCEL") {
+        log("已取消文件夹选择");
+        return;
+      }
+      throw new Error(resp.error || "下载启动失败");
+    }
+    log(`已开始落盘（目录 ${resp.dir || "?"}）`);
+    await pollTask(resp.taskId, log);
   } catch (e) {
     log(`失败: ${e.message}`, "err");
-    log("若持续 403/失败，请确认：1) Clash 已开启系统代理（Edge 跟随系统代理）；2) 下载的是主视频而非预览片", "err");
+    log("若本地服务未启动，请先打开 go-catcher.exe；也可用下方「复制命令」在终端直接下载。", "err");
+    await offerFallback(m3u8URL, pageURL, videoName);
     console.error(e);
   } finally {
     running = false;
@@ -366,110 +343,75 @@ async function startDownload(m3u8URL, pageURL, videoName, forcedPlaylistURL = ""
   }
 }
 
-// ============================================================
-// m3u8 解析
-// ============================================================
-async function fetchText(url) {
-  let lastErr;
-  for (let a = 1; a <= MAX_RETRIES; a++) {
-    try {
-      const resp = await fetch(url, { credentials: "omit" });
-      if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
-      return await resp.text();
-    } catch (e) {
-      lastErr = e;
-      await sleep(500 * a);
-    }
-  }
-  throw new Error(`获取 m3u8 失败: ${lastErr.message}`);
+// injectReferer 按 host 注入来源页的 Referer/Origin。
+// 扩展页直接 fetch 会带 chrome-extension:// 的 Origin，CDN 视为非页面请求而 403。
+async function injectReferer(url, referer) {
+  if (!referer) return;
+  let host = "";
+  try { host = new URL(url).hostname; } catch { return; }
+  const tab = await chrome.tabs.getCurrent();
+  if (!tab) return;
+  await chrome.runtime.sendMessage({ type: "setReferers", tabId: tab.id, pairs: [{ host, referer }] });
 }
 
-// master playlist：解析全部画质档位（对应 IDM 的画质识别原理）
-// 每行 #EXT-X-STREAM-INF:BANDWIDTH=...,RESOLUTION=... 后跟子播放列表 URL
-function parseVariants(text, baseURL) {
-  const lines = text.split("\n");
-  const list = [];
-  for (let i = 0; i < lines.length; i++) {
-    if (!lines[i].startsWith("#EXT-X-STREAM-INF")) continue;
-    const info = lines[i];
-    const next = (lines[i + 1] || "").trim();
-    if (!next || next.startsWith("#")) continue;
-    const bw = parseInt((info.match(/BANDWIDTH=(\d+)/) || [])[1] || "0", 10);
-    const res = (info.match(/RESOLUTION=(\d+x\d+)/) || [])[1] || "";
-    list.push({
-      url: new URL(next, baseURL).href,
-      bandwidth: bw,
-      resolution: res,
-      label: variantLabel(res, bw, next),
-    });
-  }
-  // 按码率从高到低排序
-  list.sort((a, b) => b.bandwidth - a.bandwidth);
-  if (!list.length) throw new Error("master playlist 中未找到子播放列表");
-  return list;
-}
-
-// 生成画质标签，如 "1080P · 1920x1080 · 4.5 Mbps"
-function variantLabel(resolution, bandwidth, uri) {
-  let q = "";
-  const m = String(uri).match(/(2160p|1440p|1080p|720p|480p|360p|240p)/i);
-  if (m) {
-    q = m[1].toUpperCase();
-  } else if (resolution) {
-    const h = parseInt(resolution.split("x")[1], 10);
-    q = { 2160: "4K", 1440: "2K", 1080: "1080P", 720: "720P", 480: "480P", 360: "360P", 240: "240P" }[h] || resolution;
-  } else if (bandwidth) {
-    q = (bandwidth / 1e6).toFixed(1) + " Mbps";
-  }
-  const parts = [q || "未知画质"];
-  if (resolution) parts.push(resolution);
-  if (bandwidth) parts.push((bandwidth / 1e6).toFixed(1) + " Mbps");
-  return parts.join(" · ");
-}
-
-function shortQuality(variant) {
-  return String(variant.label || "").split(" · ")[0] || "";
-}
-
-// 从 URL 中提取画质标识（用于嗅探列表角标，如 /1080p/video.m3u8 → 1080P）
-function qualityFromURL(u) {
+// fetchMasterVariants 拉一份 master playlist 并解析出全部档位。
+// 失败一律返回 null 而不抛：拿不到档位不该让整个下载失败——服务端自己会选最高码率。
+async function fetchMasterVariants(m3u8URL) {
   try {
-    const m = decodeURIComponent(new URL(u).pathname).match(/(2160p|1440p|1080p|720p|480p|360p|240p)/i);
-    if (m) return m[1].toUpperCase();
-    const q = new URL(u).searchParams.get("quality");
-    if (q) return q;
-  } catch {}
-  return "";
-}
-
-// 媒体播放列表：所有非注释行都是分片（兼容 .ts / .jpeg / .m4s 伪装）
-function parseSegments(text, baseURL) {
-  const list = [];
-  for (const raw of text.split("\n")) {
-    const line = raw.trim();
-    if (!line || line.startsWith("#")) continue;
-    list.push(new URL(line, baseURL).href);
+    const text = await fetchText(m3u8URL);
+    if (!text.includes("#EXT-X-STREAM-INF")) return null;
+    return parseVariants(text, m3u8URL);
+  } catch (e) {
+    console.warn("解析 master playlist 失败，交给服务端自选码率:", e);
+    return null;
   }
-  return list;
 }
 
-// playlistKeyMethod 返回播放列表声明的加密方式（#EXT-X-KEY:METHOD=…），
-// 明文（无 KEY 行，或 METHOD=NONE）返回空串。
-// 后一条 KEY 行覆盖前一条，与 m3u8 语义一致；用于在本页下载前拦下加密流。
-function playlistKeyMethod(text) {
-  const keyRe = /#EXT-X-KEY:[^\n]*/gi;
-  let method = "";
-  let line;
-  while ((line = keyRe.exec(text)) !== null) {
-    const m = /METHOD\s*=\s*([A-Za-z0-9-]+)/i.exec(line[0]);
-    if (!m) continue;
-    const v = m[1].toUpperCase();
-    method = v === "NONE" ? "" : v;
+// pollTask 轮询服务端任务状态直到收尾。
+// 连续查不到任务（服务重启过 / 任务被清理）会放弃，而不是无限轮询。
+async function pollTask(taskId, log) {
+  let lastStage = "";
+  let misses = 0;
+  for (;;) {
+    await new Promise((r) => setTimeout(r, POLL_INTERVAL_MS));
+    let st = null;
+    try {
+      st = await chrome.runtime.sendMessage({ type: "queryDownload", taskId });
+    } catch { /* SW 正在唤醒或短暂不可达，下一轮再看 */ }
+    if (!st || !st.exists) {
+      if (++misses > POLL_MAX_MISSES) {
+        throw new Error("任务状态丢失（本地服务可能已重启）");
+      }
+      continue;
+    }
+    misses = 0;
+    const stage = st.stage || "下载中";
+    if (stage !== lastStage) {
+      lastStage = stage;
+      log(stage);
+    }
+    if (st.state === "inProgress" || st.state === "paused") {
+      // pct 是 0-100 的整数；total 为 0（还没解析出分片数）时按 0% 显示
+      const pct = typeof st.pct === "number" ? st.pct : 0;
+      showProgress(st.state === "paused" ? "" : pct, stage);
+      continue;
+    }
+    if (st.state === "complete") {
+      showProgress(100, "已完成");
+      log(`已保存 ${st.finalPath || st.filename || ""}`, "ok");
+      return;
+    }
+    if (st.state === "canceled") {
+      log("已取消", "err");
+      return;
+    }
+    throw new Error(st.error || "下载失败");
   }
-  return method;
 }
 
-// 画质选择器：等用户点选后 resolve 选中的档位（取消则 resolve null）
+// ============================================================
+// 画质选择器（唯一需要解析播放列表的场景）
+// ============================================================
 function pickQuality(variants) {
   return new Promise((resolve) => {
     const box = $("#qualityPicker");
@@ -497,42 +439,77 @@ function pickQuality(variants) {
 }
 
 // ============================================================
-// 分片下载（带重试）
+// 进度与日志
 // ============================================================
-async function fetchSegment(url) {
-  let lastErr;
-  for (let a = 1; a <= MAX_RETRIES; a++) {
-    try {
-      const resp = await fetch(url, { credentials: "omit" });
-      if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
-      return await resp.arrayBuffer();
-    } catch (e) {
-      lastErr = e;
-      await sleep(500 * a);
-    }
-  }
-  throw new Error(`${url.split("/").pop()} ${lastErr.message}`);
+function openLog() {
+  const box = $("#log");
+  box.style.display = "block";
+  box.textContent = "";
+  return (msg, cls) => {
+    const line = document.createElement("div");
+    if (cls) line.className = cls;
+    line.textContent = `[${new Date().toLocaleTimeString()}] ${msg}`;
+    box.appendChild(line);
+    box.scrollTop = box.scrollHeight;
+  };
 }
 
-// ============================================================
-// 工具
-// ============================================================
-function showProgress(done, total, bytes, secs) {
+// showProgress 画进度条。pct 传空串表示"进度未知"（如暂停），只更新阶段文字。
+function showProgress(pct, stage) {
   $("#progressBox").style.display = "block";
-  const pct = total ? Math.round((done / total) * 100) : 0;
-  $("#progressFill").style.width = pct + "%";
-  const mb = (bytes / 1024 / 1024).toFixed(1);
-  const speed = secs > 0.5 ? (bytes / 1024 / 1024 / secs).toFixed(1) : "--";
-  $("#progressText").textContent =
-    `下载进度: ${done} / ${total}（${pct}%）· ${mb} MB · ${speed} MB/s`;
+  if (pct !== "" && pct != null) {
+    $("#progressFill").style.width = Math.max(0, Math.min(100, pct)) + "%";
+  }
+  $("#progressText").textContent = stage || "";
 }
 
-// 文件名：优先 "视频名称_画质.扩展名"
-// 默认 ts：HLS 原始流直接落盘（Go 侧不做封装），PotPlayer/VLC 可正常播放
+// ============================================================
+// 服务不可用时的兜底：把 CLI 直下命令交给用户复制
+// ============================================================
+// 生成跨 PowerShell / Git Bash / cmd 都能直接粘贴运行的命令。
+// 与 content.js 的 buildGoCommand 同一形态（那跑在页面世界，无法共享模块）：
+// 用 ; 作语句分隔符（PowerShell 5.1 不支持 &&），路径加双引号（bash 会按空白切片）。
+function buildGoCommand(m3u8URL, pageURL, videoName, exePath) {
+  const args = [`"${exePath || "go-catcher.exe"}"`];
+  if (m3u8URL) args.push(`--url="${m3u8URL}"`);
+  if (pageURL) args.push(`--referer="${pageURL}"`);
+  const outName = makeFilename(m3u8URL, videoName, qualityFromURL(m3u8URL));
+  if (outName) args.push(`-o "${outName}"`);
+  return ["chcp 65001", args.join(" ")].join(" ; ");
+}
+
+// exe 路径优先级：设置里显式填的（等于默认值 go-catcher.exe 视为未填）→
+// 服务自报的路径（refreshSvcStatus 顺带缓存）→ 裸文件名（依赖 PATH）。
+async function getExePath() {
+  const s = await chrome.storage.local.get({ exePath: "", detectedExePath: "" });
+  const custom = String(s.exePath || "").trim();
+  if (custom && custom !== "go-catcher.exe") return custom;
+  return s.detectedExePath || "go-catcher.exe";
+}
+
+async function offerFallback(m3u8URL, pageURL, videoName) {
+  lastCommand = buildGoCommand(m3u8URL, pageURL, videoName, await getExePath());
+  const box = $("#fallback");
+  if (!box) return;
+  $("#fallbackCmd").textContent = lastCommand;
+  box.style.display = "flex";
+}
+
+function hideFallback() {
+  const box = $("#fallback");
+  if (box) box.style.display = "none";
+}
+
+// ============================================================
+// 文件名
+// ============================================================
+// makeFilename 优先 "视频名称_画质.扩展名"，拿不到名称就退回 URL 路径段。
+// 扩展名只是个初值——服务端会按实际探测到的容器改名（fMP4 → .mp4），
+// 所以这里不必也不能猜容器。
 function makeFilename(m3u8URL, videoName, quality, ext = "ts") {
   const suffix = quality ? `_${quality}` : "";
   if (videoName) {
-    let clean = videoName
+    const clean = videoName
       .replace(/[\\/:*?"<>|]/g, "_")
       .replace(/\s+/g, " ")
       .trim()
@@ -554,70 +531,9 @@ function makeFilename(m3u8URL, videoName, quality, ext = "ts") {
   return `video_${Date.now()}${suffix}.${ext}`;
 }
 
-// MP4 直链下载
-async function downloadMP4(url, pageURL, videoName, quality) {
-  if (running) return;
-  running = true;
-  const btns = document.querySelectorAll("button");
-  btns.forEach((b) => (b.disabled = true));
-
-  const logBox = $("#log");
-  logBox.style.display = "block";
-  logBox.textContent = "";
-  const log = (msg, cls) => {
-    const line = document.createElement("div");
-    if (cls) line.className = cls;
-    line.textContent = `[${new Date().toLocaleTimeString()}] ${msg}`;
-    logBox.appendChild(line);
-    logBox.scrollTop = logBox.scrollHeight;
-  };
-
-  try {
-    const tab = await chrome.tabs.getCurrent();
-    let host = "";
-    try { host = new URL(url).hostname; } catch {}
-    if (tab && host) {
-      await chrome.runtime.sendMessage({
-        type: "setReferers",
-        tabId: tab.id,
-        pairs: [{ host, referer: pageURL || "" }],
-      });
-    }
-    log(`已伪装 Referer/Origin: ${pageURL || "（无来源页，未伪装）"}`);
-    log(`开始下载 MP4: ${url}`);
-
-    const resp = await fetch(url, { credentials: "omit" });
-    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
-
-    const len = resp.headers.get("content-length");
-    const totalMB = len ? (parseInt(len, 10) / 1024 / 1024).toFixed(1) : "?";
-    log(`MP4 大小约 ${totalMB} MB`);
-
-    const blob = await resp.blob();
-    const filename = makeFilename(url, videoName, quality, "mp4");
-    saveBlob(blob, filename);
-    log(`已保存 ${filename}（${(blob.size / 1024 / 1024).toFixed(1)} MB）`, "ok");
-  } catch (e) {
-    log(`失败: ${e.message}`, "err");
-  } finally {
-    running = false;
-    btns.forEach((b) => (b.disabled = false));
-  }
-}
-
-function saveBlob(blob, filename) {
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement("a");
-  a.href = url;
-  a.download = filename;
-  document.body.appendChild(a);
-  a.click();
-  a.remove();
-  // 释放 blob URL（留足保存时间）
-  setTimeout(() => URL.revokeObjectURL(url), 10 * 60 * 1000);
-}
-
-// 设置卡片顶部的服务状态指示：按当前配置端口 ping /health
+// ============================================================
+// 设置卡片顶部的服务状态指示
+// ============================================================
 async function refreshSvcStatus() {
   const el = $("#svcStatus");
   if (!el) return;
@@ -648,3 +564,21 @@ async function detectExePath(port) {
     if (info && info.exe) await chrome.storage.local.set({ detectedExePath: info.exe });
   } catch {}
 }
+
+// ============================================================
+// 测试导出面
+// node tests 通过「去掉 import 行 + 前置展开 m3u8-parse.js + new Function」加载
+// 本文件后取这里的 __test__。真实浏览器里模块作用域不外泄，无副作用。
+// ============================================================
+export const __test__ = {
+  isCandidateURL,
+  isPlaylistURL,
+  makeFilename,
+  buildGoCommand,
+  // 转出共享模块的函数，让测试能断言 import 真的接上了（不是各留一份拷贝）
+  parseDuration,
+  parseSegments,
+  parseVariants,
+  shortQuality,
+  qualityFromURL,
+};

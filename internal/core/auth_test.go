@@ -112,16 +112,50 @@ func TestGuardRejectsForeignHost(t *testing.T) {
 
 // TestGuardCORSOnlyWithToken 未通过令牌校验的响应绝不能带 CORS 头，
 // 否则网页能读到响应体，令牌形同虚设。
+//
+// 必须枚举全部路径，不能只挑一个代表：这条不变量第一次被漏掉，正是因为
+// 只采样了 /status——一个"恰好行为正确"的路径，而真正出事的是 /svc/info
+// 这类免令牌端点，它们的响应体里就有令牌。
 func TestGuardCORSOnlyWithToken(t *testing.T) {
 	setTestToken(t, "secret-token")
+	evil := map[string]string{"Origin": "https://evil.example"}
 
-	w := guardedDo(t, "GET", "/status", "127.0.0.1:7891", map[string]string{"Origin": "https://evil.example"})
-	if got := w.Header().Get("Access-Control-Allow-Origin"); got != "" {
-		t.Fatalf("未授权响应不应带 CORS 头，得到 %q", got)
+	// 需要令牌的路径：401，且不带 CORS 头
+	for _, p := range []string{"/status", "/config", "/log", "/download", "/probe", "/svc/stop"} {
+		w := guardedDo(t, "GET", p, "127.0.0.1:7891", evil)
+		if w.Code != http.StatusUnauthorized {
+			t.Errorf("%s 无令牌应 401，得到 %d", p, w.Code)
+		}
+		if got := w.Header().Get("Access-Control-Allow-Origin"); got != "" {
+			t.Errorf("%s（未授权）不应带 CORS 头，得到 %q", p, got)
+		}
 	}
-	w = guardedDo(t, "GET", "/status?t=secret-token", "127.0.0.1:7891", map[string]string{"Origin": "https://page.example"})
+
+	// 免令牌路径：放行，但绝不能带 CORS 头——它们是"不含秘密"才被豁免的，
+	// 而 /svc/info 的响应体里就有令牌、/ 与 /settings 的 HTML 里注入了令牌。
+	for _, p := range []string{"/health", "/svc/info", "/", "/settings"} {
+		if !isTokenFreePath(p) {
+			t.Fatalf("%s 不在免令牌清单里，本用例已失效", p)
+		}
+		w := guardedDo(t, "GET", p, "127.0.0.1:7891", evil)
+		if w.Code != http.StatusOK {
+			t.Errorf("%s 应免令牌放行，得到 %d", p, w.Code)
+		}
+		if got := w.Header().Get("Access-Control-Allow-Origin"); got != "" {
+			t.Errorf("%s（免令牌）绝不能带 CORS 头，否则响应体里的令牌会被任意网页读走；得到 %q", p, got)
+		}
+	}
+
+	// 带对令牌：必须带 CORS 头，否则扩展的 content script 读不到响应体
+	w := guardedDo(t, "GET", "/status?t=secret-token", "127.0.0.1:7891", map[string]string{"Origin": "https://page.example"})
 	if got := w.Header().Get("Access-Control-Allow-Origin"); got != "*" {
 		t.Fatalf("授权响应应带 CORS 头，得到 %q", got)
+	}
+	// 免令牌路径带上正确令牌时同样可以拿到 CORS 头（扩展靠 /svc/info?t= 兜底重握手），
+	// 这不再是泄露——令牌本身就是通行证。
+	w = guardedDo(t, "GET", "/svc/info?t=secret-token", "127.0.0.1:7891", evil)
+	if got := w.Header().Get("Access-Control-Allow-Origin"); got != "*" {
+		t.Fatalf("带令牌的 /svc/info 应带 CORS 头，得到 %q", got)
 	}
 }
 

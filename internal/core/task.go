@@ -63,27 +63,45 @@ type taskEntry struct {
 	rt     *Runtime
 	mu     sync.Mutex
 	st     taskState          // 对外状态快照（受 mu 保护）
-	job    *dlJob             // 任务上下文（运行时 segDone/segTot 原子值直接读）
+	job    *dlJob             // 任务上下文（运行时 segDone/segTot 原子值直接读）；指针本身必须经 jobRef 在 mu 内取
 	cancel context.CancelFunc // 中断下载（暂停/取消共用，靠 intent 区分后续处理）
 	intent int                // intentNone / intentPause / intentCancel
 }
 
 // saveDirMu / defaultSaveDir / tasksMu / tasks / seqID 均为 Runtime 字段（见 runtime.go）。
 
+// jobRef 取当前任务上下文（持 te.mu）。
+//
+// te.job 由 pipeline 在启动时写入，写点是持锁的；而 /status 每 900ms 轮询一次
+// snapshot、后台还会周期性 collectPersisted，它们都在另一个 goroutine 里。
+// 指针字段本身也必须走锁——裸读是一个真实的 data race（`-race` 在没有
+// "边跑边读状态"的用例时抓不到，不代表安全）。
+//
+// 拿到返回值后可以安全使用：dlJob 的进度计数是 atomic/自带锁的，
+// 这里保护的只是"指针有没有被换掉"。
+func (te *taskEntry) jobRef() *dlJob {
+	te.mu.Lock()
+	defer te.mu.Unlock()
+	return te.job
+}
+
 // snapshot 返回某任务当前对外状态（segDone 实时从 job 原子取，stage/error 从缓存取）
 
 func snapshot(te *taskEntry) taskState {
 	te.mu.Lock()
 	s := te.st
+	job := te.job
 	te.mu.Unlock()
-	if te.job != nil {
-		s.segDone = te.job.segNow()
-		s.segTot = te.job.segTotal()
+	if job != nil {
+		s.segDone = job.segNow()
+		s.segTot = job.segTotal()
 	}
 	// openPath：当前真实可打开的文件。done 用成品；paused/失败 用 .part 半成品（失败保留 .part 供重试）；其余空。
+	// .part 要求非空：uniquePath 会为刚创建的任务留下一个 0 字节占位（认领文件名），
+	// 那不是"可打开的半成品"。
 	if s.done && s.finalPath != "" && fileExists(s.finalPath) {
 		s.openPath = s.finalPath
-	} else if s.finalPath != "" && fileExists(s.finalPath+".part") {
+	} else if s.finalPath != "" && nonEmptyFile(s.finalPath+".part") {
 		s.openPath = s.finalPath + ".part"
 	} else {
 		s.openPath = ""
@@ -99,6 +117,16 @@ func fileExists(p string) bool {
 	}
 	fi, err := os.Stat(p)
 	return err == nil && !fi.IsDir()
+}
+
+// nonEmptyFile 报告路径是存在且非空的文件。用来区分"真正下到一半的半成品"
+// 与 uniquePath 留下的 0 字节占位（任务还在排队，没有任何可打开的内容）。
+func nonEmptyFile(p string) bool {
+	if p == "" {
+		return false
+	}
+	fi, err := os.Stat(p)
+	return err == nil && !fi.IsDir() && fi.Size() > 0
 }
 
 // failTask 标记任务失败结束（保留 .part 与文件元信息，供"重试"断点续传）。

@@ -40,8 +40,7 @@ func handleHealth(w http.ResponseWriter, r *http.Request) {
 // GUI 是 windowsgui 子系统、没有控制台，这份日志是排障的唯一入口；
 // 内容含本机路径，因此走令牌鉴权（不在 guard 的免鉴权白名单里）。
 func handleLog(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	if !requireMethod(w, r, http.MethodGet) {
 		return
 	}
 	tail, err := LogTail(logTailLines)
@@ -55,8 +54,7 @@ func handleLog(w http.ResponseWriter, r *http.Request) {
 }
 
 func (e *Engine) handleDownload(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	if !requireMethod(w, r, http.MethodGet) {
 		return
 	}
 	q := r.URL.Query()
@@ -91,14 +89,17 @@ func (e *Engine) handleDownload(w http.ResponseWriter, r *http.Request) {
 	// dir 必须在「用户选过的目录」白名单内：否则配合攻击者可控的 m3u8，
 	// 这就是一个「往任意绝对路径写文件」的原语（写进启动目录 = 持久化代码执行）。
 	if !e.rt.isAllowedSaveDir(saveDir) {
-		http.Error(w, `{"error":"dir 不在允许的下载目录内，请先通过 /pickdir 选择目录"}`, http.StatusBadRequest)
+		jsonError(w, http.StatusBadRequest, "dir 不在允许的下载目录内，请先通过 /pickdir 选择目录")
 		return
 	}
 	fname := sanitizeFilename(filename)
-	// 拒绝可执行类扩展名：本服务把内容原样落盘，允许写 .exe/.bat/.ps1 就等于
+	// 扩展名白名单（P2-10）：本服务把内容原样落盘，允许写可执行类扩展名就等于
 	// 提供了一个"落盘可执行文件"的原语——与 /openfile 组合即为本机代码执行。
-	if e2 := filepath.Ext(fname); isExecutableExt(e2) {
-		http.Error(w, `{"error":"拒绝可执行文件扩展名"}`, http.StatusBadRequest)
+	// 黑名单列不完（.pif/.msc/.inf/.settingcontent-ms…），故改为白名单，
+	// 只放行本服务确实会产出的媒体/字幕类型（见 allowedDownloadExts）。
+	if ext := filepath.Ext(fname); ext != "" && !isAllowedDownloadExt(ext) {
+		jsonError(w, http.StatusBadRequest,
+			"不支持的输出扩展名（仅允许视频/音频/字幕类型）: "+ext)
 		return
 	}
 	// 不强改扩展名：调用方给什么就用什么；完全没扩展名的（TS 原始流）补 .ts
@@ -112,8 +113,14 @@ func (e *Engine) handleDownload(w http.ResponseWriter, r *http.Request) {
 
 	id := e.rt.newTaskID()
 	// 目标路径在任务创建时就定死（.part 与正式文件都基于它），
-	// 这样暂停/重启恢复后仍写回同一个文件，不会冒出 "xxx (1).mp4"
-	finalPath := uniquePath(filepath.Join(saveDir, fname))
+	// 这样暂停/重启恢复后仍写回同一个文件，不会冒出 "xxx (1).mp4"。
+	// uniquePath 会原子认领该路径（创建 0 字节 .part 占位），因此并发同名
+	// 请求拿到的一定是不同的文件名（P2-8）。
+	finalPath, err := uniquePath(filepath.Join(saveDir, fname))
+	if err != nil {
+		jsonError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
 	// 去重后可能与请求名不一致（同名已存在 -> "xxx (1).mp4"）。
 	// 用真实落盘名回填 filename，让任务卡片显示与实际文件一致，多次下载也能区分。
 	displayName := filepath.Base(finalPath)
@@ -134,9 +141,15 @@ func (e *Engine) handleDownload(w http.ResponseWriter, r *http.Request) {
 	// 启动 goroutine：先排队等并发槽，拿到后真正跑 pipeline
 	go runDiskPipeline(te)
 
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusAccepted)
-	fmt.Fprintf(w, `{"started":true,"id":%q,"dir":%q,"filename":%q}`, id, saveDir, fname)
+	// 统一走 writeJSON：%q 是 strconv.Quote，对控制字符会产出 \x01 这类
+	// JSON 非法转义（见 handlers.go 顶部说明）。saveDir/fname 来自调用方，
+	// 不保证不含控制字符。
+	writeJSON(w, http.StatusAccepted, struct {
+		Started  bool   `json:"started"`
+		ID       string `json:"id"`
+		Dir      string `json:"dir"`
+		Filename string `json:"filename"`
+	}{true, id, saveDir, fname})
 }
 
 // runDiskPipeline 跑单个下载任务：排队 → 解析 → 流式下载（边下边写）→ 落盘。

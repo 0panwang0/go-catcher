@@ -66,16 +66,24 @@ func TestClipFilenameForDir(t *testing.T) {
 	}
 }
 
-// TestIsExecutableExt 落盘前拒绝可执行扩展名（与 /openfile 组合即代码执行）。
-func TestIsExecutableExt(t *testing.T) {
-	for _, e := range []string{".exe", ".BAT", ".ps1", ".lnk", ".scr"} {
-		if !isExecutableExt(e) {
-			t.Errorf("%s 应被判定为可执行", e)
+// TestIsAllowedDownloadExt 落盘前只放行白名单内的扩展名（可执行扩展名与 /openfile
+// 组合即是本机代码执行；黑名单列不完，所以反过来列白名单）。
+func TestIsAllowedDownloadExt(t *testing.T) {
+	// 白名单：本服务会产出的媒体/字幕类型，含容器修正后的结果（.mp4 等）
+	for _, e := range []string{".ts", ".mp4", ".mkv", ".webm", ".m4s", ".AAC", ".srt", ".vtt"} {
+		if !isAllowedDownloadExt(e) {
+			t.Errorf("%s 应被放行", e)
 		}
 	}
-	for _, e := range []string{".mp4", ".ts", ".m3u8", ""} {
-		if isExecutableExt(e) {
-			t.Errorf("%s 不应被判定为可执行", e)
+	// 可执行类一律拒绝；空扩展名由调用方单独处理（补 .ts），这里也必须为 false
+	for _, e := range []string{
+		".exe", ".BAT", ".ps1", ".lnk", ".scr", ".msi", ".dll", ".sys", ".js",
+		// 黑名单容易漏掉的这几类，白名单天然覆盖
+		".pif", ".msc", ".inf", ".settingcontent-ms", ".search-ms", ".diagcab", ".url", ".reg",
+		"", ".txt",
+	} {
+		if isAllowedDownloadExt(e) {
+			t.Errorf("%s 不应被放行", e)
 		}
 	}
 }

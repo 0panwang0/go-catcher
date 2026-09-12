@@ -107,8 +107,8 @@ func (r *Runtime) collectPersisted() []persistedTask {
 		// 断点必须用"已确认落盘"的计数，不能用界面上那个（R9）：segDone 反映的是
 		// "已写进缓冲区"，可能领先磁盘若干 MB，拿它当续传起点会在文件中间留空洞。
 		segDone := s.segDone
-		if te.job != nil {
-			segDone = te.job.segFlushedNow()
+		if job := te.jobRef(); job != nil {
+			segDone = job.segFlushedNow()
 		}
 		pt := persistedTask{
 			ID: s.id, Filename: s.filename, SaveDir: s.saveDir,

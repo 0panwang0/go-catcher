@@ -34,6 +34,22 @@ func jsonError(w http.ResponseWriter, status int, msg string) {
 	}{msg})
 }
 
+// requireMethod 校验请求方法，不匹配则回 405 并返回 false。
+//
+// 为什么写操作端点也要校验：跨源"简单请求"只限 GET/POST/HEAD，一个 GET 就能
+// 触发暂停/取消/移除。校验方法本身不构成防线（真正的防线是令牌），但它能挡掉
+// <img src>、<form> 这类不需要 CORS 就发出的噪声请求，也让端点的契约明确。
+func requireMethod(w http.ResponseWriter, r *http.Request, methods ...string) bool {
+	for _, m := range methods {
+		if r.Method == m {
+			return true
+		}
+	}
+	w.Header().Set("Allow", strings.Join(methods, ", "))
+	jsonError(w, http.StatusMethodNotAllowed, "method not allowed")
+	return false
+}
+
 // actionResp 是控制/打开类端点的统一响应体。未涉及的字段用 omitempty 省略，
 // 与改造前各个格式串产出的 JSON 形状保持一致（前端只做真值判断）。
 type actionResp struct {
@@ -58,6 +74,9 @@ func (r *Runtime) findTask(id string) *taskEntry {
 // handlePause 暂停任务：cancel 掉下载 ctx，pipeline 会把断点存下来
 
 func (e *Engine) handlePause(w http.ResponseWriter, r *http.Request) {
+	if !requireMethod(w, r, http.MethodGet) {
+		return
+	}
 	id := strings.TrimSpace(r.URL.Query().Get("id"))
 	te := e.rt.findTask(id)
 	if te == nil {
@@ -89,6 +108,9 @@ func (e *Engine) handlePause(w http.ResponseWriter, r *http.Request) {
 // handleResume 恢复任务：从上次断点继续下载（重新走一遍 pipeline，会重新排队）
 
 func (e *Engine) handleResume(w http.ResponseWriter, r *http.Request) {
+	if !requireMethod(w, r, http.MethodGet) {
+		return
+	}
 	id := strings.TrimSpace(r.URL.Query().Get("id"))
 	te := e.rt.findTask(id)
 	if te == nil {
@@ -126,6 +148,9 @@ func (e *Engine) handleResume(w http.ResponseWriter, r *http.Request) {
 // handleCancel 取消任务：中断下载并删除半截 .part 文件
 
 func (e *Engine) handleCancel(w http.ResponseWriter, r *http.Request) {
+	if !requireMethod(w, r, http.MethodGet) {
+		return
+	}
 	id := strings.TrimSpace(r.URL.Query().Get("id"))
 	te := e.rt.findTask(id)
 	if te == nil {
@@ -199,6 +224,9 @@ func (e *Engine) handleCancel(w http.ResponseWriter, r *http.Request) {
 // handleRemove 把任务从列表里彻底删掉（只影响展示，不碰磁盘文件）
 
 func (e *Engine) handleRemove(w http.ResponseWriter, r *http.Request) {
+	if !requireMethod(w, r, http.MethodGet) {
+		return
+	}
 	id := strings.TrimSpace(r.URL.Query().Get("id"))
 	if id == "" {
 		jsonError(w, http.StatusBadRequest, "missing id")
@@ -228,8 +256,7 @@ func (e *Engine) handleRemove(w http.ResponseWriter, r *http.Request) {
 // handleOpenFile 用系统关联程序直接打开文件（区别于 /openfolder 只选中）
 
 func (e *Engine) handleOpenFile(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	if !requireMethod(w, r, http.MethodGet) {
 		return
 	}
 	target, status, msg := e.taskOpenPath(r.URL.Query().Get("id"))
@@ -304,6 +331,9 @@ type pickDirResp struct {
 }
 
 func (e *Engine) handlePickDir(w http.ResponseWriter, r *http.Request) {
+	if !requireMethod(w, r, http.MethodGet) {
+		return
+	}
 	dir, err := pickFolder(0, "选择视频保存文件夹")
 	if err != nil {
 		// 用户取消，err 带 cancelled 标记
@@ -324,6 +354,9 @@ func (e *Engine) handlePickDir(w http.ResponseWriter, r *http.Request) {
 }
 
 func (e *Engine) handleStatus(w http.ResponseWriter, r *http.Request) {
+	if !requireMethod(w, r, http.MethodGet) {
+		return
+	}
 	id := r.URL.Query().Get("id")
 	if id != "" {
 		e.rt.tasksMu.Lock()
@@ -383,8 +416,7 @@ func (e *Engine) handleSettingsPage(w http.ResponseWriter, r *http.Request) {
 // handleOpenFolder 打开任务产物所在文件夹并选中该文件。只接受任务 id，
 // 路径从任务记录推导（同 /openfile，砍掉"任意路径"的参数面）。
 func (e *Engine) handleOpenFolder(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	if !requireMethod(w, r, http.MethodGet) {
 		return
 	}
 	target, status, msg := e.taskOpenDir(r.URL.Query().Get("id"))

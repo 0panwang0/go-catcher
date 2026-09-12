@@ -45,7 +45,12 @@ func Run() {
 	// 失败不阻断 GUI：外壳轮询显示"未运行"，用户从托盘重启能看到具体错误。
 	// 端口不再固定 7891：跟随 gocatcher_config.json（可在监控页设置里改）。
 	eng := core.NewEngine(0)
-	_ = eng.Start()
+	if err := eng.Start(); err != nil {
+		// 启动失败不阻断 GUI（外壳会切到"服务未运行"降级面板，用户可从托盘重启），
+		// 但必须留下原因：GUI 是 windowsgui 子系统、没有控制台，端口被占用这类
+		// 错误如果不落到文件日志，用户只会看到"服务未运行"而完全无从下手。
+		fmt.Printf("[app] 下载服务启动失败: %v\n", err)
+	}
 
 	w := webview2.NewWithOptions(webview2.WebViewOptions{
 		Debug: false,

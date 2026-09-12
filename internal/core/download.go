@@ -400,7 +400,11 @@ func (j *dlJob) downloadChunked(ctx context.Context, outPath string, m *chunkMet
 	if err != nil {
 		return err
 	}
-	defer f.Close()
+	// 用 closeOnce 而不是裸 defer：stale 分支必须先关句柄再删文件（Windows 上
+	// 删除被打开的文件会失败），裸 defer 会让 Close 走第二遍并返回 ErrClosed。
+	var closeOnce sync.Once
+	closeFile := func() { closeOnce.Do(func() { _ = f.Close() }) }
+	defer closeFile()
 
 	total := m.Total
 	var mu sync.Mutex
@@ -452,8 +456,9 @@ func (j *dlJob) downloadChunked(ctx context.Context, outPath string, m *chunkMet
 	wg.Wait()
 
 	if stale {
-		// 服务器内容已变：关闭句柄后丢弃 part/meta，下次任务全量重下
-		f.Close()
+		// 服务器内容已变：先关句柄（Windows 上打开中的文件删不掉），再丢弃 part/meta，
+		// 下次任务全量重下
+		closeFile()
 		os.Remove(outPath)
 		os.Remove(chunkMetaPath(outPath))
 		return errChunkStale

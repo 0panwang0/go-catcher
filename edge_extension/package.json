@@ -5,7 +5,7 @@
   "description": "GoCatcher Edge 扩展：嗅探网页中的 m3u8/MP4 并经本地 Go 服务下载",
   "scripts": {
     "build": "node build.mjs",
-    "test": "node tests/embedmatch.test.js && node tests/storage.test.js && node tests/sniff.test.js && node tests/bridge.test.js"
+    "test": "for t in tests/*.test.js; do node \"$t\" || exit 1; done"
   },
   "devDependencies": {
     "esbuild": "^0.24.0"

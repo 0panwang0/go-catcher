@@ -95,7 +95,8 @@ func (r *Runtime) guard(next http.Handler) http.Handler {
 			return
 		}
 
-		if !r.tokenAccepted(req) && !isTokenFreePath(req.URL.Path) {
+		tokenOK := r.tokenAccepted(req)
+		if !tokenOK && !isTokenFreePath(req.URL.Path) {
 			w.Header().Set("Content-Type", "application/json; charset=utf-8")
 			w.WriteHeader(http.StatusUnauthorized)
 			fmt.Fprint(w, `{"error":"unauthorized：缺少或错误的访问令牌"}`)
@@ -103,7 +104,14 @@ func (r *Runtime) guard(next http.Handler) http.Handler {
 		}
 		// 令牌正确才给 CORS：扩展的 content script 需要读到响应体，
 		// 而拿不到令牌的调用方也就拿不到这个头。
-		w.Header().Set("Access-Control-Allow-Origin", "*")
+		//
+		// 这里必须挂在 tokenOK 上，不能写成"非免令牌路径才给"——免令牌路径里
+		// /svc/info 的响应体含令牌、/ 与 /settings 的 HTML 里注入了令牌，
+		// 一旦它们带上 CORS 头，任意网页两行 fetch 就能把令牌读走，
+		// 下面所有需要令牌的端点就全部失守了（见 isTokenFreePath 的说明）。
+		if tokenOK {
+			w.Header().Set("Access-Control-Allow-Origin", "*")
+		}
 		next.ServeHTTP(w, req)
 	})
 }
@@ -114,7 +122,12 @@ func (r *Runtime) guard(next http.Handler) http.Handler {
 //	/svc/info    —— 扩展的握手入口，从这里拿端口与令牌
 //	/、/settings —— 内嵌监控页/设置页本身（令牌由服务端注入进 HTML）
 //
-// 这三个都不带 CORS 头，网页读不到响应体，因此可以豁免。
+// 这四个都不带 CORS 头，网页读不到响应体，因此可以豁免。
+//
+// ⚠️ 这条豁免成立的前提是 guard 只对「令牌校验通过」的响应设 CORS 头。
+// 一旦这里面的端点带上 CORS 头，豁免立刻变成漏洞：/svc/info 的 body 里
+// 就有令牌，/ 与 /settings 的 HTML 里也注入了令牌——等于把钥匙挂在门上。
+// 新增免令牌端点前，请先确认它既不含秘密、也拿不到 CORS 头。
 func isTokenFreePath(p string) bool {
 	switch p {
 	case "/health", "/svc/info", "/", "/settings":

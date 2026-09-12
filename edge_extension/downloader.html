@@ -301,9 +301,20 @@
     </div>
   </div>
 
+  <div class="item" id="fallback" style="display: none; flex-direction: column; align-items: stretch; gap: 8px">
+    <div style="display: flex; gap: 8px; align-items: center; flex-wrap: wrap">
+      <button id="btnCopyCmd" class="secondary">复制命令</button>
+      <span id="copyFeedback" style="display: none; font-size: 12px"></span>
+      <span style="font-size: 12px; color: #86909c">
+        本地服务不可用时，可把命令粘贴到终端直接下载（单 exe 的 --url= 模式，不依赖服务）
+      </span>
+    </div>
+    <code id="fallbackCmd" style="font-family: Consolas, monospace; font-size: 12px; color: #4e5969; word-break: break-all"></code>
+  </div>
+
   <pre id="log"></pre>
 
-  <script src="downloader.js"></script>
+  <script type="module" src="downloader.js"></script>
 </body>
 
 </html>

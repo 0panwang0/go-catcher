@@ -34,6 +34,8 @@ func main() {
 		// GUI 无控制台（windowsgui 子系统）：把诊断输出落盘到 exe 同目录的
 		// gocatcher.log，否则重试/回退/落盘失败这类信息全部进黑洞。
 		core.SetupFileLogging()
+		// 日志异步写盘，退出前排空队列（见 runHeadless 里的同款说明）
+		defer core.CloseFileLogging()
 		app.Run()
 	case opts.URL == "":
 		core.PrintUsage()
@@ -48,9 +50,13 @@ func runHeadless(port int) {
 	// 由 bat 用 start 拉起（或 AttachConsole 失败）时同样没有控制台，
 	// 日志落盘保证排障有据可查；有控制台时输出行为不变（tee）。
 	core.SetupFileLogging()
+	// 日志异步写盘，退出前要把队列排空——否则最后那几行（往往正是错误原因）
+	// 会留在内存里随进程一起消失。
+	defer core.CloseFileLogging()
 	eng := core.NewEngine(port)
 	if err := eng.Start(); err != nil {
 		fmt.Fprintf(os.Stderr, "server error: %v\n", err)
+		core.CloseFileLogging() // os.Exit 不跑 defer，这条错误行必须显式刷盘
 		os.Exit(1)
 	}
 	sig := make(chan os.Signal, 1)

@@ -108,7 +108,13 @@ func pickFolder(ownerHwnd uintptr, title string) (string, error) {
 	if initHr != 0 && initHr != 1 && initHr != 0x80010106 {
 		return "", fmt.Errorf("CoInitialize failed 0x%08X", initHr)
 	}
-	defer procCoUninit.Call()
+	// 只有"本次真的初始化成功"才配对 CoUninitialize。
+	// RPC_E_CHANGED_MODE 表示别的代码已用另一种 apartment 模式初始化过 COM，
+	// 本模块没有增加引用计数 —— 这时再 CoUninitialize 是去减别人的计数，
+	// 会把调用方的 COM 提前拆掉。S_FALSE(1) 表示已初始化且计数已加，仍需配对释放。
+	if initHr == 0 || initHr == 1 {
+		defer procCoUninit.Call()
+	}
 
 	// CoCreateInstance(CLSID_FileOpenDialog, nil, CLSCTX_INPROC_SERVER=1, IID_IFileOpenDialog, &ptr)
 	var dialogPtr unsafe.Pointer

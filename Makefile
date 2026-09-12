@@ -66,7 +66,9 @@ check:
 # Edge 扩展（与 CI 的 extension job 同一套判定）
 # 源码是 src/background/ 下的 ES 模块，esbuild 打包成单文件 background.js；
 # bundle 提交进仓库（用户"解压即加载"无需构建），所以改了 src/ 必须重新打包。
-# 需要 Node 18+；首次会自动 npm install。
+# 需要 Node 22+：downloader.js 是 ES 模块（import 共享解析源码），
+# `node --check` 对 .js 的模块语法探测要 22.7+，Node 18 会误报语法错误。
+# 首次会自动 npm install。
 # ============================================================
 
 # 打包：src/background/*.js → edge_extension/background.js

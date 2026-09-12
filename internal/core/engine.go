@@ -15,6 +15,17 @@ import (
 // DefaultPort 监控页 / Edge 扩展默认端口
 const DefaultPort = 7891
 
+// maskToken 只保留前缀，用于在启动横幅里辨认"是不是这枚令牌"，不泄露可用的完整值。
+//
+// 横幅会经 SetupFileLogging 落进 gocatcher.log，而日志文件是 0644——完整令牌
+// 等于把钥匙写进日志。需要完整值时从 gocatcher_config.json 或 /svc/info 取。
+func maskToken(tok string) string {
+	if len(tok) <= 8 {
+		return "****"
+	}
+	return tok[:8] + "****"
+}
+
 type Engine struct {
 	// rt 是本引擎的运行时状态（配置/任务表/代理客户端等，见 runtime.go）。
 	// 每个 Engine 独有一份，互不共享 —— internal/core 因此可多实例化。
@@ -59,7 +70,15 @@ func (e *Engine) Start() error {
 	// guard 包在最外层：Host 校验 + 访问令牌（见 auth.go）。
 	// 服务只监听 127.0.0.1，但浏览器里的任意网页都能打到 127.0.0.1，
 	// 而本服务具备"写任意路径"和"执行程序"两种能力——这道门必须自己设。
-	e.srv = &http.Server{Handler: e.rt.guard(newMux(e))}
+	e.srv = &http.Server{
+		Handler: e.rt.guard(newMux(e)),
+		// 连接级超时：令牌挡的是"谁能调用"，但不挡"谁都能占一条连接"。
+		// 没有 ReadHeaderTimeout 时，一条连上来只发一半请求头的 TCP 连接能一直
+		// 占住一个 goroutine（Slowloris 式），且不需要令牌。两者都与下载无关
+		// ——下载走的是出站共享 client（见 net.go 的分层超时），互不影响。
+		ReadHeaderTimeout: 10 * time.Second,
+		IdleTimeout:       120 * time.Second,
+	}
 	e.done = make(chan struct{})
 	e.running = true
 	go func() { _ = e.srv.Serve(ln) }()
@@ -69,7 +88,7 @@ func (e *Engine) Start() error {
 	fmt.Println("  GoCatcher 本地下载服务")
 	fmt.Printf("  监听地址: http://%s:%d\n", e.rt.bindAddr, port)
 	fmt.Printf("  最大并发下载: %d / %d 运行\n", active, limit)
-	fmt.Printf("  访问令牌: %s\n", e.rt.ensureAPIToken())
+	fmt.Printf("  访问令牌: %s\n", maskToken(e.rt.ensureAPIToken()))
 	if w := e.rt.systemProxyWarning(); w != "" {
 		// 静默降级成直连必须说出来：用户以为走了代理、实际暴露真实 IP，
 		// 不提示的话排查时完全看不出问题在哪。

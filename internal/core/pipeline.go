@@ -114,7 +114,12 @@ func runDiskPipeline(te *taskEntry) {
 		// 输出扩展名跟随 URL（如 .mp4），避免 MP4 内容存成 .ts
 		if ext := directExtFromURL(st.m3u8URL); ext != "" && !strings.HasSuffix(strings.ToLower(st.filename), ext) {
 			st.filename = strings.TrimSuffix(st.filename, filepath.Ext(st.filename)) + ext
-			st.finalPath = uniquePath(filepath.Join(st.saveDir, st.filename))
+			nf, rerr := reclaimPath(st.saveDir, st.filename, st.finalPath)
+			if rerr != nil {
+				fail(rerr.Error())
+				return
+			}
+			st.finalPath = nf
 			st.filename = filepath.Base(st.finalPath)
 			partPath = st.finalPath + ".part"
 		}
@@ -158,9 +163,10 @@ func runDiskPipeline(te *taskEntry) {
 		fail("播放列表中没有找到任何媒体分片（响应可能被加密或压缩）")
 		return
 	}
-	// 中途换 key 的流按当前实现会解错前面的分片：宁可失败也不产出损坏文件
-	if kerr := ensureSingleKey(pl); kerr != nil {
-		fail(kerr.Error())
+	// 播放列表语义校验（中途换 key / 字节范围分片 / 非 identity 密钥格式）：
+	// 这些特性按当前实现硬跑都会静默产出损坏文件，宁可在这里失败
+	if verr := validatePlaylist(pl); verr != nil {
+		fail(verr.Error())
 		return
 	}
 	// 加密流装配解密器（拉取 key 并按 METHOD 建解密器）；失败任务即失败。
@@ -191,7 +197,12 @@ func runDiskPipeline(te *taskEntry) {
 		// 输出扩展名跟随真实容器（fMP4 内容绝不能存成 .ts）
 		if nf := correctExtName(st.filename, container); nf != st.filename {
 			st.filename = nf
-			st.finalPath = uniquePath(filepath.Join(st.saveDir, st.filename))
+			np, rerr := reclaimPath(st.saveDir, st.filename, st.finalPath)
+			if rerr != nil {
+				fail(rerr.Error())
+				return
+			}
+			st.finalPath = np
 			st.filename = filepath.Base(st.finalPath)
 			partPath = st.finalPath + ".part"
 		}
@@ -340,7 +351,7 @@ func finishInterrupt(te *taskEntry) {
 	} else {
 		// 暂停时也做容器收尾处理（fMP4 回填已录部分的总时长，方便直接预览/拖动）；
 		// 续传完成后会以新总时长再次回填
-		if j := te.job; j != nil {
+		if j := te.jobRef(); j != nil {
 			if err := j.backfill(part); err != nil {
 				fmt.Printf("[disk] WARN: 容器收尾处理失败: %v\n", err)
 			}

@@ -99,14 +99,50 @@ type playlistInfo struct {
 	// segSeenForKey 当前 key 生效期间已见分片数：只有"用过之后才换 key"才算轮换，
 	// 播放列表里每个分片前重复同一条 key 是合法且常见的写法。
 	segSeenForKey int
+	// hasByteRange 播放列表用了 #EXT-X-BYTERANGE（同一个文件按字节区间切成多段，
+	// 单文件 HLS 的常见做法）。当前管线的语义是"一行分片 = 一个完整 URL"，
+	// N 行会解析出同一个 URL 并各下一遍再顺序 append —— 体积放大 N 倍、时间轴
+	// 完全错位，而且不会有任何报错。用这个标记让调用方显式失败。
+	hasByteRange bool
 }
 
-// sameKey 判定两条 #EXT-X-KEY 是否等价（METHOD/URI/IV 全同）。
+// sameKey 判定两条 #EXT-X-KEY 是否等价（METHOD/URI/IV/KEYFORMAT 全同）。
 func sameKey(a, b *KeyInfo) bool {
 	if a == nil || b == nil {
 		return a == nil && b == nil
 	}
-	return a.Method == b.Method && a.URI == b.URI && bytes.Equal(a.IV, b.IV)
+	return a.Method == b.Method && a.URI == b.URI && bytes.Equal(a.IV, b.IV) &&
+		normKeyFormat(a.KeyFormat) == normKeyFormat(b.KeyFormat)
+}
+
+// validatePlaylist 播放列表语义校验的唯一入口。
+//
+// 这里收的都是「当前实现不支持、但按错误语义硬跑会静默产出损坏文件」的 HLS 特性。
+// 之所以合成一个入口而不是让调用方逐个调：管线与 CLI 两处调用点必须保持同步，
+// 分成多个函数时新增一条校验就多一次「漏加一个调用点」的机会，而漏掉的后果
+// 恰恰是这类静默损坏。新增校验请加在这个函数里，别加在调用点。
+func validatePlaylist(pl playlistInfo) error {
+	if err := ensureSingleKey(pl); err != nil {
+		return err
+	}
+	if err := ensureNoByteRange(pl); err != nil {
+		return err
+	}
+	return ensureIdentityKeyFormat(pl)
+}
+
+// ensureIdentityKeyFormat 校验密钥格式是 identity（或缺省）。
+//
+// 非 identity 的 KEYFORMAT 表示 URI 指向的是密钥系统而不是裸密钥：FairPlay 的
+// skd:// URI、Widevine 的 license 端点等都是这种形态。此时 METHOD 往往仍写着
+// AES-128，所以单看 METHOD 会一路放行——拉回来的东西被当作 16 字节 key 用，
+// 产物是"能播但花屏/无声"的损坏文件，而日志一切正常。
+func ensureIdentityKeyFormat(pl playlistInfo) error {
+	if pl.key == nil || isIdentityKeyFormat(pl.key.KeyFormat) {
+		return nil
+	}
+	return fmt.Errorf("播放列表声明了非 identity 的密钥格式（KEYFORMAT=%q）："+
+		"该 URI 指向的是密钥系统而不是裸密钥，本工具无法解密，拒绝下载", pl.key.KeyFormat)
 }
 
 // ensureSingleKey 校验播放列表没有中途换 key。key rotation 需要按分片选择
@@ -118,11 +154,29 @@ func ensureSingleKey(pl playlistInfo) error {
 	return nil
 }
 
+// ensureNoByteRange 校验播放列表没有使用字节范围分片。
+//
+// #EXT-X-BYTERANGE 让多个分片行指向同一个 URL 的不同字节区间。当前管线把每行
+// 当成独立文件整份下载，结果是同一个文件被下 N 遍再顺序拼接：体积放大 N 倍、
+// 时间轴错位，且 validateOutput 的同步字节判据发现不了（每一份都是合法 TS）。
+// 完整支持需要给分片附上 Range 语义，属于较大的改动；定版前先显式拒绝。
+func ensureNoByteRange(pl playlistInfo) error {
+	if pl.hasByteRange {
+		return fmt.Errorf("播放列表使用了 #EXT-X-BYTERANGE（单文件按字节区间切片），当前版本不支持字节范围分片，无法正确下载该流")
+	}
+	return nil
+}
+
 // KeyInfo 一条 #EXT-X-KEY 声明（URI 已按播放列表 base 解析为绝对地址）。
 type KeyInfo struct {
 	Method string // AES-128 / SAMPLE-AES …（大写）
 	URI    string // 密钥绝对 URL
 	IV     []byte // 显式 IV（16 字节）；nil = 按 media sequence 派生
+	// KeyFormat #EXT-X-KEY 的 KEYFORMAT 属性（缺省 = "identity"）。
+	// 非 identity 表示 URI 指向的是「密钥系统」（如 skd:// 的 FairPlay、
+	// Widevine 的 license 服务），而不是 16 字节裸密钥 —— 拿它当 AES-128 的
+	// key 用，运气好是长度不合法报错，运气不好是静默解出随机字节。
+	KeyFormat string
 }
 
 // fetchPlaylist 获取并返回媒体播放列表内容与其基准 URL。
@@ -202,6 +256,9 @@ func parsePlaylist(m3u8Text, base string) playlistInfo {
 			}
 		case strings.HasPrefix(line, "#EXTINF:"):
 			pl.totalDur += parseEXTINFDuration(line)
+		case strings.HasPrefix(line, "#EXT-X-BYTERANGE:"):
+			// 不解析区间，只记录"见过"——由 ensureNoByteRange 显式失败（见该函数注释）
+			pl.hasByteRange = true
 		case strings.HasPrefix(line, "#"):
 			// 其它标签（EXT-X-TARGETDURATION 等）无需处理
 		default:
@@ -232,12 +289,15 @@ var (
 	keyMethodRe = regexp.MustCompile(`(?i)METHOD=([A-Za-z0-9-]+)`)
 	keyURIRe    = regexp.MustCompile(`(?i)URI="([^"]*)"`)
 	keyIVRe     = regexp.MustCompile(`(?i)IV=0[xX]([0-9A-Fa-f]{32})`)
+	// keyFormatRe KEYFORMAT 属性：规范要求 quoted-string，但非规范播放列表会写成
+	// 裸值（KEYFORMAT=identity,），两种都认。第 1 组是带引号形态，第 2 组是裸值。
+	keyFormatRe = regexp.MustCompile(`(?i)KEYFORMAT=(?:"([^"]*)"|([^",]*))`)
 	// mapURIRe #EXT-X-MAP 的 URI 属性（模块级编译，别在逐行循环里反复编译）
 	mapURIRe = regexp.MustCompile(`URI="([^"]*)"`)
 )
 
-// parseKeyLine 解析 #EXT-X-KEY 行：METHOD、URI（相对路径按 base 解析）与
-// 十六进制 IV。METHOD=NONE（明文）或缺 URI 返回 nil。
+// parseKeyLine 解析 #EXT-X-KEY 行：METHOD、URI（相对路径按 base 解析）、
+// 十六进制 IV 与 KEYFORMAT。METHOD=NONE（明文）或缺 URI 返回 nil。
 func parseKeyLine(line, base string) *KeyInfo {
 	m := keyMethodRe.FindStringSubmatch(line)
 	if len(m) != 2 {
@@ -255,6 +315,13 @@ func parseKeyLine(line, base string) *KeyInfo {
 	if iv := keyIVRe.FindStringSubmatch(line); len(iv) == 2 {
 		if b, err := hex.DecodeString(iv[1]); err == nil {
 			k.IV = b
+		}
+	}
+	if fm := keyFormatRe.FindStringSubmatch(line); len(fm) == 3 {
+		if fm[1] != "" {
+			k.KeyFormat = fm[1]
+		} else {
+			k.KeyFormat = strings.TrimSpace(fm[2])
 		}
 	}
 	return k

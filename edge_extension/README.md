@@ -59,7 +59,18 @@
 7. 下载进度实时显示在确认后的进度面板里，同时也显示在 GoCatcher 客户端的任务列表（或浏览器打开 `http://127.0.0.1:7891/`）
 
 > 扩展自身**不做**分片下载与合并：跨域 403 已由服务端代拉解决，而浏览器侧实现无法解密 `#EXT-X-KEY`
-> 加密流、也拿不到服务端的产物校验守卫——留着它只会静默产出不可播放的密文文件。相关代码已移除。
+> 加密流、也拿不到服务端的产物校验守卫——留着它只会静默产出不可播放的密文文件。相关代码已移除
+> （包括工具栏下载器页面里那套并行的分片下载实现；该页现在只负责列出嗅探结果、选画质、调服务，
+> `tests/downloader.test.js` 用结构性断言守住"第二套实现不许回来"）。
+
+## 工具栏下载器页面（手动/备用入口）
+
+点扩展图标打开，用于手动粘贴 URL 或在嗅探列表里挑一条下载。它的行为与悬停按钮一致：
+
+- 画质选择：master playlist 会列出各档位让你选（拉不到档位时降级为"服务端自选最高码率"）
+- 下载执行：**一律交给本地 Go 服务**（原生文件夹选择框 → 落盘 → 进度轮询）
+- 服务未启动时：页面日志给出提示，并显示一条**可复制的终端命令**（单 exe 的 `--url=` 模式，
+  不依赖服务），与悬停面板的兜底完全一致
 
 ## 排查：悬停不出现按钮
 
@@ -150,18 +161,22 @@ Go 二进制（`go-catcher.exe`）已经预设好：
 edge_extension/
 ├── manifest.json      # MV3 清单
 ├── src/background/    # service worker 源码（ES 模块，esbuild 打包成 background.js）
+│   └── m3u8-parse.js  # 全项目唯一的 m3u8/画质解析实现（downloader 页面直接 import）
 ├── background.js      # 打包产物（提交进仓库，改 src/ 后跑 make ext 重建）
 ├── content.js         # 页面内 IDM 式悬停下载按钮 + 链接列表面板 + 交给本地服务下载
+│                      # ⚠ 经典 content script（无法 import），自带一份解析拷贝，改语义要手动同步
 ├── content-main.js    # MAIN world fetch 代理（请求头与页面一致，绕过 403）
-├── downloader.html    # 下载器页面（备用/手动下载）
-├── downloader.js      # 下载器页面逻辑
+├── downloader.html    # 下载器页面（工具栏图标打开；手动下载 + 嗅探列表 + 设置）
+├── downloader.js      # 下载器页面逻辑（ES 模块；只调服务，不自己下载）
 └── tests/             # Node 回归测试（不参与扩展运行）
     ├── embedmatch.test.js   # 页面归属判定
     ├── probes.test.js       # webRequest 注册参数 + 无扩展名通道判据
-    └── storage.test.js      # 嗅探列表并发写入与淘汰
+    ├── storage.test.js      # 嗅探列表并发写入与淘汰
+    └── downloader.test.js   # 下载器页面：无第二套下载实现 + 文件名/兜底命令
 ```
 
-跑测试：`node tests/*.test.js`（或项目根 `make ext-check`，会连打包一致性一起校验）。
+跑测试：`node tests/*.test.js`（或项目根 `make ext-check`，会连打包一致性、语法检查一起校验）。
+需要 **Node 22+**：`downloader.js` 是 ES 模块，`node --check` 对 `.js` 的模块语法探测要 22.7+。
 
 > ⚠ **onCompleted 的 extraInfoSpec 只能是 `extraHeaders` / `responseHeaders`。**
 > 写成别的值（例如 `requestHeaders`，那是 `onBeforeSendHeaders` 才认的）不会报错到
