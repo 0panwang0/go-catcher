@@ -75,7 +75,9 @@
 <body>
 <div class="wrap">
   <div class="top">
-    <button class="back" onclick="location.href='/'">← 返回监控</button>
+    <!-- 带上 location.search：本页在 GUI 客户端里是嵌在外壳 iframe 中的，
+         监控页/设置页默认发 X-Frame-Options: DENY，不带键的框架内跳转会被拦成白屏 -->
+    <button class="back" onclick="location.href='/'+location.search">← 返回监控</button>
     <h1>下载设置</h1>
   </div>
   <div class="sub">调整后立即生效，无需重启；正在下载的不受影响，新任务按新配置调度。</div>
@@ -228,7 +230,8 @@ async function save(){
     }else{
       toast('设置已保存并生效');
     }
-    setTimeout(function(){ location.href = '/'; }, 800);
+    // 同上方「返回监控」：框架内跳转必须带着 location.search，否则被 DENY 拦成白屏
+    setTimeout(function(){ location.href = '/'+location.search; }, 800);
   }catch(e){ toast('保存失败：'+e.message, true); }
 }
 load();

@@ -476,7 +476,9 @@ async function loadConfig(){
   }catch(e){}
 }
 // 设置独立成页（/settings）：本页不再有弹层，⚙ 直接跳转；保存后回监控页会自动重新加载配置
-el('setbtn').addEventListener('click', function(){ location.href = '/settings'; });
+// 必须带上 location.search：GUI 客户端里本页是嵌在外壳 iframe 中的，而 /settings 默认发
+// X-Frame-Options: DENY 防点击劫持 —— 不带键的框架内跳转会被浏览器直接拦成白屏。
+el('setbtn').addEventListener('click', function(){ location.href = '/settings' + location.search; });
 
 setInterval(poll, 900);
 poll();

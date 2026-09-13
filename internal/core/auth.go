@@ -36,6 +36,10 @@ const (
 
 	// tokenHeader 备用传递方式（curl / 脚本比塞进 query 更干净）。
 	tokenHeader = "X-GoCatcher-Token"
+
+	// embedKeyParam 内嵌豁免键的参数名：GUI 外壳把它拼进 iframe 地址，
+	// 服务端据此认出"这是外壳自己的嵌套"（见 frameDeniedPaths）。
+	embedKeyParam = "e"
 )
 
 // frameDeniedPaths 禁止被 iframe 嵌套的端点（点击劫持防护）。
@@ -48,6 +52,14 @@ const (
 //
 // 两个头都设：X-Frame-Options 是老浏览器/老 WebView 的兜底，CSP frame-ancestors
 // 是现代浏览器的标准。统一挂在这里而不是各个 handler 里 —— 少写一处就是少一个口子。
+//
+// 例外——GUI 外壳自己的嵌套必须放行（否则客户端直接白屏）：
+// 桌面客户端的主窗是「外壳 HTML + iframe 内嵌监控页」两层，外壳用 WebView2 的
+// SetHtml（等价 NavigateToString）加载，父文档是 opaque origin。CSP 的
+// frame-ancestors 表达不了 opaque origin——'self'/'none' 都会把这个合法父窗口
+// 一并拒掉，表现为窗口里只剩一个"禁止"图标。放行规则见 frameAllowed
+// （embedKey + Sec-Fetch-Site 两条独立信号）。判断放在服务端而非外壳侧，是因为
+// frame-ancestors 由被嵌页面自己声明，父窗口无法替它放宽。
 var frameDeniedPaths = map[string]struct{}{
 	"/":         {},
 	"/settings": {},
@@ -82,6 +94,46 @@ func (r *Runtime) ensureAPIToken() string {
 	return r.cfg.APIToken
 }
 
+// embedKey 生成本进程的内嵌豁免键。与 API 令牌同为 16 字节随机十六进制，
+// 但用途完全不同（令牌管"谁能调用"，它管"谁可以当父窗口"），且**不落盘**——
+// 只需在一个进程生命周期内保持稳定，重启即换新，无需跨启动一致。
+func newEmbedKey() string { return newAPIToken() }
+
+// embedAccepted 报告请求是否携带本进程的内嵌豁免键（见 frameDeniedPaths 的例外说明）。
+//
+// 空键一律拒绝：embedKey 未初始化时（理论上只在 newRuntime 之前）不能让
+// "参数缺失"和"键为空"凑成一次相等比较而放行。
+func (r *Runtime) embedAccepted(req *http.Request) bool {
+	got := strings.TrimSpace(req.URL.Query().Get(embedKeyParam))
+	if got == "" || r.embedKey == "" {
+		return false
+	}
+	// 定长比较，与令牌一致：不给"逐字节猜键"留时间差
+	return subtle.ConstantTimeCompare([]byte(got), []byte(r.embedKey)) == 1
+}
+
+// frameAllowed 报告这次请求的嵌套是否来自 GUI 自己（见 frameDeniedPaths）。
+//
+// 两条**独立且各自充分**的信号，命中任一条即放行——这不是冗余设计，而是两次
+// 真实的踩坑各对应一条：
+//
+//  1. embedKey：外壳首次加载 iframe 时用。父文档是 opaque origin，浏览器给不出
+//     任何"同源"信息，只能靠这把钥匙。
+//  2. Sec-Fetch-Site: same-origin：框架**自己发起**的跳转——监控页的 ⚙ 走
+//     location.href='/settings'，请求由 iframe 内的本服务文档发出，浏览器标注为同源。
+//     只靠钥匙时这条链路没有钥匙可用，整页会被 DENY 挡住（点设置直接白屏）。
+//
+// 为什么攻击者造不出这两条：embedKey 是每进程随机的，只注入外壳 HTML（网页读不到
+// 外壳文档，也猜不出 32 位十六进制）；same-origin 要求请求发起方确实位于本服务
+// origin，网页无法把自己的文档放到 127.0.0.1 上。DNS rebinding 想伪装同源也不行
+// ——hostAllowed 会先把非本机 Host 判 403（所以本函数在 Host 校验之后才调用）。
+func (r *Runtime) frameAllowed(req *http.Request) bool {
+	if r.embedAccepted(req) {
+		return true
+	}
+	return strings.EqualFold(strings.TrimSpace(req.Header.Get("Sec-Fetch-Site")), "same-origin")
+}
+
 // apiToken 返回当前 token（空串 = 尚未初始化，此时一律拒绝）。
 func (r *Runtime) apiToken() string {
 	r.cfgMu.Lock()
@@ -94,15 +146,17 @@ func (r *Runtime) guard(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		// 禁止浏览器按内容猜类型：JSON 响应不能被当成脚本加载
 		w.Header().Set("X-Content-Type-Options", "nosniff")
-		// 注入令牌的页面禁止被 iframe 嵌套（点击劫持防护，见 frameDeniedPaths）
-		if _, deny := frameDeniedPaths[req.URL.Path]; deny {
-			w.Header().Set("X-Frame-Options", "DENY")
-			w.Header().Set("Content-Security-Policy", "frame-ancestors 'none'")
-		}
 
 		if !hostAllowed(req.Host) {
 			http.Error(w, "forbidden: unexpected Host header", http.StatusForbidden)
 			return
+		}
+
+		// 注入令牌的页面默认禁止被 iframe 嵌套（点击劫持防护，见 frameDeniedPaths）。
+		// 放在 Host 校验之后：403 响应没必要再带这组头。
+		if _, deny := frameDeniedPaths[req.URL.Path]; deny && !r.frameAllowed(req) {
+			w.Header().Set("X-Frame-Options", "DENY")
+			w.Header().Set("Content-Security-Policy", "frame-ancestors 'none'")
 		}
 
 		// 预检只声明「允许什么」，不泄露任何信息；真正的请求仍要过令牌。

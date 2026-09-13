@@ -78,7 +78,9 @@ func Run() {
 
 	// 加载外壳：iframe 内嵌监控页铺满窗口，无工具条。
 	// 外壳的 JS 轮询 vc_running/vc_port 自行决定 iframe 地址与降级提示，无需 Go 端切换。
-	w.SetHtml(shellHTML())
+	// 必须带上本引擎的内嵌豁免键：监控页/设置页默认 DENY 防点击劫持，而外壳的父文档
+	// 是 opaque origin，不带键会被一并拒掉（主窗白屏，只剩"禁止"图标）。
+	w.SetHtml(shellHTML(eng.EmbedKey()))
 
 	// 注册托盘 + 子类化主窗(拦 WM_CLOSE 缩托盘)
 	initTray(w, eng)

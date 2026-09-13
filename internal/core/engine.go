@@ -151,6 +151,13 @@ func (e *Engine) Port() int {
 	return e.rt.configuredPort()
 }
 
+// EmbedKey 返回本引擎的内嵌豁免键：GUI 外壳把它拼进 iframe 地址，服务端据此
+// 放行外壳自己的嵌套（点击劫持防护的例外，理由见 auth.go 的 frameDeniedPaths）。
+//
+// 同一 Engine 反复 Stop/Start 键不变（键在 newRuntime 时定型），因此"设置里改端口
+// → 托盘重启服务 → 外壳把 iframe 切到新地址"这条路径上不需要重新取键。
+func (e *Engine) EmbedKey() string { return e.rt.embedKey }
+
 // Done 在服务停止后可读（无头模式 select 它决定进程退出）。未 Start 过时为 nil。
 func (e *Engine) Done() <-chan struct{} {
 	e.mu.Lock()

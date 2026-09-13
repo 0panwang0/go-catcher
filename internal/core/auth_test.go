@@ -94,20 +94,75 @@ func TestGuardTokenFreePaths(t *testing.T) {
 	}
 }
 
-// TestGuardFrameDeniedPages 注入令牌的页面必须禁止被 iframe 嵌套（点击劫持）：
+// TestGuardFrameDeniedPages 注入令牌的页面默认禁止被 iframe 嵌套（点击劫持）：
 // 它们免令牌且 HTML 里带着真令牌，任意网页透明 iframe 覆盖诱导点击，就能让
 // 页面自身去 POST /config 改代理（流量经中间人）或改端口。Host 校验拦不住 ——
 // iframe 发请求时 Host 就是本机地址。
+//
+// 例外分支必须一起验证：DENY 对"父文档是 opaque origin"的 GUI 外壳同样生效，
+// 一刀切会让客户端整个白屏。已发出去的版本只测了"该拒的都拒了"、漏测"该放的
+// 没放"，于是先后踩了两次——首次加载被拦（缺键）、点设置被拦（框架内跳转没键）。
 func TestGuardFrameDeniedPages(t *testing.T) {
 	setTestToken(t, "secret-token")
+	if testStd.embedKey == "" {
+		t.Fatal("embedKey 不应为空：空键会让外壳拿不到豁免，也说明 newRuntime 漏了初始化")
+	}
+
+	hdr := func(w *httptest.ResponseRecorder) (string, string) {
+		return w.Header().Get("X-Frame-Options"), w.Header().Get("Content-Security-Policy")
+	}
+	// 被拒 = 两个头都在；放行 = 两个头都不许出现（浏览器只看头，不看意图）
+	assertDenied := func(what string, w *httptest.ResponseRecorder) {
+		t.Helper()
+		if xfo, csp := hdr(w); xfo != "DENY" || !strings.Contains(csp, "frame-ancestors 'none'") {
+			t.Errorf("%s 应被拒嵌套，得到 XFO=%q CSP=%q", what, xfo, csp)
+		}
+	}
+	assertFramable := func(what string, w *httptest.ResponseRecorder) {
+		t.Helper()
+		if xfo, csp := hdr(w); xfo != "" || csp != "" {
+			t.Errorf("%s 应可被嵌套，却带上了 XFO=%q CSP=%q（客户端会白屏）", what, xfo, csp)
+		}
+	}
+
 	for _, p := range []string{"/", "/settings"} {
-		w := guardedDo(t, "GET", p, "127.0.0.1:7891", nil)
-		if got := w.Header().Get("X-Frame-Options"); got != "DENY" {
-			t.Errorf("%s X-Frame-Options=%q want DENY", p, got)
+		// 1) 任意网页的 iframe：无键、无同源信号 → 拒
+		assertDenied(p+"（普通 iframe）", guardedDo(t, "GET", p, "127.0.0.1:7891", nil))
+		// 2) 恶意页面能标出的只有 cross-site → 拒
+		assertDenied(p+"（cross-site）",
+			guardedDo(t, "GET", p, "127.0.0.1:7891", map[string]string{"Sec-Fetch-Site": "cross-site"}))
+		// 3) 猜错的键 / 空键：不能因为"带了参数"就放行
+		for _, bad := range []string{"", "deadbeef", testStd.embedKey + "0"} {
+			assertDenied(p+"（错键 "+bad+"）",
+				guardedDo(t, "GET", p+"?"+embedKeyParam+"="+bad, "127.0.0.1:7891", nil))
 		}
-		if got := w.Header().Get("Content-Security-Policy"); !strings.Contains(got, "frame-ancestors 'none'") {
-			t.Errorf("%s Content-Security-Policy=%q 应含 frame-ancestors 'none'", p, got)
-		}
+		// 4) GUI 外壳首次加载 iframe：父文档是 opaque origin，只带得动这把钥匙 → 放行
+		assertFramable(p+"（正确内嵌键）",
+			guardedDo(t, "GET", p+"?"+embedKeyParam+"="+testStd.embedKey, "127.0.0.1:7891", nil))
+		// 5) 框架内自发跳转（监控页 ⚙ → /settings）：发起方就是本服务文档，
+		//    浏览器标 same-origin，这条没有任何钥匙可用 → 必须放行
+		assertFramable(p+"（same-origin 框架内跳转）",
+			guardedDo(t, "GET", p, "127.0.0.1:7891", map[string]string{"Sec-Fetch-Site": "same-origin"}))
+	}
+
+	// 非 frameDeniedPaths 的页面不受影响（不因豁免逻辑而误设头）
+	if xfo, _ := hdr(guardedDo(t, "GET", "/health", "127.0.0.1:7891", nil)); xfo != "" {
+		t.Errorf("/health 不该有 X-Frame-Options，得到 %q", xfo)
+	}
+}
+
+// TestEmbedKeyPerRuntime 内嵌豁免键必须每次新建 Runtime 都重新随机：
+// 固定键（如写死常量）等于把钥匙公开，点击劫持防护直接失效。
+func TestEmbedKeyPerRuntime(t *testing.T) {
+	a, b := newRuntime(), newRuntime()
+	if a.embedKey == "" || b.embedKey == "" {
+		t.Fatal("embedKey 不应为空")
+	}
+	if len(a.embedKey) != 32 {
+		t.Errorf("embedKey 应为 32 位十六进制，得到 %d 位: %q", len(a.embedKey), a.embedKey)
+	}
+	if a.embedKey == b.embedKey {
+		t.Errorf("两个 Runtime 的 embedKey 相同（%q），说明没随机生成", a.embedKey)
 	}
 }
 

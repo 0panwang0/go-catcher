@@ -30,6 +30,10 @@ const defaultUserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/
 
 // Runtime 聚合引擎全部可变状态。字段按职责分区；并发保护策略见各组注释。
 type Runtime struct {
+	// ---- 访问控制 ----
+	// embedKey 内嵌豁免键：构造时生成一次、此后只读，故不加锁（见 auth.go）。
+	embedKey string
+
 	// ---- 配置（原 config.go 包级变量）----
 	// cfg 由 cfgMu 保护；segConcurrency/retryLimit 是热路径原子读。
 	cfgMu          sync.Mutex
@@ -93,6 +97,7 @@ type Runtime struct {
 // newRuntime 创建一份带默认值的运行时。Engine 与 CLI 各持一份，互不共享。
 func newRuntime() *Runtime {
 	r := &Runtime{
+		embedKey:          newEmbedKey(), // 每次运行新键：GUI 外壳的 iframe 豁免凭据
 		cfg:               defaultConfig(),
 		tasks:             map[string]*taskEntry{},
 		allowedDirs:       map[string]bool{},

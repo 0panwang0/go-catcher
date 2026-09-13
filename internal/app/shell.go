@@ -8,8 +8,18 @@
 // 外壳自身的 JS 不发起任何 HTTP，状态判断走 Go 绑定（window.vc_running / vc_port）。
 package app
 
-func shellHTML() string {
-	return `<!DOCTYPE html><html lang="zh-CN"><head><meta charset="UTF-8">
+import "strings"
+
+// embedKeyPlaceholder 外壳 HTML 里内嵌豁免键的占位符，由 shellHTML 换成真键。
+//
+// 服务端对 / 与 /settings 默认发 DENY 防点击劫持，只有带对本进程键的嵌套才放行
+// （见 core 的 frameDeniedPaths）。外壳经 SetHtml 加载、父文档是 opaque origin，
+// 永远拿不到"同源"身份，所以这把钥匙是必需的——漏注入的表现就是主窗里只剩一个
+// "禁止"图标（iframe 被 X-Frame-Options 拒了）。
+const embedKeyPlaceholder = "__GOCATCHER_EMBED_KEY__"
+
+// shellTemplate 外壳 HTML 模板；只用 shellHTML 访问，勿直接引用（占位符未替换）。
+const shellTemplate = `<!DOCTYPE html><html lang="zh-CN"><head><meta charset="UTF-8">
 <title>GoCatcher 客户端</title>
 <style>
 :root{
@@ -73,13 +83,16 @@ iframe::-webkit-scrollbar{display:none;width:0;height:0}
 </div>
 
 <script>
+var EMBED_KEY='__GOCATCHER_EMBED_KEY__';
 function q(id){return document.getElementById(id)}
 let iframeSrc='';
 async function refresh(){
   var running=null, port=0;
   try{ running=await window.vc_running(); port=await window.vc_port(); }catch(e){}
   if(running===null)return; // 绑定未就绪：保持现状，避免启动瞬间闪降级页
-  var url='http://127.0.0.1:'+port+'/';
+  // 内嵌豁免键必须带上：服务端对监控页/设置页默认 DENY 防点击劫持，只认本进程的键。
+  // 键是十六进制串，拼进 query 无需转义。
+  var url='http://127.0.0.1:'+port+'/?e='+EMBED_KEY;
   q('fport').textContent='127.0.0.1:'+port;
   q('pport').textContent=port;
   q('ph').style.display=running?'none':'flex';
@@ -94,4 +107,8 @@ async function refresh(){
 refresh();
 setInterval(refresh,1500);
 </script></body></html>`
+
+// shellHTML 把内嵌豁免键注入外壳模板。
+func shellHTML(embedKey string) string {
+	return strings.ReplaceAll(shellTemplate, embedKeyPlaceholder, embedKey)
 }
