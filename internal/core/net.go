@@ -96,24 +96,10 @@ func (r *Runtime) dialTLSContext(ctx context.Context, network, addr string) (net
 	// 4. uTLS 握手 — 伪造 Chrome 指纹
 	host, _, _ := net.SplitHostPort(addr)
 
-	uConn := utls.UClient(bConn, &utls.Config{
-		ServerName: host,
-	}, utls.HelloCustom)
-
-	// 获取 Chrome 指纹 spec，覆盖 ALPN 为 http/1.1 避免 HTTP/2 问题
-	spec, err := utls.UTLSIdToSpec(utls.HelloChrome_Auto)
+	uConn, err := newUTLSConn(bConn, host)
 	if err != nil {
 		bConn.Close()
-		return nil, fmt.Errorf("构建 TLS spec 失败: %w", err)
-	}
-	for _, ext := range spec.Extensions {
-		if alpn, ok := ext.(*utls.ALPNExtension); ok {
-			alpn.AlpnProtocols = []string{"http/1.1"}
-		}
-	}
-	if err := uConn.ApplyPreset(&spec); err != nil {
-		bConn.Close()
-		return nil, fmt.Errorf("应用 TLS spec 失败: %w", err)
+		return nil, err
 	}
 
 	if err := uConn.HandshakeContext(ctx); err != nil {
@@ -153,10 +139,43 @@ func dialDirect(ctx context.Context, addr string) (net.Conn, error) {
 		return nil, fmt.Errorf("直连失败: %w", err)
 	}
 	host, _, _ := net.SplitHostPort(addr)
-	uConn := utls.UClient(conn, &utls.Config{ServerName: host}, utls.HelloChrome_Auto)
+	uConn, err := newUTLSConn(conn, host)
+	if err != nil {
+		conn.Close()
+		return nil, err
+	}
 	if err := uConn.HandshakeContext(ctx); err != nil {
 		conn.Close()
 		return nil, fmt.Errorf("TLS 握手失败: %w", err)
+	}
+	return uConn, nil
+}
+
+// newUTLSConn 建立「伪造 Chrome 指纹」的 uTLS 连接，并把 ALPN 收窄为 http/1.1。
+//
+// 为什么必须收窄：Transport 自定义了 DialTLSContext（经代理与直连都走这里），
+// Go 不会为这类 Transport 启用 HTTP/2 —— 请求一律按 HTTP/1.1 编码。而
+// HelloChrome_Auto 的 ALPN 是 ["h2","http/1.1"]，支持 h2 的 CDN 会选中 h2，
+// 服务器于是按 HTTP/2 回帧（SETTINGS/GOAWAY），Transport 侧抛
+// "malformed HTTP response" 加一串二进制 —— 真实错误被完全盖住。
+// 只声明 http/1.1，服务器就只能按 HTTP/1.1 应答。
+//
+// 两条拨号路径（经代理 / 直连）必须共用本函数：曾经直连路径直接用
+// HelloChrome_Auto，B 站 CDN（cn-hnzz-cm-01-03.bilivideo.com）选中 h2 后
+// 表现为一堆乱码报错（实测复现，见 net_alpn_test.go）。
+func newUTLSConn(conn net.Conn, serverName string) (*utls.UConn, error) {
+	spec, err := utls.UTLSIdToSpec(utls.HelloChrome_Auto)
+	if err != nil {
+		return nil, fmt.Errorf("构建 TLS spec 失败: %w", err)
+	}
+	for _, ext := range spec.Extensions {
+		if alpn, ok := ext.(*utls.ALPNExtension); ok {
+			alpn.AlpnProtocols = []string{"http/1.1"}
+		}
+	}
+	uConn := utls.UClient(conn, &utls.Config{ServerName: serverName}, utls.HelloCustom)
+	if err := uConn.ApplyPreset(&spec); err != nil {
+		return nil, fmt.Errorf("应用 TLS spec 失败: %w", err)
 	}
 	return uConn, nil
 }
