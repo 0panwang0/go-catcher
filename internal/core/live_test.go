@@ -309,7 +309,7 @@ func TestVODStreamResumeRemainder(t *testing.T) {
 		tots = append(tots, tot)
 		pmu.Unlock()
 	}
-	content, base, isDirect, err := j.fetchPlaylist()
+	content, base, isDirect, err := j.fetchPlaylist(context.Background())
 	if err != nil || isDirect {
 		t.Fatalf("fetchPlaylist: isDirect=%v err=%v", isDirect, err)
 	}
@@ -371,7 +371,7 @@ func TestVODFMP4(t *testing.T) {
 
 	ctx := context.Background()
 	j := &dlJob{rt: testStd, m3u8URL: srv.URL + "/vod.m3u8"}
-	content, base, isDirect, err := j.fetchPlaylist()
+	content, base, isDirect, err := j.fetchPlaylist(context.Background())
 	if err != nil || isDirect {
 		t.Fatalf("fetchPlaylist: isDirect=%v err=%v", isDirect, err)
 	}
@@ -415,5 +415,104 @@ func TestVODFMP4(t *testing.T) {
 	want := "FTYP-MOOV-INIT" + "\x00\x00\x00\x10moofDATA0" + "\x00\x00\x00\x10moofDATA1"
 	if string(data) != want {
 		t.Fatalf("文件=%q want %q", data, want)
+	}
+}
+
+// TestLiveEventStreamNoDuplicate 只增不减的 EVENT 直播列表（旧分片永远留在
+// 列表里）不能重复录制：判定必须靠 media sequence 水位线 —— 一旦 URL 窗口有界，
+// 早期 URL 会被淘汰，按「URL 是否在窗口里」判重会把它们当新分片重下一遍。
+func TestLiveEventStreamNoDuplicate(t *testing.T) {
+	var mu sync.Mutex
+	polls := 0
+	mux := http.NewServeMux()
+	mux.HandleFunc("/event.m3u8", func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		polls++
+		n := polls
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/vnd.apple.mpegurl")
+		var b strings.Builder
+		b.WriteString("#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-PLAYLIST-TYPE:EVENT\n#EXT-X-MEDIA-SEQUENCE:0\n")
+		total := 3 * n
+		if total > 6 {
+			total = 6
+		}
+		for i := 0; i < total; i++ {
+			fmt.Fprintf(&b, "#EXTINF:2.0,\nseg/%d.ts\n", i)
+		}
+		if n >= 3 {
+			b.WriteString("#EXT-X-ENDLIST\n")
+		}
+		fmt.Fprint(w, b.String())
+	})
+	mux.HandleFunc("/seg/", func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintf(w, "SEG-%s", strings.TrimPrefix(r.URL.Path, "/seg/"))
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	oldI, oldE := testStd.livePollInterval, testStd.liveMaxEmptyPolls
+	testStd.livePollInterval = 5 * time.Millisecond
+	testStd.liveMaxEmptyPolls = 3
+	defer func() { testStd.livePollInterval, testStd.liveMaxEmptyPolls = oldI, oldE }()
+
+	out := filepath.Join(t.TempDir(), "event.ts")
+	j := &dlJob{rt: testStd, m3u8URL: srv.URL + "/event.m3u8", live: true}
+
+	next, err := j.liveDownload(context.Background(), out, 0)
+	if err != nil {
+		t.Fatalf("liveDownload: %v", err)
+	}
+	if next != 6 {
+		t.Fatalf("next=%d want 6（每片恰好录一次）", next)
+	}
+	data, err := os.ReadFile(out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantOut := ""
+	for i := 0; i < 6; i++ {
+		wantOut += fmt.Sprintf("SEG-%d.ts", i)
+	}
+	if string(data) != wantOut {
+		t.Fatalf("内容=%q\nwant %q（EVENT 列表不得重复录制）", data, wantOut)
+	}
+}
+
+// TestSeenWindowBounded 去重窗口必须有界，且水位线独立于窗口工作：长直播不能
+// 把见过的每个 URL 都留在内存与状态文件里（旧实现只增不减 → 写盘近似 O(n²)）。
+func TestSeenWindowBounded(t *testing.T) {
+	j := &dlJob{rt: testStd, live: true}
+	n := uint64(liveSeenWindow*3 + 7)
+	for i := uint64(0); i < n; i++ {
+		j.seenRecord(i, fmt.Sprintf("https://cdn.example.com/seg/%d.ts", i))
+	}
+	seq, any, urls := j.seenSnapshotState()
+	if !any || seq != n-1 {
+		t.Fatalf("水位线应推进到最后一个序号：seq=%d any=%v want %d/true", seq, any, n-1)
+	}
+	if len(urls) > liveSeenWindow {
+		t.Fatalf("URL 窗口应 ≤ %d，得到 %d", liveSeenWindow, len(urls))
+	}
+	// 判定不依赖 URL 是否还在窗口里：最早期分片已被淘汰，仍须判为已录
+	if !j.seenCovers(0, "https://cdn.example.com/seg/0.ts") {
+		t.Error("被窗口淘汰的早期分片仍应判为已录（否则 EVENT 流会重复录制）")
+	}
+	if !j.seenCovers(n-1, "") {
+		t.Error("最近录过的分片应判为已录")
+	}
+	if j.seenCovers(n, "") {
+		t.Error("超前序号应判为新分片")
+	}
+
+	// 恢复：水位线保留，URL 窗口截断到上限内
+	j2 := &dlJob{rt: testStd, live: true}
+	big := make([]string, liveSeenWindow+500)
+	for i := range big {
+		big[i] = fmt.Sprintf("u%d", i)
+	}
+	j2.restoreSeen(big, 42, true)
+	if seq2, any2, urls2 := j2.seenSnapshotState(); !any2 || seq2 != 42 || len(urls2) > liveSeenWindow {
+		t.Fatalf("恢复后 seq=%d any=%v len(urls)=%d want 42/true/≤%d", seq2, any2, len(urls2), liveSeenWindow)
 	}
 }

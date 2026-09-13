@@ -15,23 +15,27 @@ const stateVersion = 1
 // persistedTask 落盘的字段（不含运行时对象）
 
 type persistedTask struct {
-	ID          string          `json:"id"`
-	Filename    string          `json:"filename"`
-	SaveDir     string          `json:"saveDir"`
-	M3u8URL     string          `json:"m3u8URL"`
-	Referer     string          `json:"referer"`
-	SegDone     int64           `json:"segDone"`
-	SegTot      int64           `json:"segTot"`
-	Stage       string          `json:"stage"`
-	Done        bool            `json:"done"`
-	Paused      bool            `json:"paused"`
-	Canceled    bool            `json:"canceled"`
-	FinalPath   string          `json:"finalPath"`
-	ErrorMsg    string          `json:"errorMsg"`
-	Started     time.Time       `json:"started"`
-	Finished    time.Time       `json:"finished"`
-	Live        bool            `json:"live"`                  // 直播跟随任务（播放列表无 ENDLIST）
-	SeenURLs    []string        `json:"seenURLs,omitempty"`    // 直播已录分片 URL 窗口（断点恢复去重）
+	ID        string    `json:"id"`
+	Filename  string    `json:"filename"`
+	SaveDir   string    `json:"saveDir"`
+	M3u8URL   string    `json:"m3u8URL"`
+	Referer   string    `json:"referer"`
+	SegDone   int64     `json:"segDone"`
+	SegTot    int64     `json:"segTot"`
+	Stage     string    `json:"stage"`
+	Done      bool      `json:"done"`
+	Paused    bool      `json:"paused"`
+	Canceled  bool      `json:"canceled"`
+	FinalPath string    `json:"finalPath"`
+	ErrorMsg  string    `json:"errorMsg"`
+	Started   time.Time `json:"started"`
+	Finished  time.Time `json:"finished"`
+	Live      bool      `json:"live"` // 直播跟随任务（播放列表无 ENDLIST）
+	// 直播去重状态：主依据是 seenSeq 水位线（seenAny = 是否已建立）；SeenURLs 是
+	// 有界 URL 窗口，仅用于兼容只存了 URL 的旧状态文件。
+	SeenSeq     uint64          `json:"seenSeq,omitempty"`
+	SeenAny     bool            `json:"seenAny,omitempty"`
+	SeenURLs    []string        `json:"seenURLs,omitempty"`
 	ContainerID string          `json:"containerID,omitempty"` // 探测到的容器 ID（续传恢复规范化）
 	NormState   json.RawMessage `json:"normState,omitempty"`   // 跨分片状态字节（NormState.snapshot 导出，续传 restore 恢复）
 }
@@ -120,7 +124,7 @@ func (r *Runtime) collectPersisted() []persistedTask {
 			Live: s.live,
 		}
 		if s.live {
-			pt.SeenURLs = te.seenURLs()
+			pt.SeenSeq, pt.SeenAny, pt.SeenURLs = te.seenState()
 		}
 		pt.ContainerID = s.containerID
 		if len(s.normState) > 0 {
@@ -133,14 +137,14 @@ func (r *Runtime) collectPersisted() []persistedTask {
 	return out
 }
 
-// seenURLs 取直播任务当前已录制分片 URL 窗口（运行时以 job.seen 为准）。
-func (te *taskEntry) seenURLs() []string {
+// seenState 取直播任务的去重状态（水位线 + 有界 URL 窗口）；非直播任务返回零值。
+func (te *taskEntry) seenState() (uint64, bool, []string) {
 	te.mu.Lock()
 	defer te.mu.Unlock()
 	if te.job == nil || !te.job.live {
-		return nil
+		return 0, false, nil
 	}
-	return te.job.seenSnapshot()
+	return te.job.seenSnapshotState()
 }
 
 // ============================================================
@@ -249,7 +253,8 @@ func (r *Runtime) loadState() {
 			m3u8URL: pt.M3u8URL, referer: pt.Referer, filename: pt.Filename,
 			saveDir: pt.SaveDir, segDone: pt.SegDone, segTot: pt.SegTot,
 			started: pt.Started, finished: pt.Finished,
-			live: pt.Live, seen: pt.SeenURLs,
+			live: pt.Live,
+			seen: pt.SeenURLs, seenSeq: pt.SeenSeq, seenAny: pt.SeenAny,
 			containerID: pt.ContainerID,
 		}
 		if len(pt.NormState) > 0 {
@@ -277,6 +282,9 @@ func (r *Runtime) loadState() {
 			r.seqID = n
 		}
 	}
+	// 恢复出来的历史任务同样受 maxKeptTasks 约束：pruneOldTasks 原先只在新建任务
+	// 时被调用，状态文件里堆积的旧完成任务无人清理（长期使用后列表无限增长）。
+	r.pruneOldTasks()
 	if len(sf.Tasks) > 0 {
 		fmt.Printf("[state] 已恢复 %d 个历史任务（其中 %d 个可继续下载）\n", len(sf.Tasks), resumed)
 	}

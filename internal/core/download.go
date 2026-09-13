@@ -41,9 +41,14 @@ type dlJob struct {
 	live bool
 	// pre 容器探测时已拉取的首个分片（from==0 时直接复用，避免重复下载）
 	pre []byte
-	// seen 直播已下载分片 URL 集合（去重 + 断点恢复时跳过已录分片）
-	seenMu sync.Mutex
-	seen   map[string]bool
+	// 直播去重状态。判定主依据是 media sequence 水位线（seenSeq/seenAny，见
+	// seenCovers）；seen/seenOrder 是有界 URL 窗口（liveSeenWindow），只用于
+	// 兼容「只持久化了 URL」的旧状态文件。
+	seenMu    sync.Mutex
+	seen      map[string]bool
+	seenOrder []string
+	seenSeq   uint64
+	seenAny   bool
 
 	// container 探测到的容器（决定分片写入前是否需要规范化）
 	container *Container
@@ -63,11 +68,87 @@ type dlJob struct {
 	initLen int
 }
 
-// seenHas / seenAdd / seenSnapshot 直播分片去重与持久化窗口。
-func (j *dlJob) seenHas(u string) bool {
+// liveSeenWindow 直播去重 URL 窗口的上限（条数）。
+//
+// 去重的判定主依据是 media sequence 水位线（见 seenCovers），URL 窗口只用于
+// 兼容旧状态文件。即便如此也要有界：旧实现只增不减，一段 6 小时直播（2s/片）
+// 会攒下约 10800 条 URL 常驻内存，且 markDirty 的 1.2s debounce 每次都把它
+// 整个序列化进 gocatcher_state.json（近似 O(n²) 写盘放大）。窗口只需覆盖
+// 「播放列表当前滚动窗口」内的分片，1000 条远超任何实际列表窗口。
+const liveSeenWindow = 1000
+
+// seenCovers 报告序号为 seq 的分片是否已录制。
+//
+// 水位线已建立时按序号判定：这对滑动窗口列表与只增不减的 EVENT 列表都正确。
+// 旧实现用 URL 集合，窗口一旦有界，EVENT 列表里被淘汰过的早期分片就会被当
+// 新分片重复录制；不设界又解决不了内存与写盘的膨胀。
+// 刚恢复、水位线尚未建立时退回 URL 集合判定：兼容只存了 URL 的旧状态文件。
+func (j *dlJob) seenCovers(seq uint64, u string) bool {
 	j.seenMu.Lock()
 	defer j.seenMu.Unlock()
+	if j.seenAny {
+		return seq <= j.seenSeq
+	}
 	return j.seen[u]
+}
+
+// seenRecord 记录一个已录制分片：推进 media sequence 水位线，并把 URL 放进
+// 有界窗口（仅作旧状态文件的恢复兜底，见 seenCovers）。
+func (j *dlJob) seenRecord(seq uint64, u string) {
+	j.seenMu.Lock()
+	defer j.seenMu.Unlock()
+	if !j.seenAny || seq > j.seenSeq {
+		j.seenSeq = seq
+	}
+	j.seenAny = true
+	if j.seen == nil {
+		j.seen = make(map[string]bool)
+	}
+	if j.seen[u] {
+		return
+	}
+	j.seen[u] = true
+	j.seenOrder = append(j.seenOrder, u)
+	if len(j.seenOrder) > liveSeenWindow {
+		old := j.seenOrder[0]
+		j.seenOrder = append(j.seenOrder[:0], j.seenOrder[1:]...) // 原地左移，容量不增长
+		delete(j.seen, old)
+	}
+}
+
+// restoreSeen 断点续传时恢复直播去重状态：水位线优先，URL 集合兜底
+// （旧状态文件只存了 seenURLs）。
+func (j *dlJob) restoreSeen(urls []string, seq uint64, any bool) {
+	j.seenMu.Lock()
+	defer j.seenMu.Unlock()
+	j.seen = make(map[string]bool, len(urls))
+	j.seenOrder = j.seenOrder[:0]
+	for _, u := range urls {
+		if j.seen[u] {
+			continue
+		}
+		j.seen[u] = true
+		j.seenOrder = append(j.seenOrder, u)
+	}
+	if len(j.seenOrder) > liveSeenWindow {
+		j.seenOrder = append([]string(nil), j.seenOrder[len(j.seenOrder)-liveSeenWindow:]...)
+		j.seen = make(map[string]bool, len(j.seenOrder))
+		for _, u := range j.seenOrder {
+			j.seen[u] = true
+		}
+	}
+	j.seenSeq, j.seenAny = seq, any
+}
+
+// seenSnapshotState 导出直播去重状态（水位线 + 有界 URL 窗口）供持久化。
+// URL 稳定排序：否则文件内容会随插入顺序抖动，白白产生 diff。
+func (j *dlJob) seenSnapshotState() (uint64, bool, []string) {
+	j.seenMu.Lock()
+	defer j.seenMu.Unlock()
+	out := make([]string, len(j.seenOrder))
+	copy(out, j.seenOrder)
+	sort.Strings(out)
+	return j.seenSeq, j.seenAny, out
 }
 
 // backfill 任务完成/暂停收尾：委托规范化状态的 Finish（无状态容器为 nil，静默跳过）。
@@ -76,24 +157,6 @@ func (j *dlJob) backfill(path string) error {
 		return nil
 	}
 	return j.norm.Finish(path)
-}
-
-func (j *dlJob) seenAdd(u string) {
-	j.seenMu.Lock()
-	defer j.seenMu.Unlock()
-	j.seen[u] = true
-}
-
-// seenSnapshot 返回已见分片 URL（稳定排序，用于持久化断点恢复）。
-func (j *dlJob) seenSnapshot() []string {
-	j.seenMu.Lock()
-	defer j.seenMu.Unlock()
-	out := make([]string, 0, len(j.seen))
-	for u := range j.seen {
-		out = append(out, u)
-	}
-	sort.Strings(out)
-	return out
 }
 
 // setSeg 更新本任务分片进度计数，并回调 progress(若设了)
@@ -494,7 +557,9 @@ func (j *dlJob) downloadRange(ctx context.Context, f *os.File, start, end int64)
 				return err
 			}
 			attempt++
-			time.Sleep(time.Duration(attempt-1) * 300 * time.Millisecond)
+			if !sleepCtx(ctx, time.Duration(attempt-1)*300*time.Millisecond) {
+				return ctx.Err()
+			}
 			continue
 		}
 		if resp.StatusCode == http.StatusRequestedRangeNotSatisfiable {
@@ -507,10 +572,19 @@ func (j *dlJob) downloadRange(ctx context.Context, f *os.File, start, end int64)
 				return fmt.Errorf("HTTP %d", resp.StatusCode)
 			}
 			attempt++
-			time.Sleep(time.Duration(attempt-1) * 300 * time.Millisecond)
+			if !sleepCtx(ctx, time.Duration(attempt-1)*300*time.Millisecond) {
+				return ctx.Err()
+			}
 			continue
 		}
-		n, cpErr := copyWithIdleTimeout(&offsetWriter{f: f, off: start}, resp.Body, transferIdleTimeout)
+		// 按 expected 限长：服务器忽略 Range 结束偏移、把整份文件回给一个分片请求时
+		// （行为不当的 CDN / 中间层），多出的字节会被 WriteAt 写进下一个分片的区域
+		// 并把它污染（邻片若已 done 就再也不会被重写，成品里那段是坏数据）。
+		// 限长后 n 不可能超过 expected，多出的部分直接丢弃。
+		n, cpErr := copyWithIdleTimeout(
+			&offsetWriter{f: f, off: start, end: end},
+			limitReadCloser(resp.Body, expected, resp.Body),
+			transferIdleTimeout)
 		resp.Body.Close()
 		if cpErr != nil {
 			if ctx.Err() != nil {
@@ -520,7 +594,9 @@ func (j *dlJob) downloadRange(ctx context.Context, f *os.File, start, end int64)
 				return cpErr
 			}
 			attempt++
-			time.Sleep(time.Duration(attempt-1) * 300 * time.Millisecond)
+			if !sleepCtx(ctx, time.Duration(attempt-1)*300*time.Millisecond) {
+				return ctx.Err()
+			}
 			continue
 		}
 		if n != expected {
@@ -528,7 +604,9 @@ func (j *dlJob) downloadRange(ctx context.Context, f *os.File, start, end int64)
 				return fmt.Errorf("分片 %d-%d 收到 %d 字节, 期望 %d", start, end, n, expected)
 			}
 			attempt++
-			time.Sleep(time.Duration(attempt-1) * 300 * time.Millisecond)
+			if !sleepCtx(ctx, time.Duration(attempt-1)*300*time.Millisecond) {
+				return ctx.Err()
+			}
 			continue
 		}
 		return nil
@@ -536,12 +614,22 @@ func (j *dlJob) downloadRange(ctx context.Context, f *os.File, start, end int64)
 }
 
 // offsetWriter 把 Write 转发为固定偏移的 WriteAt（并发分片各自写自己的区间）。
+// end 是本次分片可写的最后一个字节偏移：写入会被截断在该位置，保证任何情况下
+// 溢出的字节都不会落到下一个分片的区域（调用方已用 limitReadCloser 在源头限长，
+// 这一层是纵深防御）。
 type offsetWriter struct {
 	f   *os.File
 	off int64
+	end int64
 }
 
 func (w *offsetWriter) Write(p []byte) (int, error) {
+	if w.off > w.end {
+		return 0, nil // 已写满本次区间，多余的直接丢弃
+	}
+	if remain := w.end - w.off + 1; int64(len(p)) > remain {
+		p = p[:remain]
+	}
 	n, err := w.f.WriteAt(p, w.off)
 	w.off += int64(n)
 	return n, err
@@ -602,13 +690,17 @@ func fetchSegment(ctx context.Context, j *dlJob, segURL string) ([]byte, error) 
 			if ctx.Err() != nil {
 				return nil, ctx.Err()
 			}
-			time.Sleep(time.Duration(attempt) * time.Second)
+			if !sleepCtx(ctx, time.Duration(attempt)*time.Second) {
+				return nil, ctx.Err()
+			}
 			continue
 		}
 		if resp.StatusCode != http.StatusOK {
 			resp.Body.Close()
 			lastErr = fmt.Errorf("attempt %d: HTTP %d", attempt, resp.StatusCode)
-			time.Sleep(time.Duration(attempt) * time.Second)
+			if !sleepCtx(ctx, time.Duration(attempt)*time.Second) {
+				return nil, ctx.Err()
+			}
 			continue
 		}
 		data, err := readAllWithIdleTimeout(resp.Body, transferIdleTimeout)
@@ -618,7 +710,9 @@ func fetchSegment(ctx context.Context, j *dlJob, segURL string) ([]byte, error) 
 			if ctx.Err() != nil {
 				return nil, ctx.Err()
 			}
-			time.Sleep(time.Duration(attempt) * time.Second)
+			if !sleepCtx(ctx, time.Duration(attempt)*time.Second) {
+				return nil, ctx.Err()
+			}
 			continue
 		}
 		return data, nil
@@ -805,7 +899,7 @@ func (j *dlJob) liveDownload(ctx context.Context, outPath string, from int) (int
 		if err := ctx.Err(); err != nil {
 			return next, nil // 暂停/取消：把断点交还上层
 		}
-		content, base, isDirect, err := j.fetchPlaylist()
+		content, base, isDirect, err := j.fetchPlaylist(ctx)
 		if err != nil {
 			return next, err
 		}
@@ -815,7 +909,12 @@ func (j *dlJob) liveDownload(ctx context.Context, outPath string, from int) (int
 		cur := parsePlaylist(content, base)
 		// 同一轮窗口内换 key（key rotation）无法安全解密：显式失败。
 		// 跨轮换 key 是支持的 —— 每轮按本轮声明的 key 解密本轮分片。
-		if kerr := ensureSingleKey(cur); kerr != nil {
+		//
+		// 校验必须走 validatePlaylist 这个唯一入口，不能只查 ensureSingleKey：
+		// 畸形加密声明（METHOD 非 NONE 但 URI 解析不出）、#EXT-X-BYTERANGE、
+		// 非 identity 的 KEYFORMAT 在点播路径都会被它挡下，直播若只做简易校验
+		// 就成了绕过口 —— 那几类恰好都是「产物坏了但日志正常」的静默损坏。
+		if kerr := validatePlaylist(cur); kerr != nil {
 			return next, kerr
 		}
 		// 每轮轮询重新装配解密器（幂等：key 未变不重拉）；key 轮换时按新 key 解密后续分片
@@ -826,12 +925,16 @@ func (j *dlJob) liveDownload(ctx context.Context, outPath string, from int) (int
 		var newSegs []string
 		firstNewPos := -1 // 本批首个新分片在当前列表中的位置（派生 IV 的序号基准）
 		for pos, u := range cur.segments {
-			if !j.seenHas(u) {
-				j.seenAdd(u)
-				newSegs = append(newSegs, u)
-				if firstNewPos < 0 {
-					firstNewPos = pos
-				}
+			// 按 media sequence 判重（列表位置 + MEDIA-SEQUENCE），而不是"URL 是否
+			// 见过"：见 seenCovers。
+			seq := cur.mediaSeq + uint64(pos)
+			if j.seenCovers(seq, u) {
+				continue
+			}
+			j.seenRecord(seq, u)
+			newSegs = append(newSegs, u)
+			if firstNewPos < 0 {
+				firstNewPos = pos
 			}
 		}
 

@@ -33,6 +33,9 @@ var routeDefs = []routeDef{
 
 	{"/pickdir", []string{http.MethodGet}, true, func(e *Engine) http.HandlerFunc { return e.handlePickDir }},
 	{"/status", []string{http.MethodGet}, true, func(e *Engine) http.HandlerFunc { return e.handleStatus }},
+	// /download 用 GET 触发副作用：令牌挡住了外部调用方，但语义上它不是幂等方法，
+	// 属 CSRF 友好型接口（历史包袱）。GET 是扩展侧的既有契约（content script /
+	// downloader 页都按 GET 拼 URL），改 POST 会破坏兼容，故显式记一笔，新端点勿模仿。
 	{"/download", []string{http.MethodGet}, true, func(e *Engine) http.HandlerFunc { return e.handleDownload }},
 	{"/probe", []string{http.MethodGet}, true, func(e *Engine) http.HandlerFunc { return e.handleProbe }},
 	{"/pause", []string{http.MethodGet}, true, func(e *Engine) http.HandlerFunc { return e.handlePause }},

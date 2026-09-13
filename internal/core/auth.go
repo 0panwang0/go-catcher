@@ -38,6 +38,21 @@ const (
 	tokenHeader = "X-GoCatcher-Token"
 )
 
+// frameDeniedPaths 禁止被 iframe 嵌套的端点（点击劫持防护）。
+//
+// 这两个页面免令牌，但页面 HTML 里注入了真实令牌：任意网页用
+// <iframe src="http://127.0.0.1:<port>/settings" style="opacity:0"> 透明覆盖，
+// 诱导用户点击即可驱动页面自身的脚本 POST /config（把代理改成攻击者地址 → 流量
+// 经中间人）或改端口（服务重启后失联）；监控页的 /openfile 按钮同样能被诱导点击。
+// Host 校验拦不住 —— iframe 的 Host 就是本机地址，完全合法。
+//
+// 两个头都设：X-Frame-Options 是老浏览器/老 WebView 的兜底，CSP frame-ancestors
+// 是现代浏览器的标准。统一挂在这里而不是各个 handler 里 —— 少写一处就是少一个口子。
+var frameDeniedPaths = map[string]struct{}{
+	"/":         {},
+	"/settings": {},
+}
+
 // newAPIToken 生成 16 字节随机 token（32 位十六进制）。
 func newAPIToken() string {
 	b := make([]byte, 16)
@@ -79,6 +94,11 @@ func (r *Runtime) guard(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		// 禁止浏览器按内容猜类型：JSON 响应不能被当成脚本加载
 		w.Header().Set("X-Content-Type-Options", "nosniff")
+		// 注入令牌的页面禁止被 iframe 嵌套（点击劫持防护，见 frameDeniedPaths）
+		if _, deny := frameDeniedPaths[req.URL.Path]; deny {
+			w.Header().Set("X-Frame-Options", "DENY")
+			w.Header().Set("Content-Security-Policy", "frame-ancestors 'none'")
+		}
 
 		if !hostAllowed(req.Host) {
 			http.Error(w, "forbidden: unexpected Host header", http.StatusForbidden)

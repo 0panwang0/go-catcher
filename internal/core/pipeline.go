@@ -96,7 +96,7 @@ func runDiskPipeline(te *taskEntry) {
 	}
 
 	// 1. fetch 播放列表（若 URL 返回的是 MP4 等直链媒体文件，isDirect=true）
-	m3u8Content, baseURL, isDirect, err := job.fetchPlaylist()
+	m3u8Content, baseURL, isDirect, err := job.fetchPlaylist(ctx)
 	if err != nil {
 		if ctx.Err() != nil {
 			finishInterrupt(te)
@@ -233,13 +233,12 @@ func runDiskPipeline(te *taskEntry) {
 	// 4. 下载：直播跟随（循环拉取增量追加）vs 点播（一次性并发）
 	te.mu.Lock()
 	job.live = isLive
-	if isLive {
-		job.seen = make(map[string]bool)
-		for _, u := range st.seen {
-			job.seenAdd(u) // 断点恢复：跳过已录制分片
-		}
-	}
+	seenURLs, seenSeq, seenAny := st.seen, st.seenSeq, st.seenAny
 	te.mu.Unlock()
+	if isLive {
+		// 断点恢复：水位线优先，URL 集合兜底（旧状态文件只存了 URL）
+		job.restoreSeen(seenURLs, seenSeq, seenAny)
+	}
 
 	var next int
 	if isLive {

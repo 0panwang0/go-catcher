@@ -20,10 +20,8 @@ const probeMaxBytes = 4 << 20 // playlist/master 体积很小，4MB 上限防御
 const probeTimeout = 12 * time.Second // 预检是交互路径，快速失败优于长重试
 
 func (e *Engine) handleProbe(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
+	// 方法校验由路由表的 methodGuard 统一完成（routeDefs 里 /probe 只允许 GET）。
+	// 这里不再手写一份：表驱动改造后残留的重复校验会让人怀疑"是不是漏挂了表"。
 	target := strings.TrimSpace(r.URL.Query().Get("url"))
 	referer := strings.TrimSpace(r.URL.Query().Get("referer"))
 	if !e.rt.validProbeTarget(target) {

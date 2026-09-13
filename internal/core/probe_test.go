@@ -125,12 +125,18 @@ func TestProbeGunzipsBody(t *testing.T) {
 	}
 }
 
+// TestProbeMethodNotAllowed 方法校验由路由表的 methodGuard 提供（handler 内
+// 不再重复实现）：POST /probe 必须 405 且带 Allow 头。走 newMux 才覆盖到这一层。
 func TestProbeMethodNotAllowed(t *testing.T) {
 	setupProbeTest(t)
 	rec := httptest.NewRecorder()
-	testEngine().handleProbe(rec, httptest.NewRequest(http.MethodPost, "/probe?url=https://x.example/a.m3u8", nil))
+	newMux(testEngine()).ServeHTTP(rec,
+		httptest.NewRequest(http.MethodPost, "/probe?url=https://x.example/a.m3u8", nil))
 	if rec.Code != http.StatusMethodNotAllowed {
 		t.Fatalf("status=%d want 405", rec.Code)
+	}
+	if allow := rec.Header().Get("Allow"); allow != http.MethodGet {
+		t.Fatalf("Allow=%q want GET", allow)
 	}
 }
 

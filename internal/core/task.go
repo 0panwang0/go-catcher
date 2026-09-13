@@ -35,8 +35,12 @@ type taskState struct {
 
 	// live 直播跟随任务（播放列表无 ENDLIST，列表不断增长）
 	live bool
-	// seen 直播已录制分片 URL 窗口（断点恢复时跳过已录分片；运行时以 job.seen 为准）
-	seen []string
+	// 直播去重状态（断点恢复用；运行时以 job 的为准）：
+	// seen 是有界 URL 窗口（兼容只存了 URL 的旧状态文件），seenSeq/seenAny 是
+	// media sequence 水位线。
+	seen    []string
+	seenSeq uint64
+	seenAny bool
 
 	// containerID 探测到的容器 ID（断点续传恢复规范化等格式相关行为）
 	containerID string

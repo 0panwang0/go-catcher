@@ -415,3 +415,79 @@ func TestStreamWriterFlushBreakpointNotAhead(t *testing.T) {
 		t.Fatalf("Close 后断点应推进到 %d, got %d", segCount, flushed)
 	}
 }
+
+// TestDownloadRangeLimitsOversizedResponse 缺陷形态回归：服务器忽略 Range 的
+// 结束偏移、把整份文件回给一个分片请求时（行为不当的 CDN / 中间层），多出的
+// 字节绝不能写进相邻分片的区域 —— 邻片若已标记完成就不会再被重写，成品里
+// 那段永久是坏数据，而抽样校验未必命中。
+func TestDownloadRangeLimitsOversizedResponse(t *testing.T) {
+	content := bytes.Repeat([]byte{0xAB}, 4096)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// 故意无视 Range 的结束偏移：无论要哪一段，整个文件回过去
+		w.WriteHeader(http.StatusPartialContent)
+		w.Write(content)
+	}))
+	defer srv.Close()
+	saveRestoreHTTP(t, srv.Client(), 1)
+
+	path := filepath.Join(t.TempDir(), "x.bin")
+	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+
+	job := &dlJob{rt: testStd, m3u8URL: srv.URL}
+	// 请求 [0,99]：期望 100 字节，服务器回 4096
+	if err := job.downloadRange(context.Background(), f, 0, 99); err != nil {
+		t.Fatalf("前 100 字节内容正确，不应判失败: %v", err)
+	}
+	head := make([]byte, 100)
+	if _, err := f.ReadAt(head, 0); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(head, content[:100]) {
+		t.Fatal("分片写入内容应等于源文件前 100 字节")
+	}
+	// 文件必须恰好在 [0,99] 结束：多出的 3996 字节一旦落盘就会占住邻片区域
+	if fi, _ := f.Stat(); fi.Size() != 100 {
+		t.Fatalf("文件大小=%d want 100（服务器多回的字节不得落盘）", fi.Size())
+	}
+}
+
+// TestOffsetWriterTruncatesAtEnd offsetWriter 必须把写入截断在区间末尾：
+// 即便上游忘了限长，越界字节也不能落进邻片区域（纵深防御）。
+func TestOffsetWriterTruncatesAtEnd(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "x.bin")
+	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+
+	w := &offsetWriter{f: f, off: 10, end: 19} // 只允许写 [10,19]
+	n, err := w.Write(bytes.Repeat([]byte{0xEE}, 100))
+	if err != nil || n != 10 {
+		t.Fatalf("越界写入应被截断到区间末尾：n=%d err=%v want n=10", n, err)
+	}
+	buf := make([]byte, 20)
+	if _, err := f.ReadAt(buf, 0); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 10; i++ {
+		if buf[i] != 0 {
+			t.Fatalf("区间起点之前不应被写：偏移 %d = %#x", i, buf[i])
+		}
+	}
+	for i := 10; i < 20; i++ {
+		if buf[i] != 0xEE {
+			t.Fatalf("区间内应被写：偏移 %d = %#x", i, buf[i])
+		}
+	}
+	if fi, _ := f.Stat(); fi.Size() != 20 {
+		t.Fatalf("文件大小=%d want 20（越界字节不得落盘）", fi.Size())
+	}
+	if n2, err2 := w.Write([]byte("more")); err2 != nil || n2 != 0 {
+		t.Fatalf("写满后应安全丢弃：n=%d err=%v", n2, err2)
+	}
+}

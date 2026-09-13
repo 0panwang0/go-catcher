@@ -41,7 +41,7 @@ func TestParseKeyLineReadsKeyFormat(t *testing.T) {
 		},
 	}
 	for _, c := range cases {
-		k := parseKeyLine(c.line, base)
+		k, _ := parseKeyLine(c.line, base)
 		if k == nil {
 			t.Fatalf("%s: 应解析出 KeyInfo，得到 nil（line=%s）", c.name, c.line)
 		}
@@ -122,8 +122,8 @@ seg0.ts
 // 且「裸写」与「显式 identity」是同一件事——不能因为写法不同就判成 key rotation
 // （那会把正常流拒掉，比漏判更糟：误伤）。
 func TestKeyFormatDoesNotTriggerFalseRotation(t *testing.T) {
-	bare := parseKeyLine(`#EXT-X-KEY:METHOD=AES-128,URI="k.bin"`, "https://cdn.example.com/v/pl.m3u8")
-	explicit := parseKeyLine(`#EXT-X-KEY:METHOD=AES-128,URI="k.bin",KEYFORMAT="identity"`, "https://cdn.example.com/v/pl.m3u8")
+	bare, _ := parseKeyLine(`#EXT-X-KEY:METHOD=AES-128,URI="k.bin"`, "https://cdn.example.com/v/pl.m3u8")
+	explicit, _ := parseKeyLine(`#EXT-X-KEY:METHOD=AES-128,URI="k.bin",KEYFORMAT="identity"`, "https://cdn.example.com/v/pl.m3u8")
 	if !sameKey(bare, explicit) {
 		t.Error("缺省 KEYFORMAT 与显式 identity 应视为同一条 key")
 	}
@@ -133,7 +133,7 @@ func TestKeyFormatDoesNotTriggerFalseRotation(t *testing.T) {
 	}
 
 	// 真的换了 KEYFORMAT 才算不同
-	wv := parseKeyLine(`#EXT-X-KEY:METHOD=AES-128,URI="k.bin",KEYFORMAT="com.widevine"`, "https://cdn.example.com/v/pl.m3u8")
+	wv, _ := parseKeyLine(`#EXT-X-KEY:METHOD=AES-128,URI="k.bin",KEYFORMAT="com.widevine"`, "https://cdn.example.com/v/pl.m3u8")
 	if sameKey(bare, wv) {
 		t.Error("KEYFORMAT 不同不应视为同一条 key")
 	}

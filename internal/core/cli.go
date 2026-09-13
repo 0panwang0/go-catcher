@@ -105,7 +105,7 @@ func RunCLI(o CLIOptions) int {
 
 	// 1. 获取 m3u8 / 直链识别
 	fmt.Println("\n[1/4] 获取 m3u8 索引...")
-	m3u8Content, baseURL, isDirect, err := job.fetchPlaylist()
+	m3u8Content, baseURL, isDirect, err := job.fetchPlaylist(context.Background())
 	if err != nil {
 		fmt.Printf("获取 m3u8 失败: %v\n", err)
 		return 1
@@ -187,7 +187,6 @@ func RunCLI(o CLIOptions) int {
 		defer stop()
 		dlCtx = ctx
 		job.live = true
-		job.seen = make(map[string]bool)
 		written, err = job.liveDownload(dlCtx, partPath, 0)
 	} else {
 		written, err = streamDownload(dlCtx, job, segURLs, 0, pl.mediaSeq, partPath)

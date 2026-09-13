@@ -218,18 +218,27 @@ func cleanURLParseErr(err error, target string) error {
 
 // 带重试的 HTTP GET
 
-func (r *Runtime) httpGetWithRetry(target, ref string) ([]byte, int, error) {
+func (r *Runtime) httpGetWithRetry(ctx context.Context, target, ref string) ([]byte, int, error) {
 	var lastErr error
 	var lastStatus int
 	for attempt := 1; attempt <= r.maxRetriesNow(); attempt++ {
+		if err := ctx.Err(); err != nil {
+			return nil, lastStatus, err
+		}
 		req, err := r.newRequest(target, ref)
 		if err != nil {
 			return nil, 0, cleanURLParseErr(err, target)
 		}
+		req = req.WithContext(ctx)
 		resp, err := r.getClient().Do(req)
 		if err != nil {
+			if ctx.Err() != nil {
+				return nil, lastStatus, ctx.Err()
+			}
 			lastErr = fmt.Errorf("attempt %d: %w", attempt, err)
-			time.Sleep(time.Duration(attempt*2) * time.Second)
+			if !sleepCtx(ctx, time.Duration(attempt*2)*time.Second) {
+				return nil, lastStatus, ctx.Err()
+			}
 			continue
 		}
 		if resp.StatusCode != http.StatusOK {
@@ -243,13 +252,20 @@ func (r *Runtime) httpGetWithRetry(target, ref string) ([]byte, int, error) {
 			}
 			resp.Body.Close()
 			lastErr = fmt.Errorf("attempt %d: HTTP %d", attempt, resp.StatusCode)
-			time.Sleep(time.Duration(attempt*2) * time.Second)
+			if !sleepCtx(ctx, time.Duration(attempt*2)*time.Second) {
+				return nil, lastStatus, ctx.Err()
+			}
 			continue
 		}
-		body, err := io.ReadAll(resp.Body)
+		// 读体带空闲超时（与分片下载同一套）：只设 ResponseHeaderTimeout 时，
+		// 服务端把响应头发完就停住会让读取永久挂住。
+		body, err := readAllWithIdleTimeout(resp.Body, transferIdleTimeout)
 		resp.Body.Close()
 		if err != nil {
 			lastErr = fmt.Errorf("attempt %d: read body: %w", attempt, err)
+			if ctx.Err() != nil {
+				return nil, lastStatus, ctx.Err()
+			}
 			continue
 		}
 		// 显式解压：Go 在请求未显式声明 Accept-Encoding 时会自动解压 gzip，
@@ -288,24 +304,35 @@ func isM3U8Playlist(body []byte) bool {
 // httpGetPlaylist 获取 m3u8 播放列表；若响应是直链媒体文件（MP4 等），
 // 只读取开头一小段识别后即返回（isDirect=true），由上层改为流式整体下载，
 // 避免把整个大文件读进内存。文本播放列表则读完剩余部分一并返回。
-func (r *Runtime) httpGetPlaylist(target, ref string) (body []byte, isDirect bool, status int, err error) {
+func (r *Runtime) httpGetPlaylist(ctx context.Context, target, ref string) (body []byte, isDirect bool, status int, err error) {
 	const peekLen = 32 << 10 // 32KB：足够判断文本播放列表与二进制媒体头
 	var lastErr error
 	for attempt := 1; attempt <= r.maxRetriesNow(); attempt++ {
+		if err := ctx.Err(); err != nil {
+			return nil, false, 0, err
+		}
 		req, rerr := r.newRequest(target, ref)
 		if rerr != nil {
 			return nil, false, 0, cleanURLParseErr(rerr, target)
 		}
+		req = req.WithContext(ctx)
 		resp, rerr := r.getClient().Do(req)
 		if rerr != nil {
+			if ctx.Err() != nil {
+				return nil, false, 0, ctx.Err()
+			}
 			lastErr = fmt.Errorf("attempt %d: %w", attempt, rerr)
-			time.Sleep(time.Duration(attempt*2) * time.Second)
+			if !sleepCtx(ctx, time.Duration(attempt*2)*time.Second) {
+				return nil, false, 0, ctx.Err()
+			}
 			continue
 		}
 		if resp.StatusCode != http.StatusOK {
 			resp.Body.Close()
 			lastErr = fmt.Errorf("attempt %d: HTTP %d", attempt, resp.StatusCode)
-			time.Sleep(time.Duration(attempt*2) * time.Second)
+			if !sleepCtx(ctx, time.Duration(attempt*2)*time.Second) {
+				return nil, false, 0, ctx.Err()
+			}
 			continue
 		}
 
@@ -318,8 +345,10 @@ func (r *Runtime) httpGetPlaylist(target, ref string) (body []byte, isDirect boo
 				gz = nil // 解压失败就按原样读（极少见）
 			}
 		}
-		peek, rerr := io.ReadAll(io.LimitReader(rd, peekLen))
-		if rerr != nil {
+		// peek/rest 都带空闲超时，closer 恒为 resp.Body：gzip.Reader.Close 不关
+		// 底层连接，而空闲超时靠 Close 从另一 goroutine 中断阻塞读。
+		var peekBuf bytes.Buffer
+		if _, rerr = copyWithIdleTimeout(&peekBuf, limitReadCloser(rd, peekLen, resp.Body), transferIdleTimeout); rerr != nil {
 			if gz != nil {
 				gz.Close()
 			}
@@ -327,6 +356,7 @@ func (r *Runtime) httpGetPlaylist(target, ref string) (body []byte, isDirect boo
 			lastErr = fmt.Errorf("attempt %d: read body: %w", attempt, rerr)
 			continue
 		}
+		peek := peekBuf.Bytes()
 		if isDirectMediaFile(peek, resp.Header.Get("Content-Type")) {
 			if gz != nil {
 				gz.Close()
@@ -334,7 +364,7 @@ func (r *Runtime) httpGetPlaylist(target, ref string) (body []byte, isDirect boo
 			resp.Body.Close()
 			return peek, true, http.StatusOK, nil
 		}
-		rest, rerr := io.ReadAll(rd)
+		rest, rerr := readAllWithIdleTimeout(&limitedReadCloser{Reader: rd, Closer: resp.Body}, transferIdleTimeout)
 		if gz != nil {
 			gz.Close()
 		}
@@ -485,6 +515,38 @@ func readAllWithIdleTimeout(body io.ReadCloser, idle time.Duration) ([]byte, err
 		return nil, err
 	}
 	return buf.Bytes(), nil
+}
+
+// sleepCtx 可中断的退避等待：ctx 结束立刻返回 false，调用方据此提前退出，
+// 而不是把一轮最长数秒的 sleep 白等完（暂停/取消要等好几秒才生效）。
+func sleepCtx(ctx context.Context, d time.Duration) bool {
+	if d <= 0 {
+		return ctx.Err() == nil
+	}
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-t.C:
+		return true
+	}
+}
+
+// limitedReadCloser 限制读取上限，Close 作用于指定的 closer。
+//
+// 为什么不是 io.NopCloser(io.LimitReader(...))：copyWithIdleTimeout 靠 body.Close()
+// 从另一 goroutine 中断阻塞读（关闭后阻塞中的 Read 会立刻返回错误）。NopCloser 的
+// Close 是空操作，空闲超时会因此失效、连接卡死时读永久阻塞。closer 传底层
+// resp.Body 即可——即便上层套了 gzip.Reader，中断底层连接同样能让 gzip 读报错。
+type limitedReadCloser struct {
+	io.Reader
+	io.Closer
+}
+
+// limitReadCloser 把 r 截断为最多可读 n 字节，Close 关闭 closer。
+func limitReadCloser(r io.Reader, n int64, closer io.Closer) io.ReadCloser {
+	return &limitedReadCloser{Reader: io.LimitReader(r, n), Closer: closer}
 }
 
 // dlJob：单个下载任务的全部状态。同一时刻可存在多个 dlJob 并行跑。

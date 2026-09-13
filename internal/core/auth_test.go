@@ -94,6 +94,23 @@ func TestGuardTokenFreePaths(t *testing.T) {
 	}
 }
 
+// TestGuardFrameDeniedPages 注入令牌的页面必须禁止被 iframe 嵌套（点击劫持）：
+// 它们免令牌且 HTML 里带着真令牌，任意网页透明 iframe 覆盖诱导点击，就能让
+// 页面自身去 POST /config 改代理（流量经中间人）或改端口。Host 校验拦不住 ——
+// iframe 发请求时 Host 就是本机地址。
+func TestGuardFrameDeniedPages(t *testing.T) {
+	setTestToken(t, "secret-token")
+	for _, p := range []string{"/", "/settings"} {
+		w := guardedDo(t, "GET", p, "127.0.0.1:7891", nil)
+		if got := w.Header().Get("X-Frame-Options"); got != "DENY" {
+			t.Errorf("%s X-Frame-Options=%q want DENY", p, got)
+		}
+		if got := w.Header().Get("Content-Security-Policy"); !strings.Contains(got, "frame-ancestors 'none'") {
+			t.Errorf("%s Content-Security-Policy=%q 应含 frame-ancestors 'none'", p, got)
+		}
+	}
+}
+
 // TestGuardRejectsForeignHost DNS rebinding 防护：Host 不是本机地址一律 403，
 // 即使令牌正确——这条挡的是"攻击者域名解析到 127.0.0.1 后与页面同源"。
 func TestGuardRejectsForeignHost(t *testing.T) {

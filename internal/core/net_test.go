@@ -4,10 +4,12 @@ package core
 
 import (
 	"compress/gzip"
+	"context"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 )
 
 // saveRestoreHTTP 覆盖 sharedClient 与 maxRetries 全局，测试结束恢复。
@@ -38,7 +40,7 @@ func TestHTTPGetWithRetryGzipFallback(t *testing.T) {
 	defer srv.Close()
 	// DisableCompression：模拟个别 CDN 把压缩流原样返回的场景
 	saveRestoreHTTP(t, &http.Client{Transport: &http.Transport{DisableCompression: true}}, 2)
-	body, status, err := testStd.httpGetWithRetry(srv.URL, "")
+	body, status, err := testStd.httpGetWithRetry(context.Background(), srv.URL, "")
 	if err != nil {
 		t.Fatalf("httpGetWithRetry: %v", err)
 	}
@@ -60,7 +62,7 @@ func TestHTTPGetWithRetryStatusFailure(t *testing.T) {
 	defer srv.Close()
 	saveRestoreHTTP(t, srv.Client(), 1) // 1 次尝试，避免长时间 sleep
 
-	_, status, err := testStd.httpGetWithRetry(srv.URL, "")
+	_, status, err := testStd.httpGetWithRetry(context.Background(), srv.URL, "")
 	if status != http.StatusNotFound {
 		t.Fatalf("status=%d want 404", status)
 	}
@@ -80,7 +82,7 @@ func TestHTTPGetWithRetrySuccess(t *testing.T) {
 	defer srv.Close()
 	saveRestoreHTTP(t, srv.Client(), 3)
 
-	body, status, err := testStd.httpGetWithRetry(srv.URL, "")
+	body, status, err := testStd.httpGetWithRetry(context.Background(), srv.URL, "")
 	if err != nil || status != http.StatusOK || string(body) != "plain" {
 		t.Fatalf("body=%q status=%d err=%v", body, status, err)
 	}
@@ -89,7 +91,7 @@ func TestHTTPGetWithRetrySuccess(t *testing.T) {
 // TestHTTPGetWithRetryBadURL 非法 URL 直接报错不发起请求。
 func TestHTTPGetWithRetryBadURL(t *testing.T) {
 	saveRestoreHTTP(t, &http.Client{}, 3)
-	_, _, err := testStd.httpGetWithRetry("://bad url", "")
+	_, _, err := testStd.httpGetWithRetry(context.Background(), "://bad url", "")
 	if err == nil {
 		t.Fatal("非法 URL 应报错")
 	}
@@ -136,7 +138,7 @@ func TestFetchPlaylistRejectsHTML(t *testing.T) {
 	saveRestoreHTTP(t, srv.Client(), 3)
 
 	j := &dlJob{rt: testStd, m3u8URL: srv.URL + "/play/?url=https://x.com/a.m3u8", referer: ""}
-	_, _, _, err := j.fetchPlaylist()
+	_, _, _, err := j.fetchPlaylist(context.Background())
 	if err == nil || !strings.Contains(err.Error(), "不是 m3u8 播放列表") {
 		t.Fatalf("err=%v want 指向非 m3u8 的明确错误", err)
 	}
@@ -154,7 +156,7 @@ func TestFetchPlaylistAcceptsBOM(t *testing.T) {
 	saveRestoreHTTP(t, srv.Client(), 1)
 
 	j := &dlJob{rt: testStd, m3u8URL: srv.URL + "/index.m3u8", referer: ""}
-	content, base, isDirect, err := j.fetchPlaylist()
+	content, base, isDirect, err := j.fetchPlaylist(context.Background())
 	if err != nil {
 		t.Fatalf("fetchPlaylist: %v", err)
 	}
@@ -187,7 +189,7 @@ func TestFetchPlaylistMasterSubNotPlaylist(t *testing.T) {
 	saveRestoreHTTP(t, srv.Client(), 1)
 
 	j := &dlJob{rt: testStd, m3u8URL: srv.URL + "/master.m3u8", referer: ""}
-	_, _, _, err := j.fetchPlaylist()
+	_, _, _, err := j.fetchPlaylist(context.Background())
 	if err == nil || !strings.Contains(err.Error(), "子播放列表") {
 		t.Fatalf("err=%v want 子播放列表校验失败", err)
 	}
@@ -224,5 +226,25 @@ func TestSetProxyAddrSwapsClient(t *testing.T) {
 	testStd.setProxyAddr("http://10.0.0.1:8080")
 	if testStd.getClient() != cur {
 		t.Fatal("代理未变化时不应重建客户端（白白丢连接池重握手）")
+	}
+}
+
+// TestSleepCtx 退避等待必须可中断：暂停/取消不能等一整轮 sleep 跑完才生效
+// （旧实现用裸 time.Sleep，最坏要等数秒）。
+func TestSleepCtx(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		time.Sleep(10 * time.Millisecond)
+		cancel()
+	}()
+	start := time.Now()
+	if sleepCtx(ctx, 5*time.Second) {
+		t.Fatal("ctx 取消后 sleepCtx 应返回 false")
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("应在取消后立即返回，实际等了 %s", elapsed)
+	}
+	if !sleepCtx(context.Background(), 5*time.Millisecond) {
+		t.Fatal("ctx 未取消时应睡满并返回 true")
 	}
 }

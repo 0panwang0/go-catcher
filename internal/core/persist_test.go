@@ -4,6 +4,7 @@ package core
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -226,5 +227,41 @@ func TestPersistHealthRecordsFailure(t *testing.T) {
 	testStd.saveState()
 	if d := testStd.persistDTOOf(); !d.OK {
 		t.Fatalf("落盘成功后 persist 状态应恢复健康: %+v", d)
+	}
+}
+
+// TestLoadStatePrunesOldTasks 恢复历史任务同样要受 maxKeptTasks 约束：原先
+// pruneOldTasks 只在新建任务时被调用，状态文件里堆积的旧完成任务无人清理
+// （长期使用后任务列表与状态文件无限增长）。
+func TestLoadStatePrunesOldTasks(t *testing.T) {
+	saveRestoreState(t)
+	dir := t.TempDir()
+	const extra = 50
+	tasks := make([]persistedTask, 0, maxKeptTasks+extra)
+	for i := 0; i < maxKeptTasks+extra; i++ {
+		tasks = append(tasks, persistedTask{
+			ID: fmt.Sprintf("t%d", i), Filename: "x.ts", SaveDir: dir,
+			Done: true, Stage: "已保存", Started: time.Now().Add(time.Duration(i) * time.Second),
+		})
+	}
+	data, err := json.Marshal(stateFile{Version: stateVersion, Tasks: tasks})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(testStd.statePath, data, 0644); err != nil {
+		t.Fatal(err)
+	}
+	testStd.tasks = map[string]*taskEntry{}
+	testStd.loadState()
+
+	n := len(testStd.tasks)
+	if n > maxKeptTasks {
+		t.Fatalf("恢复后任务数=%d 应 ≤ %d（历史任务也要裁剪）", n, maxKeptTasks)
+	}
+	if n == 0 {
+		t.Fatal("不应把任务全部裁掉（保留最新的 maxKeptTasks 个）")
+	}
+	if _, ok := testStd.tasks[fmt.Sprintf("t%d", maxKeptTasks+extra-1)]; !ok {
+		t.Fatal("最新的任务应被保留")
 	}
 }
