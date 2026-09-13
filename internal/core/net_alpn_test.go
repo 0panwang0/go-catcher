@@ -46,7 +46,7 @@ func captureALPN(t *testing.T) (addr string, protos <-chan []string) {
 
 // TestNewUTLSConnForcesHTTP11ALPN 固定「握手必须只提议 http/1.1」这条不变量。
 //
-// 背景（实测）：HelloChrome_Auto 的 ALPN 是 ["h2","http/1.1"]，B 站 CDN 会
+// 背景（实测）：所用指纹预设的 ALPN 是 ["h2","http/1.1"]，某视频站点的 CDN 会
 // 选中 h2；而 Transport 自定义了 DialTLSContext 后 Go 不做 HTTP/2，请求仍按
 // HTTP/1.1 发出，服务器回的 HTTP/2 帧让 Transport 抛
 // "malformed HTTP response" 加一串二进制，真实原因（如 404 签名过期）被盖住。

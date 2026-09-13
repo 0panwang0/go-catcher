@@ -11,7 +11,7 @@
 - **HLS AES-128 解密**：自动识别 `#EXT-X-KEY` 加密流，拉取密钥并逐分片解密（显式 IV / 按分片序号派生 IV），落盘即明文可播
 - **断点续传**：任务状态持久化到本地，服务重启后自动恢复未完成任务
 - **并发与重试**：分片并发下载、失败自动重试、`--limit` 试片模式
-- **代理支持**：默认跟随 Windows 系统代理（Clash 等工具开「系统代理」即自动生效），设置页可切换手动指定 / 直连，保存即生效；CLI 模式用 `--proxy` 指定
+- **代理支持**：默认跟随 Windows 系统代理（在系统设置里开启「代理」即自动生效），设置页可切换手动指定 / 直连，保存即生效；CLI 模式用 `--proxy` 指定
 - **端口可配置**：监控页设置里可改服务端口（解决端口冲突），重启服务生效
 - **Edge 浏览器扩展**：网页内一键发起下载，自动回填页面 URL 作为 Referer
 - **本地优先**：服务只监听 `127.0.0.1`，监控页与 API 不对外暴露
@@ -42,7 +42,7 @@ go-catcher.exe --url="https://cdn.example.com/video/1080p/video.m3u8" --referer=
 |---|---|
 | `--url` | 下载地址（m3u8 流地址或直链文件） |
 | `--referer` | 来源页 URL，部分站点必填 |
-| `--proxy` | 代理：`system` 跟随 Windows 系统代理（默认）、`http://127.0.0.1:7890` 手动指定、`direct`/`none` 直连 |
+| `--proxy` | 代理：`system` 跟随 Windows 系统代理（默认）、`http://127.0.0.1:8080` 手动指定、`direct`/`none` 直连 |
 | `-c` | 分片并发数，默认 10 |
 | `-o` | 输出文件名（默认 output.ts；HLS 原始流直接落盘，不做封装转换） |
 | `--limit` | 只下载前 N 个分片（0 = 全部，用于试片） |
@@ -125,7 +125,7 @@ go-catcher.exe
 | 限制 | 说明 |
 |---|---|
 | 只支持 HLS(m3u8) 与直链 MP4 | 不支持 DASH(`.mpd`)、HLS over WebSocket |
-| 加密只支持 AES-128 | SAMPLE-AES / Widevine 会明确报错（不支持的 METHOD） |
+| 加密只支持 AES-128 | SAMPLE-AES 与商业 DRM 方案会明确报错（不支持的 METHOD / KEYFORMAT） |
 | 全程必须同一把密钥 | 播放列表中途换 key（key rotation）会明确报错而不是产出损坏文件 |
 | 明文 `http://` 同样走代理 | 已修正：此前只有 https 走 CONNECT 隧道，明文请求会绕过代理直连 |
 | 代理只支持 `http://` | `socks5://` 系统代理会在启动横幅与 `/config` 的 `systemProxyWarning` 里提示"已按直连处理" |

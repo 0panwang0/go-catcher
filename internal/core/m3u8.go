@@ -158,8 +158,8 @@ func ensureKeyDeclared(pl playlistInfo) error {
 
 // ensureIdentityKeyFormat 校验密钥格式是 identity（或缺省）。
 //
-// 非 identity 的 KEYFORMAT 表示 URI 指向的是密钥系统而不是裸密钥：FairPlay 的
-// skd:// URI、Widevine 的 license 端点等都是这种形态。此时 METHOD 往往仍写着
+// 非 identity 的 KEYFORMAT 表示 URI 指向的是密钥系统而不是裸密钥：商业 DRM 的
+// 许可端点都属这种形态。此时 METHOD 往往仍写着
 // AES-128，所以单看 METHOD 会一路放行——拉回来的东西被当作 16 字节 key 用，
 // 产物是"能播但花屏/无声"的损坏文件，而日志一切正常。
 func ensureIdentityKeyFormat(pl playlistInfo) error {
@@ -198,9 +198,9 @@ type KeyInfo struct {
 	URI    string // 密钥绝对 URL
 	IV     []byte // 显式 IV（16 字节）；nil = 按 media sequence 派生
 	// KeyFormat #EXT-X-KEY 的 KEYFORMAT 属性（缺省 = "identity"）。
-	// 非 identity 表示 URI 指向的是「密钥系统」（如 skd:// 的 FairPlay、
-	// Widevine 的 license 服务），而不是 16 字节裸密钥 —— 拿它当 AES-128 的
-	// key 用，运气好是长度不合法报错，运气不好是静默解出随机字节。
+	// 非 identity 表示 URI 指向的是「密钥系统」（商业 DRM 的许可服务），而不是
+	// 16 字节裸密钥 —— 拿它当 AES-128 的 key 用，运气好是长度不合法报错，
+	// 运气不好是静默解出随机字节。
 	KeyFormat string
 }
 

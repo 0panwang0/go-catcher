@@ -118,7 +118,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 installSniffProbes();
 
 // 下载器页签关闭时清掉它的 Referer 规则：规则按 tabId 生效，tab 没了规则
-// 就永远匹配不到请求，只会占用动态规则配额（Chrome 上限 5000 条）。
+// 就永远匹配不到请求，只会占用动态规则配额（浏览器动态规则上限 5000 条）。
 // 监听器必须在顶层同步注册（MV3 事件唤醒机制的要求）。
 chrome.tabs.onRemoved.addListener((tabId) => {
   clearRefererRules(tabId).catch(() => {});

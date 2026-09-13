@@ -1,5 +1,5 @@
 // 「这个视频」的候选与选项解析：
-//   getVideoSources —— 全部候选链接（不解析，供 content.js 做 IDM 式列表）
+//   getVideoSources —— 全部候选链接（不解析，供 content.js 做链接列表）
 //   getVideoSource  —— 悬停门控的单选命中（按钮显隐用）
 import { pageCandidates, findSniffedByURL } from "./page-match.js";
 import { qualityFromURL, isMasterCandidateM3U8 } from "./m3u8-parse.js";
@@ -17,7 +17,7 @@ export function openDownloader(item) {
 }
 
 // getVideoSources 返回"该视频"的全部候选链接（不挑选、不解析），
-// 供 content.js 做 IDM 式链接列表（解析放页面主世界，避免扩展 Origin 403）。
+// 供 content.js 做链接列表（解析放页面主世界，避免扩展 Origin 403）。
 export async function getVideoSources({ src = "", pageUrl = "", embedUrl = "" }) {
   const { hostM3U8, hostMP4 } = await pageCandidates(pageUrl);
   const sources = [];

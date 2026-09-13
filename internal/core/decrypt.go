@@ -136,7 +136,7 @@ func newAES128Decryptor(spec KeySpec) (SegDecryptor, error) {
 }
 
 // DecryptSegment 每个分片独立 CBC 解密（HLS 语义：分片间不链式，各自以 IV 起块）。
-// PKCS7 尾部填充不剥离：hls.js/ffmpeg 同样保留，TS/MP4 解复用器会忽略尾部残片；
+// PKCS7 尾部填充不剥离：主流播放器实现同样保留，TS/MP4 解复用器会忽略尾部残片；
 // 猜测式剥离反而可能吃掉合法数据（明文恰好以 0x01 结尾的 TS 包）。
 func (d *aes128Decryptor) DecryptSegment(seq uint64, data []byte) ([]byte, error) {
 	if len(data) == 0 {

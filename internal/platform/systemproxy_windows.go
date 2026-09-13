@@ -2,7 +2,7 @@
 
 package platform
 
-// 系统代理读取：Clash 等工具的「系统代理」开关写的 WinINET 注册表设置
+// 系统代理读取：系统「代理」开关写入的 WinINET 注册表设置
 // （HKCU\...\Internet Settings 的 ProxyEnable/ProxyServer）。
 // system 代理模式每次建连现读注册表，开关/改端口即时跟随。
 

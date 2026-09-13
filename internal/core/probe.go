@@ -1,4 +1,4 @@
-// /probe：服务端代拉 m3u8 文本（带 Referer 的完整浏览器头 + uTLS 指纹），
+// /probe：服务端代拉 m3u8 文本（带 Referer 的完整浏览器头 + 指纹伪装），
 // 供浏览器扩展预检候选链接的画质/时长。
 // 浏览器侧 fetch 对无 CORS 头的 CDN 只能拿到 opaque 空响应（"未预检"的根源），
 // 预检必须与下载路径同能力，故由本地服务代理拉取。
@@ -131,7 +131,7 @@ func isBlockedIP(ip net.IP) bool {
 }
 
 // readProbeBody 读取响应体并按 Content-Encoding 兜底解压 gzip
-// （自定义 Transport + uTLS 握手下个别 CDN 会把压缩流原样返回，同 httpGetPlaylist）。
+// （自定义 Transport + 指纹伪装握手下个别 CDN 会把压缩流原样返回，同 httpGetPlaylist）。
 func readProbeBody(resp *http.Response) ([]byte, error) {
 	rd := io.Reader(io.LimitReader(resp.Body, probeMaxBytes))
 	if enc := resp.Header.Get("Content-Encoding"); strings.Contains(enc, "gzip") {

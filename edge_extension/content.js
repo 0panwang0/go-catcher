@@ -1,4 +1,4 @@
-// M3U8 Video Catcher - IDM 式单视频下载按钮
+// M3U8 Video Catcher - 悬停单视频下载按钮
 // 鼠标悬停在某个 video 上时显示"下载该视频"按钮，点击后在页面内完成下载。
 // 所有真实网络请求通过 MAIN world fetch 代理发出，Origin/Referer/Cookie 与页面一致，绕过 CDN 403。
 
@@ -396,7 +396,7 @@
       const src = target.src;
       const pageUrl = target.pageUrl;
 
-      // IDM 式：取"该视频"的全部候选链接，再在页面主世界解析出各画质/格式
+      // 取"该视频"的全部候选链接，再在页面主世界解析出各画质/格式
       const resp = await chrome.runtime.sendMessage({
         type: "getVideoSources",
         src,
@@ -416,7 +416,7 @@
         return;
       }
 
-      // 单链接直接确认面板；多链接展示 IDM 式列表
+      // 单链接直接确认面板；多链接展示链接列表
       if (options.length === 1) {
         renderConfirmPanel(options[0]);
       } else {
@@ -478,9 +478,9 @@
   }
 
   // latestMediaDir 最近 SEGMENT_WINDOW_MS 内**最新一条**媒体请求的目录
-  //（分片 .ts/.m4s/.flv 或 .m3u8 均算——B 站直播的变体 playlist 持续刷新且与
+  //（分片 .ts/.m4s/.flv 或 .m3u8 均算——直播的变体 playlist 持续刷新且与
   // 分片同目录，刷新请求本身也是"当前流"的可靠信号）。
-  // 与 activeSegmentDirs 的区别：旧流切走后的"余波"请求（B 站切直播间时旧流
+  // 与 activeSegmentDirs 的区别：旧流切走后的"余波"请求（切流时旧流
   // 会再拉几秒）落在活跃集合里会让旧流误判为正在播放；最新一条一定是
   // 当前正在播放的流。
   function latestMediaDir() {
@@ -601,7 +601,7 @@
   }
 
   // ============================================================
-  // IDM 式候选展开：全部候选 → 每个可下载的画质/格式选项
+  // 候选展开：全部候选 → 每个可下载的画质/格式选项
   // master m3u8 展开为各变体；媒体 playlist 补时长/分片数；mp4 透传。
   // 列表限定"悬停的那个视频"：src 直链隔离 → 分辨率/时长特征匹配 →
   // 活跃分片目录过滤，逐级空回退（宁多勿漏）。
@@ -611,7 +611,7 @@
   async function expandVideoOptions(candidates, pageUrl, video) {
     const fallbackTitle = document.title || "";
     // 预检优先走本地 Go 服务 /probe：浏览器对无 CORS 头的 CDN 只能拿到 opaque
-    // 空响应（"未预检"的根源），服务端带 Referer 直连（uTLS 指纹）能拿到。
+    // 空响应（"未预检"的根源），服务端带 Referer + 指纹伪装直连能拿到。
     // 本地服务未启动时回退页面主世界 fetch。
     let serverBase = null;
     try {
@@ -726,7 +726,7 @@
     );
 
     // 悬停视频自带 http src 时，其余 mp4 是页面上其他视频（推荐流卡片）的
-    // 嗅探条目——全部剔除，列表只保留选中视频（IDM 同行为）
+    // 嗅探条目——全部剔除，列表只保留选中视频
     const videoSrc = video ? String(video.currentSrc || video.src || "") : "";
     if (/^https?:/i.test(videoSrc)) {
       for (let i = mp4Options.length - 1; i >= 0; i--) {
@@ -799,7 +799,7 @@
 
     // 只保留"正在播放的流"，三级严格→宽松→全集（每级剔光即回退）：
     // 1. 最新媒体目录严格匹配：真正在播放的流必然刚拉过 .ts/.m3u8/.flv，
-    //    旧流切走后的余波请求（B 站切直播间旧流再拉几秒）目录更旧，被挤掉。
+    //    旧流切走后的余波请求（切流时旧流再拉几秒）目录更旧，被挤掉。
     // 2. 全部活跃目录宽松匹配：最新目录与候选 URL 前缀不一致（CDN 目录分属
     //    不同路径层级）或暂停播放时兜底。
     // 3. 无任何活跃信号（暂停）回退全集，宁多勿漏。
@@ -1038,7 +1038,7 @@
   }
 
   // ============================================================
-  // IDM 式链接列表面板：多候选时列出全部可选链接（格式/画质/码率/时长）
+  // 链接列表面板：多候选时列出全部可选链接（格式/画质/码率/时长）
   // ============================================================
   function optionMeta(o) {
     const parts = [];
@@ -1444,7 +1444,7 @@
       .slice(0, 80);
     if (!name) return "";
 
-    // 画质后缀（输出 .ts：HLS 原始流直接落盘，Go 侧不做封装，PotPlayer/VLC 可播）
+    // 画质后缀（输出 .ts：HLS 原始流直接落盘，Go 侧不做封装，主流播放器可播）
     const q = qualityFromUrl(m3u8Url);
     return name + (q ? `_${q}` : "") + ".ts";
   }

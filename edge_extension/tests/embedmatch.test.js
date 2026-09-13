@@ -2,7 +2,7 @@
 // 用法（在 edge_extension 目录下）：
 //   node tests/embedmatch.test.js
 //
-// 注意：文件名不能以 "_" 开头（Chrome 保留），且不能放在会被 manifest 引用的位置。
+// 注意：文件名不能以 "_" 开头（浏览器保留），且不能放在会被 manifest 引用的位置。
 const fs = require("fs");
 const path = require("path");
 
@@ -50,7 +50,7 @@ function check(name, cond, extra) {
 }
 
 (async () => {
-  const M3U8 = "https://vv.jisuzyv.com/play/e0RLJ1Vb/index.m3u8";
+  const M3U8 = "https://cdn.example.com/play/e0RLJ1Vb/index.m3u8";
   const PARSE_IFRAME = "https://jisuzyjiexi.com/play/?url=" + M3U8;
   const TOP = "https://www.xmfyy.com/index.php/vod/play/id/290898/sid/1/nid/1.html";
 
@@ -67,11 +67,11 @@ function check(name, cond, extra) {
   check("完全相同 → 命中", hit && hit.url === M3U8, hit);
   const hitQ = await api.findSniffedByURL(M3U8 + "?sign=abc&t=1");
   check("带签名参数 → 忽略 query 命中", hitQ && hitQ.url === M3U8, hitQ);
-  const miss = await api.findSniffedByURL("https://vv.jisuzyv.com/play/OTHER/index.m3u8");
+  const miss = await api.findSniffedByURL("https://cdn.example.com/play/OTHER/index.m3u8");
   check("别的视频 → 不命中", miss === null, miss);
 
   store.m3u8_list = [
-    { url: "https://vv.jisuzyv.com/play/e0RLJ1Vb/1080p/index.m3u8", pageUrl: TOP, frameUrl: "https://player.other-host.com/x/", type: "m3u8" },
+    { url: "https://cdn.example.com/play/e0RLJ1Vb/1080p/index.m3u8", pageUrl: TOP, frameUrl: "https://player.other-host.com/x/", type: "m3u8" },
   ];
   const dirHit = await api.findSniffedByURL(M3U8);
   check("同目录变体 → 命中", dirHit && dirHit.url.includes("1080p"), dirHit);

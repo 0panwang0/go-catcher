@@ -51,7 +51,7 @@ export async function hostCandidates(pageUrl) {
 // pageCandidates 在同站基础上进一步限定「同一视频页」，逐级收窄、宁多勿漏：
 //   1. frameUrl 完全相等——iframe 播放器场景最准（解析页 URL 的 ?url= 参数
 //      编码了目标 m3u8，同站不同视频的 frameUrl 各不相同，可精确隔离）
-//   2. 顶层页 hostname+pathname 相同——常规站内页（B 站房间号在路径里可隔离）
+//   2. 顶层页 hostname+pathname 相同——常规站内页（房间号/视频 ID 在路径里可隔离）
 //   3. 都为空（SPA 路由变化等）回退同站全集
 export async function pageCandidates(pageUrl) {
   const { hostM3U8, hostMP4 } = await hostCandidates(pageUrl);

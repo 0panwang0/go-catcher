@@ -5,7 +5,7 @@
 // 旧实现每次全量清空 1000-9999 号段再重建，有两个用户可见后果：
 //   - 两个下载器页签先后设置时，后写者把先写者的规则一并删掉
 //     （last-writer-wins）→ 先打开的页面分析请求被 CDN 403
-//   - 页签关闭后规则永久残留，长期占用动态规则配额（Chrome 上限 5000 条）
+//   - 页签关闭后规则永久残留，长期占用动态规则配额（浏览器上限 5000 条）
 // 本测试用数组模拟 DNR 动态规则存储，断言新实现的语义：
 //   - 清理范围与规则作用域同维度（只动本 tab 的规则）
 //   - 同 tab 重设为替换语义，remove/add 合并为一次 updateDynamicRules
@@ -146,7 +146,7 @@ const PAIRS_B = [{ host: "b.com", referer: "https://b.com/watch/2" }];
 
   // 场景 8（P2-3）：号段内 id 全被占用时，setRefererRules 必须显式失败 ——
   // 旧实现会生成 id: undefined 的规则，updateDynamicRules 随后抛错，报错
-  // 完全看不出根因。号段上界也必须落在 Chrome 的单扩展配额（5000）之内。
+  // 完全看不出根因。号段上界也必须落在浏览器的单扩展配额（5000）之内。
   store = [];
   for (let id = 1000; id < 5000; id++) {
     store.push({ id, priority: 1, action: {}, condition: { tabIds: [999] } });
@@ -166,7 +166,7 @@ const PAIRS_B = [{ host: "b.com", referer: "https://b.com/watch/2" }];
   );
   store = [];
   check(
-    "号段起点仍是 1000、且分配结果落在 Chrome 上限之内",
+    "号段起点仍是 1000、且分配结果落在浏览器上限之内",
     api.allocRuleIds([], 1)[0] === 1000,
     api.allocRuleIds([], 1),
   );

@@ -102,7 +102,7 @@ func newRuntime() *Runtime {
 		tasks:             map[string]*taskEntry{},
 		allowedDirs:       map[string]bool{},
 		stateSaveDelay:    1200 * time.Millisecond, // 进度去抖：合并高频更新避免疯狂写盘
-		proxyAddr:         "system",                // 默认跟随 Windows 系统代理（Clash 开箱即用）
+		proxyAddr:         "system",                // 默认跟随 Windows 系统代理
 		userAgent:         defaultUserAgent,
 		outputFile:        "output.ts",
 		bindAddr:          "127.0.0.1",

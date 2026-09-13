@@ -107,7 +107,7 @@ export function qualityFromURL(u) {
 // ============================================================
 // 嗅探列表里 master 和各变体（或 ad 预热片）混在一起。
 // 按 URL 形态判断"是不是 master 候选"——变体通常带 _240p/_720p 等后缀，
-// master 则一般是 /ID.m3u8。这种启发式足够处理常见 CDN（growcdn/alibaba 等）。
+// master 则一般是 /ID.m3u8。这种启发式足够覆盖常见 CDN 的命名。
 export function isMasterCandidateM3U8(url) {
   try {
     const path = new URL(url).pathname;

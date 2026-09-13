@@ -8,7 +8,7 @@
 // 的规则一并删掉；页签关闭后规则永久残留、占用动态规则配额。
 
 // 本扩展占用的动态规则 id 号段：id 分配只在 [MIN, MAX) 内进行。
-// MAX 必须落在 Chrome 的单扩展动态规则总量上限（5000，
+// MAX 必须落在浏览器的单扩展动态规则总量上限（5000，
 // declarativeNetRequest.MAX_NUMBER_OF_DYNAMIC_RULES）之内 —— 超出上限的 id
 // 永远不可能成为合法动态规则，分配器却会把它们发出去（旧值取到 10000）。
 const RULE_ID_MIN = 1000;

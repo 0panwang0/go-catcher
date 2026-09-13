@@ -1,6 +1,6 @@
 // fMP4 init 段处理：确保 moov 声明 fragment 总时长（mehd）。
 //
-// B 站等直播平台的 init 段（#EXT-X-MAP）通常只有 ftyp+moov，moov 内
+// 直播平台的 init 段（#EXT-X-MAP）通常只有 ftyp+moov，moov 内
 // mvex 只带 trex 而没有 mehd（movie extends header）。播放器（如 Windows
 // Media Player）打开文件时无法预知总时长，只能按「直播流」处理：
 // 不显示结束时间、禁止拖动进度条。

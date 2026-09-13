@@ -1,4 +1,4 @@
-// 网络层：uTLS 指纹 / 代理 CONNECT / HTTP client 与重试。
+// 网络层：TLS 指纹伪装 / 代理 CONNECT / HTTP client 与重试。
 package core
 
 import (
@@ -28,8 +28,8 @@ func (c *bufferedConn) Read(b []byte) (int, error) {
 	return c.r.Read(b)
 }
 
-// dialTLSContext: 连接 Clash 代理 → CONNECT 隧道 → uTLS 伪造 Chrome 指纹握手
-// 代理为空 / direct / none 时不走代理，直接连接（Clash 没开或访问国内资源时用）
+// dialTLSContext: 连接代理 → CONNECT 隧道 → TLS 指纹伪装握手
+// 代理为空 / direct / none 时不走代理，直接连接（无代理或访问国内资源时用）
 //
 // proxyAddr / sharedClient / netMu 均为 Runtime 字段（见 runtime.go），
 // 访问入口是方法 getProxyAddr / setProxyAddr / getClient。
@@ -43,7 +43,7 @@ func (r *Runtime) dialProxyTunnel(ctx context.Context, addr string) (*bufferedCo
 		return nil, err
 	}
 
-	// 1. TCP 连接到 Clash 代理
+	// 1. TCP 连接到代理
 	conn, err := (&net.Dialer{Timeout: 30 * time.Second}).DialContext(ctx, "tcp", proxyURL.Host)
 	if err != nil {
 		return nil, fmt.Errorf("连接代理失败: %w", err)
@@ -93,7 +93,7 @@ func (r *Runtime) dialTLSContext(ctx context.Context, network, addr string) (net
 		return nil, err
 	}
 
-	// 4. uTLS 握手 — 伪造 Chrome 指纹
+	// 4. TLS 握手 — 伪造浏览器指纹
 	host, _, _ := net.SplitHostPort(addr)
 
 	uConn, err := newUTLSConn(bConn, host)
@@ -111,7 +111,7 @@ func (r *Runtime) dialTLSContext(ctx context.Context, network, addr string) (net
 }
 
 // effectiveProxy 返回本次连接实际使用的代理地址（空 = 直连）。
-// "system" 模式每次建连现读注册表：Clash 开关系统代理、改端口即时跟随。
+// "system" 模式每次建连现读注册表：系统代理开关、改端口即时跟随。
 func (r *Runtime) effectiveProxy() string {
 	p := strings.TrimSpace(r.getProxyAddr())
 	if strings.EqualFold(p, "system") {
@@ -131,7 +131,7 @@ func isDirectStr(p string) bool {
 	return p == "" || p == "direct" || p == "none" || p == "off"
 }
 
-// 不走代理时的直连 + uTLS 握手（指纹照旧伪造）
+// 不走代理时的直连 + 指纹伪装握手（指纹照旧伪造）
 
 func dialDirect(ctx context.Context, addr string) (net.Conn, error) {
 	conn, err := (&net.Dialer{Timeout: 30 * time.Second}).DialContext(ctx, "tcp", addr)
@@ -151,18 +151,18 @@ func dialDirect(ctx context.Context, addr string) (net.Conn, error) {
 	return uConn, nil
 }
 
-// newUTLSConn 建立「伪造 Chrome 指纹」的 uTLS 连接，并把 ALPN 收窄为 http/1.1。
+// newUTLSConn 建立「伪造浏览器指纹」的 uTLS 连接，并把 ALPN 收窄为 http/1.1。
 //
 // 为什么必须收窄：Transport 自定义了 DialTLSContext（经代理与直连都走这里），
 // Go 不会为这类 Transport 启用 HTTP/2 —— 请求一律按 HTTP/1.1 编码。而
-// HelloChrome_Auto 的 ALPN 是 ["h2","http/1.1"]，支持 h2 的 CDN 会选中 h2，
+// 所用指纹预设的 ALPN 是 ["h2","http/1.1"]，支持 h2 的 CDN 会选中 h2，
 // 服务器于是按 HTTP/2 回帧（SETTINGS/GOAWAY），Transport 侧抛
 // "malformed HTTP response" 加一串二进制 —— 真实错误被完全盖住。
 // 只声明 http/1.1，服务器就只能按 HTTP/1.1 应答。
 //
-// 两条拨号路径（经代理 / 直连）必须共用本函数：曾经直连路径直接用
-// HelloChrome_Auto，B 站 CDN（cn-hnzz-cm-01-03.bilivideo.com）选中 h2 后
-// 表现为一堆乱码报错（实测复现，见 net_alpn_test.go）。
+// 两条拨号路径（经代理 / 直连）必须共用本函数：曾经直连路径直接用未收窄的
+// 指纹预设，某视频站点的 CDN 选中 h2 后表现为一堆乱码报错
+// （实测复现，见 net_alpn_test.go）。
 func newUTLSConn(conn net.Conn, serverName string) (*utls.UConn, error) {
 	spec, err := utls.UTLSIdToSpec(utls.HelloChrome_Auto)
 	if err != nil {
@@ -288,7 +288,7 @@ func (r *Runtime) httpGetWithRetry(ctx context.Context, target, ref string) ([]b
 			continue
 		}
 		// 显式解压：Go 在请求未显式声明 Accept-Encoding 时会自动解压 gzip，
-		// 但自定义 Transport + uTLS 握手下个别 CDN 仍可能把压缩流原样返回。
+		// 但自定义 Transport + 指纹伪装握手下个别 CDN 仍可能把压缩流原样返回。
 		// 此处按 Content-Encoding 兜底（若 Go 已解压，该头会被移除，不会二次解压）。
 		if enc := resp.Header.Get("Content-Encoding"); strings.Contains(enc, "gzip") {
 			if gz, gerr := gzip.NewReader(bytes.NewReader(body)); gerr == nil {
@@ -463,7 +463,7 @@ func (r *Runtime) getClient() *http.Client {
 				// 不走环境 HTTP(S)_PROXY——代理只由设置页 / --proxy 控制（经 DialTLSContext）
 				Proxy:                 nil,
 				DialContext:           r.dialContext,    // 明文 http://（Transport 不会为它调 DialTLSContext）
-				DialTLSContext:        r.dialTLSContext, // https:// 走 uTLS 指纹
+				DialTLSContext:        r.dialTLSContext, // https:// 走指纹伪装
 				MaxIdleConns:          200,
 				MaxIdleConnsPerHost:   50,
 				IdleConnTimeout:       90 * time.Second,

@@ -26,7 +26,7 @@ func TestEffectiveProxySystemFollows(t *testing.T) {
 		t.Fatal("system+已启用 不应判定直连")
 	}
 
-	// 系统代理未启用：直连（Clash 关掉系统代理开关的场景）
+	// 系统代理未启用：直连（用户关掉系统代理开关的场景）
 	testStd.systemProxyAddrFn = func() string { return "" }
 	if got := testStd.effectiveProxy(); got != "" {
 		t.Fatalf("system+未启用 effectiveProxy=%q", got)

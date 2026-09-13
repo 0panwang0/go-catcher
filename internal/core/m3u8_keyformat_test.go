@@ -1,9 +1,11 @@
 // #EXT-X-KEY 的 KEYFORMAT 校验回归。
 //
-// 缺陷形态：parseKeyLine 只读 METHOD/URI/IV，KEYFORMAT 被整个忽略。DRM 流
-// （FairPlay 的 skd://、Widevine 的 license 端点）的 METHOD 往往仍写着
-// AES-128，于是一路放行，把"密钥系统响应体"当 16 字节裸密钥用 —— 产物是
-// 能播但花屏/无声的文件，日志一切正常。这是最隐蔽的一类损坏，必须显式拒绝。
+// 缺陷形态：parseKeyLine 只读 METHOD/URI/IV，KEYFORMAT 被整个忽略。DRM 流的
+// METHOD 往往仍写着 AES-128，于是一路放行，把"密钥系统响应体"当 16 字节裸密钥
+// 用 —— 产物是能播但花屏/无声的文件，日志一切正常。这是最隐蔽的一类损坏，
+// 必须显式拒绝。
+//
+// 用例里的 KEYFORMAT / URI 均为中性构造值，不代表任何具体 DRM 产品。
 package core
 
 import (
@@ -21,8 +23,8 @@ func TestParseKeyLineReadsKeyFormat(t *testing.T) {
 	}{
 		{
 			"带引号（规范写法）",
-			`#EXT-X-KEY:METHOD=AES-128,URI="k.bin",KEYFORMAT="com.apple.streamingkeydelivery"`,
-			"com.apple.streamingkeydelivery",
+			`#EXT-X-KEY:METHOD=AES-128,URI="k.bin",KEYFORMAT="com.example.drm"`,
+			"com.example.drm",
 		},
 		{
 			"裸值（非规范播放列表）",
@@ -35,9 +37,9 @@ func TestParseKeyLineReadsKeyFormat(t *testing.T) {
 			"",
 		},
 		{
-			"Widevine 的 urn 形态",
-			`#EXT-X-KEY:METHOD=AES-128,URI="data:text/plain;base64,AAAA",KEYFORMAT="urn:uuid:edef8ba9-79d6-4ace-a3c8-27dcd51d21ed"`,
-			"urn:uuid:edef8ba9-79d6-4ace-a3c8-27dcd51d21ed",
+			"商业 DRM 的 urn 形态",
+			`#EXT-X-KEY:METHOD=AES-128,URI="data:text/plain;base64,AAAA",KEYFORMAT="urn:uuid:11111111-2222-4333-8444-555555555555"`,
+			"urn:uuid:11111111-2222-4333-8444-555555555555",
 		},
 	}
 	for _, c := range cases {
@@ -60,9 +62,9 @@ func TestEnsureIdentityKeyFormat(t *testing.T) {
 		}
 	}
 	bad := []string{
-		"com.apple.streamingkeydelivery",
-		"urn:uuid:edef8ba9-79d6-4ace-a3c8-27dcd51d21ed",
-		"com.widevine",
+		"com.example.drm",
+		"urn:uuid:11111111-2222-4333-8444-555555555555",
+		"com.example.drm.alt",
 	}
 	for _, f := range bad {
 		if isIdentityKeyFormat(f) {
@@ -76,7 +78,7 @@ func TestEnsureIdentityKeyFormat(t *testing.T) {
 func TestValidatePlaylistRejectsNonIdentityKeyFormat(t *testing.T) {
 	const pl = `#EXTM3U
 #EXT-X-VERSION:6
-#EXT-X-KEY:METHOD=AES-128,URI="skd://key",KEYFORMAT="com.apple.streamingkeydelivery",KEYFORMATVERSIONS="1"
+#EXT-X-KEY:METHOD=AES-128,URI="https://drm.example.com/license",KEYFORMAT="com.example.drm",KEYFORMATVERSIONS="1"
 #EXTINF:6.0,
 seg0.ts
 #EXTINF:6.0,
@@ -91,7 +93,7 @@ seg1.ts
 	if err == nil {
 		t.Fatal("非 identity 的 KEYFORMAT 必须被拒绝（否则会把 license 响应当密钥用）")
 	}
-	if !strings.Contains(err.Error(), "com.apple.streamingkeydelivery") {
+	if !strings.Contains(err.Error(), "com.example.drm") {
 		t.Errorf("报错应带上 KEYFORMAT 值，得到: %v", err)
 	}
 }
@@ -133,8 +135,8 @@ func TestKeyFormatDoesNotTriggerFalseRotation(t *testing.T) {
 	}
 
 	// 真的换了 KEYFORMAT 才算不同
-	wv, _ := parseKeyLine(`#EXT-X-KEY:METHOD=AES-128,URI="k.bin",KEYFORMAT="com.widevine"`, "https://cdn.example.com/v/pl.m3u8")
-	if sameKey(bare, wv) {
+	alt, _ := parseKeyLine(`#EXT-X-KEY:METHOD=AES-128,URI="k.bin",KEYFORMAT="com.example.drm.alt"`, "https://cdn.example.com/v/pl.m3u8")
+	if sameKey(bare, alt) {
 		t.Error("KEYFORMAT 不同不应视为同一条 key")
 	}
 

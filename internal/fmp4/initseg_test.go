@@ -327,7 +327,7 @@ func TestBackfillDurationsWrites(t *testing.T) {
 	}
 }
 
-// TestBackfillDurationsFtypLayout 回归测试：moov 前面有 ftyp（如 B 站真实 init），
+// TestBackfillDurationsFtypLayout 回归测试：moov 前面有 ftyp（真实直播 init 的布局），
 // mvhd 偏移必须记绝对位置，否则回填会把时长写进 moov 的 size 字段破坏文件。
 func TestBackfillDurationsFtypLayout(t *testing.T) {
 	init := buildInit(1000, map[uint32]uint32{1: 90000, 2: 48000})

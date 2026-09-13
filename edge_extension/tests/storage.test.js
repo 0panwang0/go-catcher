@@ -66,7 +66,7 @@ const TOP = "https://www.xmfyy.com/index.php/vod/play/id/290898/sid/1/nid/1.html
 // i 越大越新；基准取「刚刚」，避免被 TTL 当成过期记录清掉。
 const NOW = Date.now();
 const rec = (i, extra = {}) => ({
-  url: `https://vv.jisuzyv.com/play/e0RLJ1Vb/v${i}/index.m3u8`,
+  url: `https://cdn.example.com/play/e0RLJ1Vb/v${i}/index.m3u8`,
   pageUrl: TOP,
   frameUrl: "",
   title: "异种污染",

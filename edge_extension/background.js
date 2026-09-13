@@ -125,7 +125,7 @@ var __m3u8catcher = (() => {
     },
     {
       name: "webRequest-mp4",
-      // MP4 直链（IDM 也常提供 MP4 格式选项）
+      // MP4 直链通道
       install() {
         chrome.webRequest.onCompleted.addListener(
           (details) => {

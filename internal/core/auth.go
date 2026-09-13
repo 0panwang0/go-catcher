@@ -34,7 +34,7 @@ const (
 	// tokenPlaceholder 内嵌页面 HTML 里的令牌占位符：服务端返回页面时替换成真 token。
 	tokenPlaceholder = "__GOCATCHER_TOKEN__"
 
-	// tokenHeader 备用传递方式（curl / 脚本比塞进 query 更干净）。
+	// tokenHeader 备用传递方式（命令行工具 / 脚本比塞进 query 更干净）。
 	tokenHeader = "X-GoCatcher-Token"
 
 	// embedKeyParam 内嵌豁免键的参数名：GUI 外壳把它拼进 iframe 地址，

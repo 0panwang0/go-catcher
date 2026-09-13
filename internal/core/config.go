@@ -125,7 +125,7 @@ func defaultConfig() appConfig {
 		MaxRetries:     3,
 		Port:           DefaultPort,
 		UIView:         "detail",
-		Proxy:          "system", // 跟随 Windows 系统代理（Clash 等开箱即用），与包级默认一致
+		Proxy:          "system", // 跟随 Windows 系统代理，与包级默认一致
 	}
 }
 

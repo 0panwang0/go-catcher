@@ -95,12 +95,12 @@ func RunCLI(o CLIOptions) int {
 
 	start := time.Now()
 	fmt.Println("========================================")
-	fmt.Println("  m3u8 视频下载器 (uTLS + Clash)")
+	fmt.Println("  m3u8 视频下载器")
 	fmt.Println("  URL:     ", job.m3u8URL)
 	fmt.Println("  代理:    ", rt.describeProxy())
 	fmt.Println("  Referer: ", job.referer)
 	fmt.Println("  输出:    ", rt.outputFile)
-	fmt.Println("  TLS指纹: Chrome Auto")
+	fmt.Println("  TLS指纹: 浏览器指纹伪装")
 	fmt.Println("========================================")
 
 	// 1. 获取 m3u8 / 直链识别
