@@ -7,9 +7,12 @@
 // 旧实现每次全量清空号段再重建，两个页签先后设置时后写者会把先写者
 // 的规则一并删掉；页签关闭后规则永久残留、占用动态规则配额。
 
-// 本扩展占用的动态规则 id 号段；清理与 id 分配都只认这个号段。
+// 本扩展占用的动态规则 id 号段：id 分配只在 [MIN, MAX) 内进行。
+// MAX 必须落在 Chrome 的单扩展动态规则总量上限（5000，
+// declarativeNetRequest.MAX_NUMBER_OF_DYNAMIC_RULES）之内 —— 超出上限的 id
+// 永远不可能成为合法动态规则，分配器却会把它们发出去（旧值取到 10000）。
 const RULE_ID_MIN = 1000;
-const RULE_ID_MAX = 10000;
+const RULE_ID_MAX = 5000;
 
 // DNR 读改写串行化：并发的 set/clear/sweep 若交错执行「读现有规则 →
 // 算新 id → 写回」，会分配出重复 id 互相覆盖。SW 单实例，模块级
@@ -24,8 +27,11 @@ function enqueueDnr(job) {
   return run;
 }
 
+// oursInSegment 取本扩展的动态规则。只判下界、不设上界：号段历史上曾取到
+// 10000，那些 id 如今虽不会再被分配，但清理/sweep 必须能把它们收回来 ——
+// 加上界过滤会让它们变成永久残留，反而占着配额。
 function oursInSegment(rules) {
-  return rules.filter((r) => r.id >= RULE_ID_MIN && r.id < RULE_ID_MAX);
+  return rules.filter((r) => r.id >= RULE_ID_MIN);
 }
 
 // ruleIdsForTab 号段内、作用于指定 tab 的规则 id。getDynamicRules 返回的
@@ -38,7 +44,8 @@ function ruleIdsForTab(rules, tabId) {
 
 // allocRuleIds 在号段内分配 count 个未占用的 id。占用集合取自当前快照，
 // 含本批即将被 remove 的旧规则——同批 remove/add 不复用 id。
-function allocRuleIds(rules, count) {
+// 号段内可用 id 不足时返回的数组会比 count 短，调用方必须检查（见 applyRefererRules）。
+export function allocRuleIds(rules, count) {
   const used = new Set(oursInSegment(rules).map((r) => r.id));
   const ids = [];
   for (let id = RULE_ID_MIN; ids.length < count && id < RULE_ID_MAX; id++) {
@@ -101,7 +108,15 @@ async function applyRefererRules(tabId, pairs) {
     specs.push({ host, referer, origin });
   }
 
+  // 配额不足必须显式失败：继续下去会生成 id: undefined 的规则，
+  // updateDynamicRules 抛出的报错完全看不出根因（评审 P2-3）。
   const ids = allocRuleIds(rules, specs.length);
+  if (ids.length < specs.length) {
+    throw new Error(
+      `DNR 动态规则配额不足：需要 ${specs.length} 条，号段内仅剩 ${ids.length} 条可用`,
+    );
+  }
+
   const addRules = specs.map((s, i) => ({
     id: ids[i],
     priority: 1,

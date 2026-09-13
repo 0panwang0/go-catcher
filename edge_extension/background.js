@@ -646,7 +646,7 @@ var __m3u8catcher = (() => {
 
   // src/background/referer-rules.js
   var RULE_ID_MIN = 1e3;
-  var RULE_ID_MAX = 1e4;
+  var RULE_ID_MAX = 5e3;
   var dnrChain = Promise.resolve();
   function enqueueDnr(job) {
     const run = dnrChain.then(job);
@@ -655,7 +655,7 @@ var __m3u8catcher = (() => {
     return run;
   }
   function oursInSegment(rules) {
-    return rules.filter((r) => r.id >= RULE_ID_MIN && r.id < RULE_ID_MAX);
+    return rules.filter((r) => r.id >= RULE_ID_MIN);
   }
   function ruleIdsForTab(rules, tabId) {
     return oursInSegment(rules).filter((r) => (r.condition?.tabIds || []).includes(tabId)).map((r) => r.id);
@@ -712,6 +712,11 @@ var __m3u8catcher = (() => {
       specs.push({ host, referer, origin });
     }
     const ids = allocRuleIds(rules, specs.length);
+    if (ids.length < specs.length) {
+      throw new Error(
+        `DNR \u52A8\u6001\u89C4\u5219\u914D\u989D\u4E0D\u8DB3\uFF1A\u9700\u8981 ${specs.length} \u6761\uFF0C\u53F7\u6BB5\u5185\u4EC5\u5269 ${ids.length} \u6761\u53EF\u7528`
+      );
+    }
     const addRules = specs.map((s, i) => ({
       id: ids[i],
       priority: 1,
@@ -811,7 +816,8 @@ var __m3u8catcher = (() => {
     // DNR Referer 规则管理（tests/refererrules.test.js）
     setRefererRules,
     clearRefererRules,
-    sweepStaleRules
+    sweepStaleRules,
+    allocRuleIds
   };
   return __toCommonJS(main_exports);
 })();

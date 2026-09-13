@@ -28,7 +28,7 @@ import {
   queryDownload,
   controlTask,
 } from "./server-api.js";
-import { setRefererRules, clearRefererRules, sweepStaleRules } from "./referer-rules.js";
+import { setRefererRules, clearRefererRules, sweepStaleRules, allocRuleIds } from "./referer-rules.js";
 
 // 点击工具栏图标：打开下载器页面
 chrome.action.onClicked.addListener(() => {
@@ -154,4 +154,5 @@ export const __test__ = {
   setRefererRules,
   clearRefererRules,
   sweepStaleRules,
+  allocRuleIds,
 };

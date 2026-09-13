@@ -144,6 +144,33 @@ const PAIRS_B = [{ host: "b.com", referer: "https://b.com/watch/2" }];
   ]);
   check("无效 pairs 不产生规则", tabRules(50).length === 0, store.length);
 
+  // 场景 8（P2-3）：号段内 id 全被占用时，setRefererRules 必须显式失败 ——
+  // 旧实现会生成 id: undefined 的规则，updateDynamicRules 随后抛错，报错
+  // 完全看不出根因。号段上界也必须落在 Chrome 的单扩展配额（5000）之内。
+  store = [];
+  for (let id = 1000; id < 5000; id++) {
+    store.push({ id, priority: 1, action: {}, condition: { tabIds: [999] } });
+  }
+  check("号段取满时 allocRuleIds 返回不足长度", api.allocRuleIds(store, 1).length === 0);
+  let quotaErr = "";
+  try {
+    await api.setRefererRules(50, [{ host: "x.com", referer: "https://x.com/1" }]);
+  } catch (e) {
+    quotaErr = String(e);
+  }
+  check("配额耗尽时 setRefererRules 显式报错", /配额不足/.test(quotaErr), quotaErr);
+  check(
+    "配额耗尽时不产生 id:undefined 的规则",
+    store.every((r) => r.id !== undefined),
+    store.length,
+  );
+  store = [];
+  check(
+    "号段起点仍是 1000、且分配结果落在 Chrome 上限之内",
+    api.allocRuleIds([], 1)[0] === 1000,
+    api.allocRuleIds([], 1),
+  );
+
   console.log(`\n${fail ? "FAIL" : "PASS"}: ${pass} ok, ${fail} failed`);
   process.exitCode = fail ? 1 : 0;
 })();
