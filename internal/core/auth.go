@@ -38,32 +38,27 @@ const (
 	tokenHeader = "X-GoCatcher-Token"
 
 	// embedKeyParam 内嵌豁免键的参数名：GUI 外壳把它拼进 iframe 地址，
-	// 服务端据此认出"这是外壳自己的嵌套"（见 frameDeniedPaths）。
+	// 服务端据此认出"这是外壳自己的嵌套"（见 routeDef.frameGuard）。
 	embedKeyParam = "e"
 )
 
-// frameDeniedPaths 禁止被 iframe 嵌套的端点（点击劫持防护）。
-//
-// 这两个页面免令牌，但页面 HTML 里注入了真实令牌：任意网页用
+// 防嵌套端点由路由表声明（routeDef.frameGuard，见 server.go）：/ 与 /settings
+// 返回「注入令牌的 HTML」且免令牌——任意网页用
 // <iframe src="http://127.0.0.1:<port>/settings" style="opacity:0"> 透明覆盖，
 // 诱导用户点击即可驱动页面自身的脚本 POST /config（把代理改成攻击者地址 → 流量
 // 经中间人）或改端口（服务重启后失联）；监控页的 /openfile 按钮同样能被诱导点击。
 // Host 校验拦不住 —— iframe 的 Host 就是本机地址，完全合法。
 //
 // 两个头都设：X-Frame-Options 是老浏览器/老 WebView 的兜底，CSP frame-ancestors
-// 是现代浏览器的标准。统一挂在这里而不是各个 handler 里 —— 少写一处就是少一个口子。
+// 是现代浏览器的标准。
 //
 // 例外——GUI 外壳自己的嵌套必须放行（否则客户端直接白屏）：
 // 桌面客户端的主窗是「外壳 HTML + iframe 内嵌监控页」两层，外壳用 WebView2 的
 // SetHtml（等价 NavigateToString）加载，父文档是 opaque origin。CSP 的
 // frame-ancestors 表达不了 opaque origin——'self'/'none' 都会把这个合法父窗口
-// 一并拒掉，表现为窗口里只剩一个"禁止"图标。放行规则见 frameAllowed
-// （embedKey + Sec-Fetch-Site 两条独立信号）。判断放在服务端而非外壳侧，是因为
+// 一并拒掉，表现为窗口里只剩一个"禁止"图标。放行规则见 frameAllowed（embedKey
+// + Sec-Fetch-Site 两条独立信号）。判断放在服务端而非外壳侧，是因为
 // frame-ancestors 由被嵌页面自己声明，父窗口无法替它放宽。
-var frameDeniedPaths = map[string]struct{}{
-	"/":         {},
-	"/settings": {},
-}
 
 // newAPIToken 生成 16 字节随机 token（32 位十六进制）。
 func newAPIToken() string {
@@ -99,7 +94,7 @@ func (r *Runtime) ensureAPIToken() string {
 // 只需在一个进程生命周期内保持稳定，重启即换新，无需跨启动一致。
 func newEmbedKey() string { return newAPIToken() }
 
-// embedAccepted 报告请求是否携带本进程的内嵌豁免键（见 frameDeniedPaths 的例外说明）。
+// embedAccepted 报告请求是否携带本进程的内嵌豁免键（见 routeDef.frameGuard 的例外说明）。
 //
 // 空键一律拒绝：embedKey 未初始化时（理论上只在 newRuntime 之前）不能让
 // "参数缺失"和"键为空"凑成一次相等比较而放行。
@@ -112,7 +107,7 @@ func (r *Runtime) embedAccepted(req *http.Request) bool {
 	return subtle.ConstantTimeCompare([]byte(got), []byte(r.embedKey)) == 1
 }
 
-// frameAllowed 报告这次请求的嵌套是否来自 GUI 自己（见 frameDeniedPaths）。
+// frameAllowed 报告这次请求的嵌套是否来自 GUI 自己（见 routeDef.frameGuard）。
 //
 // 两条**独立且各自充分**的信号，命中任一条即放行——这不是冗余设计，而是两次
 // 真实的踩坑各对应一条：
@@ -122,11 +117,22 @@ func (r *Runtime) embedAccepted(req *http.Request) bool {
 //  2. Sec-Fetch-Site: same-origin：框架**自己发起**的跳转——监控页的 ⚙ 走
 //     location.href='/settings'，请求由 iframe 内的本服务文档发出，浏览器标注为同源。
 //     只靠钥匙时这条链路没有钥匙可用，整页会被 DENY 挡住（点设置直接白屏）。
+//     两条跳转同时把 location.search 带上了（见 web/*.html），所以即便某个 WebView
+//     不发 Sec-Fetch-*，这条链路也仍有钥匙兜底。
 //
-// 为什么攻击者造不出这两条：embedKey 是每进程随机的，只注入外壳 HTML（网页读不到
-// 外壳文档，也猜不出 32 位十六进制）；same-origin 要求请求发起方确实位于本服务
-// origin，网页无法把自己的文档放到 127.0.0.1 上。DNS rebinding 想伪装同源也不行
-// ——hostAllowed 会先把非本机 Host 判 403（所以本函数在 Host 校验之后才调用）。
+// 为什么攻击者造不出这两条：
+//   - embedKey 每进程随机、不落盘，只注入外壳 HTML。网页读不到外壳文档（跨源），
+//     32 位十六进制猜不出来；比较走常量时间，不留逐字节试探的时间差。
+//   - Sec-Fetch-* 是 Fetch 规范里的 forbidden header name（`Sec-` 前缀），页面
+//     fetch/XHR 设上去会被浏览器丢弃，只能由浏览器自己填。它标 same-origin 的
+//     前提是「发起文档确实位于本服务 origin」，网页做不到；DNS rebinding 想把
+//     自己的页面搬进这个 origin 也不行，hostAllowed 会先把非本机 Host 判 403
+//     —— 所以本函数必须在 Host 校验之后调用，顺序不能调。
+//
+// 最坏情况评估（万一两条同时被判为真）：被嵌套方仍然读不到页面内容——CORS 头只在
+// tokenOK 时下发（见 guard），跨源 iframe 拿不到 DOM，也拿不到页面里注入的令牌。
+// 所以防嵌套是第二道线，第一道是令牌；两道都失守才轮得到点击劫持（改代理 / 改端口），
+// 而不是令牌泄漏。
 func (r *Runtime) frameAllowed(req *http.Request) bool {
 	if r.embedAccepted(req) {
 		return true
@@ -152,9 +158,12 @@ func (r *Runtime) guard(next http.Handler) http.Handler {
 			return
 		}
 
-		// 注入令牌的页面默认禁止被 iframe 嵌套（点击劫持防护，见 frameDeniedPaths）。
-		// 放在 Host 校验之后：403 响应没必要再带这组头。
-		if _, deny := frameDeniedPaths[req.URL.Path]; deny && !r.frameAllowed(req) {
+		// 注入令牌的页面默认禁止被 iframe 嵌套（点击劫持防护，见 routeDef.frameGuard）。
+		// 用 routeFor 解析实际命中的路由项，而不是另立一份路径名单：未知路径会落到
+		// catch-all "/"，于是同样继承防护（fail-safe），不会因漏登记而放行。
+		// 放在 Host 校验之后：403 响应没必要再带这组头；也保证 frameAllowed 里
+		// 那条 same-origin 判断建立在"Host 已确认本机"的前提之上。
+		if rd, ok := routeFor(req.URL.Path); ok && rd.frameGuard && !r.frameAllowed(req) {
 			w.Header().Set("X-Frame-Options", "DENY")
 			w.Header().Set("Content-Security-Policy", "frame-ancestors 'none'")
 		}

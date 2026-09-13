@@ -11,42 +11,73 @@ import (
 	"github.com/0panwang0/go-catcher/internal/platform"
 )
 
-// routeDef 一条路由表项：路径、允许的方法、是否要求令牌、handler 工厂。
+// routeDef 一条路由表项：路径、允许的方法、是否要求令牌、是否防嵌套、handler 工厂。
 // 端点的一切约束都收敛在这里——新增端点 = 加一行表项，不再需要同时改
 // mux 装配、handler 内的方法检查、auth 的免令牌白名单三处（评审 P2-3）。
 // needToken 默认语义为要求令牌；false 仅限响应体不含秘密的端点。
+//
+// frameGuard 表示该端点返回「注入令牌的 HTML 页面」，默认禁止被 iframe 嵌套
+// （点击劫持防护，见 auth.go）。它必须和路径写在同一条表项里：防护集合若另立
+// 一份硬编码名单，与路由表脱钩时漏项就是**静默放行**（fail-open）——这正是把
+// 它收进表里的理由（早期版本栽过一次）。
 type routeDef struct {
-	path      string
-	methods   []string
-	needToken bool
-	new       func(*Engine) http.HandlerFunc
+	path       string
+	methods    []string
+	needToken  bool
+	frameGuard bool
+	new        func(*Engine) http.HandlerFunc
 }
 
 // routeDefs 全部端点一览表。免令牌端点只有 4 个：探活 / 握手 / 两个页面。
 // 新增免令牌端点前必须想清楚：它的响应体是否含秘密（令牌）、是否会被 CORS
-// 读到（豁免成立的前提见 auth.go 的说明）。
+// 读到（豁免成立的前提见 auth.go 的说明）；若返回 HTML，还要把 frameGuard 置 true
+// （有测试遍历本表兜底，见 auth_test.go）。
 var routeDefs = []routeDef{
-	{"/health", []string{http.MethodGet}, false, func(*Engine) http.HandlerFunc { return handleHealth }},
-	{"/svc/info", []string{http.MethodGet}, false, func(e *Engine) http.HandlerFunc { return e.handleSvcInfo }},
-	{"/", []string{http.MethodGet}, false, func(e *Engine) http.HandlerFunc { return e.handleHomePage }},
-	{"/settings", []string{http.MethodGet}, false, func(e *Engine) http.HandlerFunc { return e.handleSettingsPage }},
+	{"/health", []string{http.MethodGet}, false, false, func(*Engine) http.HandlerFunc { return handleHealth }},
+	{"/svc/info", []string{http.MethodGet}, false, false, func(e *Engine) http.HandlerFunc { return e.handleSvcInfo }},
+	{"/", []string{http.MethodGet}, false, true, func(e *Engine) http.HandlerFunc { return e.handleHomePage }},
+	{"/settings", []string{http.MethodGet}, false, true, func(e *Engine) http.HandlerFunc { return e.handleSettingsPage }},
 
-	{"/pickdir", []string{http.MethodGet}, true, func(e *Engine) http.HandlerFunc { return e.handlePickDir }},
-	{"/status", []string{http.MethodGet}, true, func(e *Engine) http.HandlerFunc { return e.handleStatus }},
+	{"/pickdir", []string{http.MethodGet}, true, false, func(e *Engine) http.HandlerFunc { return e.handlePickDir }},
+	{"/status", []string{http.MethodGet}, true, false, func(e *Engine) http.HandlerFunc { return e.handleStatus }},
 	// /download 用 GET 触发副作用：令牌挡住了外部调用方，但语义上它不是幂等方法，
 	// 属 CSRF 友好型接口（历史包袱）。GET 是扩展侧的既有契约（content script /
 	// downloader 页都按 GET 拼 URL），改 POST 会破坏兼容，故显式记一笔，新端点勿模仿。
-	{"/download", []string{http.MethodGet}, true, func(e *Engine) http.HandlerFunc { return e.handleDownload }},
-	{"/probe", []string{http.MethodGet}, true, func(e *Engine) http.HandlerFunc { return e.handleProbe }},
-	{"/pause", []string{http.MethodGet}, true, func(e *Engine) http.HandlerFunc { return e.handlePause }},
-	{"/resume", []string{http.MethodGet}, true, func(e *Engine) http.HandlerFunc { return e.handleResume }},
-	{"/cancel", []string{http.MethodGet}, true, func(e *Engine) http.HandlerFunc { return e.handleCancel }},
-	{"/remove", []string{http.MethodGet}, true, func(e *Engine) http.HandlerFunc { return e.handleRemove }},
-	{"/openfolder", []string{http.MethodGet}, true, func(e *Engine) http.HandlerFunc { return e.handleOpenFolder }},
-	{"/openfile", []string{http.MethodGet}, true, func(e *Engine) http.HandlerFunc { return e.handleOpenFile }},
-	{"/config", []string{http.MethodGet, http.MethodPost}, true, func(e *Engine) http.HandlerFunc { return e.handleConfig }},
-	{"/log", []string{http.MethodGet}, true, func(*Engine) http.HandlerFunc { return handleLog }},
-	{"/svc/stop", []string{http.MethodPost}, true, func(e *Engine) http.HandlerFunc { return e.handleSvcStop }},
+	{"/download", []string{http.MethodGet}, true, false, func(e *Engine) http.HandlerFunc { return e.handleDownload }},
+	{"/probe", []string{http.MethodGet}, true, false, func(e *Engine) http.HandlerFunc { return e.handleProbe }},
+	{"/pause", []string{http.MethodGet}, true, false, func(e *Engine) http.HandlerFunc { return e.handlePause }},
+	{"/resume", []string{http.MethodGet}, true, false, func(e *Engine) http.HandlerFunc { return e.handleResume }},
+	{"/cancel", []string{http.MethodGet}, true, false, func(e *Engine) http.HandlerFunc { return e.handleCancel }},
+	{"/remove", []string{http.MethodGet}, true, false, func(e *Engine) http.HandlerFunc { return e.handleRemove }},
+	{"/openfolder", []string{http.MethodGet}, true, false, func(e *Engine) http.HandlerFunc { return e.handleOpenFolder }},
+	{"/openfile", []string{http.MethodGet}, true, false, func(e *Engine) http.HandlerFunc { return e.handleOpenFile }},
+	{"/config", []string{http.MethodGet, http.MethodPost}, true, false, func(e *Engine) http.HandlerFunc { return e.handleConfig }},
+	{"/log", []string{http.MethodGet}, true, false, func(*Engine) http.HandlerFunc { return handleLog }},
+	{"/svc/stop", []string{http.MethodPost}, true, false, func(e *Engine) http.HandlerFunc { return e.handleSvcStop }},
+}
+
+// routeFor 返回路径最终由哪个路由项处理，复现 ServeMux 的匹配语义：精确匹配
+// 优先；未命中则取最长前缀匹配的 subtree 模式（以 "/" 结尾）；都没有就是
+// catch-all "/"。抽出来是为了让「防嵌套」与「令牌豁免」共享同一张表，
+// 不再各自维护一份路径名单。
+//
+// 注意它对「未命中」的处理与 tokenFreePath 相反，这是有意的：
+//   - tokenFreePath 未命中 → 要求令牌（未知路径不可能是免令牌端点）
+//   - routeFor 未命中 → 落到 catch-all "/"，于是 frameGuard 继承 "/" 的值（设防）
+//
+// 两者都取安全侧，但方向不同；把它俩合并成一个函数会破坏其中一条的语义。
+func routeFor(p string) (routeDef, bool) {
+	var best routeDef
+	bestLen := -1
+	for _, rd := range routeDefs {
+		if rd.path == p {
+			return rd, true
+		}
+		if strings.HasSuffix(rd.path, "/") && strings.HasPrefix(p, rd.path) && len(rd.path) > bestLen {
+			best, bestLen = rd, len(rd.path)
+		}
+	}
+	return best, bestLen >= 0
 }
 
 // newMux 装配全部路由。鉴权（Host / 令牌 / CORS）由 engine.go 在 mux 外层

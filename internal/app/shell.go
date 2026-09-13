@@ -13,7 +13,7 @@ import "strings"
 // embedKeyPlaceholder 外壳 HTML 里内嵌豁免键的占位符，由 shellHTML 换成真键。
 //
 // 服务端对 / 与 /settings 默认发 DENY 防点击劫持，只有带对本进程键的嵌套才放行
-// （见 core 的 frameDeniedPaths）。外壳经 SetHtml 加载、父文档是 opaque origin，
+// （见 core 的 routeDef.frameGuard）。外壳经 SetHtml 加载、父文档是 opaque origin，
 // 永远拿不到"同源"身份，所以这把钥匙是必需的——漏注入的表现就是主窗里只剩一个
 // "禁止"图标（iframe 被 X-Frame-Options 拒了）。
 const embedKeyPlaceholder = "__GOCATCHER_EMBED_KEY__"

@@ -145,9 +145,56 @@ func TestGuardFrameDeniedPages(t *testing.T) {
 			guardedDo(t, "GET", p, "127.0.0.1:7891", map[string]string{"Sec-Fetch-Site": "same-origin"}))
 	}
 
-	// 非 frameDeniedPaths 的页面不受影响（不因豁免逻辑而误设头）
+	// 非 frameGuard 的端点不受影响（不因豁免逻辑而误设头）
 	if xfo, _ := hdr(guardedDo(t, "GET", "/health", "127.0.0.1:7891", nil)); xfo != "" {
 		t.Errorf("/health 不该有 X-Frame-Options，得到 %q", xfo)
+	}
+
+	// 未知路径必须落到 catch-all "/" 上、继承防护，而不是"没登记就放行"：
+	// guard 曾经用的是一份独立的硬编码路径 map，与路由表各写一份，漏项即静默
+	// fail-open。现在改为 routeFor 解析实际命中的路由项，这条用例把它钉住。
+	// /settingsX 是前缀相近但不等的对照——不能因为像就误判成页面。
+	for _, p := range []string{"/nonexistent", "/settingsX", "/index.html"} {
+		assertDenied("未知路径 "+p, guardedDo(t, "GET", p, "127.0.0.1:7891", nil))
+		assertDenied("未知路径 "+p+"（cross-site）",
+			guardedDo(t, "GET", p, "127.0.0.1:7891", map[string]string{"Sec-Fetch-Site": "cross-site"}))
+	}
+	// 键是充分条件，与路径是否是页面无关——带对键时未知路径同样放行
+	assertFramable("未知路径 + 正确内嵌键",
+		guardedDo(t, "GET", "/nonexistent?"+embedKeyParam+"="+testStd.embedKey, "127.0.0.1:7891", nil))
+}
+
+// TestFrameGuardCoversTokenFreeHTMLPages 遍历路由表，断言「免令牌且返回 HTML 的
+// 端点必须声明 frameGuard」。这是防脱钩的守卫：防护集合一旦与路由表分离，新增
+// 页面漏登记就是**静默放行**（fail-open），而无论"被嵌套"还是"客户端白屏"都不会
+// 报错——只能靠用例兜。
+//
+// 反向也查：声明了 frameGuard 却不返回 HTML = 声明过期（路径或 handler 被改过），
+// 需人工复核，避免防护挂在一个已不再是页面的端点上。
+func TestFrameGuardCoversTokenFreeHTMLPages(t *testing.T) {
+	e := testEngine()
+	for _, rd := range routeDefs {
+		if rd.needToken {
+			// 需要令牌的端点拿不到页面内容（401），不是点击劫持目标；且调用它们的
+			// handler 可能有副作用（/pickdir 会弹窗、/download 会起任务），不在此验证。
+			if rd.frameGuard {
+				t.Errorf("%s 声明了 frameGuard 却要求令牌 —— 这类端点不该挂页面防护，请复核", rd.path)
+			}
+			continue
+		}
+		w := httptest.NewRecorder()
+		rd.new(e)(w, httptest.NewRequest(http.MethodGet, rd.path, nil))
+		ct := w.Header().Get("Content-Type")
+		isHTML := strings.HasPrefix(ct, "text/html")
+
+		if isHTML && !rd.frameGuard {
+			t.Errorf("%s 免令牌且返回 HTML（Content-Type=%q）却没声明 frameGuard —— 可被任意网页 iframe 嵌套",
+				rd.path, ct)
+		}
+		if rd.frameGuard && !isHTML {
+			t.Errorf("%s 声明了 frameGuard 但 Content-Type=%q 不是 HTML —— 声明已过期，请复核",
+				rd.path, ct)
+		}
 	}
 }
 
