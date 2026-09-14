@@ -3,10 +3,12 @@
   "name": "M3U8 Video Catcher",
   "version": "0.5.0",
   "description": "嗅探网页中的 m3u8 视频并一键下载（自动注入 Referer，走浏览器系统代理）",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAxx1GS7+8CnsNY5aYsAA8Dj1txoWBGE7c2ctiercKO8SeNfJ6FGIvqfyAkEX99ru4UPv6NANcD2d+9dqOCatXePhM+D+R9UVrlvjCdRnp6pLPJfd3mYRMwA9GLoP3jAvX3vL68NXXJ9/LPzp/0P21cis4sS8sBVIg3cd/VUGHXmtfuUxypchwadzNyUyFQGJAXeIquPrRJluUPwhp5c6wiC7Jzs0DG6F+V5BgFi7tgpUb6I0SENjJHiDKEPjpoiqB2mOQnERiA20o4vkpvqLto9R01ZV1Uui2Z78b3lc/QfUqObwn1MLwg01MqhsSb4UY/ZXK44WWaWxcHF2nNT/sKQIDAQAB",
   "permissions": [
     "storage",
     "webRequest",
-    "declarativeNetRequest"
+    "declarativeNetRequest",
+    "nativeMessaging"
   ],
   "host_permissions": [
     "http://*/*",

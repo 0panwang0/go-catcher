@@ -8,6 +8,7 @@
 //   m3u8-parse    m3u8/画质解析
 //   video-source  「这个视频」的候选与选项
 //   server-api    本地 Go 服务访问（令牌握手 / 下载 / 轮询 / 控制）
+//   native-host   原生消息唤起（服务没跑时把客户端拉起来）
 //   referer-rules DNR Referer 注入
 import {
   recordMedia,
@@ -29,6 +30,7 @@ import {
   controlTask,
 } from "./server-api.js";
 import { setRefererRules, clearRefererRules, sweepStaleRules, allocRuleIds } from "./referer-rules.js";
+import { requestWake, NATIVE_HOST_NAME } from "./native-host.js";
 
 // 点击工具栏图标：打开下载器页面
 chrome.action.onClicked.addListener(() => {
@@ -155,4 +157,7 @@ export const __test__ = {
   clearRefererRules,
   sweepStaleRules,
   allocRuleIds,
+  // 原生消息唤起（tests/nativehost.test.js）
+  requestWake,
+  NATIVE_HOST_NAME,
 };

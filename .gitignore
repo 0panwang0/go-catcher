@@ -18,6 +18,10 @@ gocatcher_config.json
 gocatcher_state.json
 client_run.log
 
+# 原生消息宿主清单（客户端首次运行自动生成到 exe 旁）：内容含本机 exe 绝对路径，
+# 且随安装位置而变，不入仓库。
+native-host/
+
 # 日志及轮转文件（gocatcher.log 超过 2MB 会轮转为 gocatcher.log.1）
 gocatcher.log
 gocatcher.log.*

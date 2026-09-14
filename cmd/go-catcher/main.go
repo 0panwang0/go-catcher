@@ -1,9 +1,12 @@
 // GoCatcher 单文件入口。
 //
-// 一个 exe 三种模式，按启动参数分发：
-//   - 无参数        → GUI 客户端（internal/app 外壳 + 进程内 core.Engine 服务）
-//   - --server      → 无头服务模式（只有 core.Engine，供 bat/终端手动起服务）
-//   - --url=...     → CLI 直下模式（单任务下载，输出挂回父终端）
+// 一个 exe 多种模式，按启动参数分发：
+//   - 无参数             → GUI 客户端（internal/app 外壳 + 进程内 core.Engine 服务）
+//   - --tray             → 托盘常驻（同 GUI，但不弹主窗；由原生消息宿主拉起）
+//   - --native-host      → 浏览器原生消息宿主（stdin/stdout 帧协议，被浏览器拉起）
+//   - --server           → 无头服务模式（只有 core.Engine，供 bat/终端手动起服务）
+//   - --url=...          → CLI 直下模式（单任务下载，输出挂回父终端）
+//   - --install-native-host / --uninstall-native-host / --native-host-status
 //
 // 架构：internal/core 是纯下载引擎（HTTP API + 任务管线，不依赖任何 GUI），
 // internal/app 是 GUI 外壳（WebView2 + 托盘），二者只通过 Engine 的
@@ -22,28 +25,45 @@ import (
 )
 
 func main() {
-	// 带 参数启动的都不是 GUI 路径：先把标准输出挂回父终端（flag 报错、CLI 进度都要可见）。
-	if len(os.Args) > 1 {
+	// 必须先解析参数再决定挂不挂控制台：原生消息宿主用 stdin/stdout 走二进制帧
+	// 协议，而 AttachParentConsole 会把 os.Stdout 换成 CONOUT$——一挂就毁掉那条通道。
+	opts := core.ParseCLI(os.Args[1:])
+	if len(os.Args) > 1 && !opts.NativeHostMode {
+		// 带参数启动的都不是 GUI 路径：先把标准输出挂回父终端（flag 报错、CLI 进度都要可见）。
 		platform.AttachParentConsole()
 	}
-	opts := core.ParseCLI(os.Args[1:])
 
 	switch {
+	case opts.NativeHostMode:
+		os.Exit(core.RunNativeHost())
+	case opts.InstallNativeHost:
+		os.Exit(core.RunInstallNativeHost())
+	case opts.UninstallNativeHost:
+		os.Exit(core.RunUninstallNativeHost())
+	case opts.NativeHostStatus:
+		os.Exit(core.RunNativeHostStatus())
 	case opts.ServerMode:
 		runHeadless(opts.Port)
+	case opts.TrayMode:
+		runGUI(true)
 	case len(os.Args) == 1:
-		// GUI 无控制台（windowsgui 子系统）：把诊断输出落盘到 exe 同目录的
-		// gocatcher.log，否则重试/回退/落盘失败这类信息全部进黑洞。
-		platform.SetupFileLogging()
-		// 日志异步写盘，退出前排空队列（见 runHeadless 里的同款说明）
-		defer platform.CloseFileLogging()
-		app.Run()
+		runGUI(false)
 	case opts.URL == "":
 		core.PrintUsage()
 		os.Exit(1)
 	default:
 		os.Exit(core.RunCLI(opts))
 	}
+}
+
+// runGUI 启动桌面客户端。trayOnly=true 时只驻托盘（不弹主窗）。
+func runGUI(trayOnly bool) {
+	// GUI 无控制台（windowsgui 子系统）：把诊断输出落盘到 exe 同目录的
+	// gocatcher.log，否则重试/回退/落盘失败这类信息全部进黑洞。
+	platform.SetupFileLogging()
+	// 日志异步写盘，退出前排空队列（见 runHeadless 里的同款说明）
+	defer platform.CloseFileLogging()
+	app.Run(trayOnly)
 }
 
 // runHeadless 无头服务模式：起引擎后阻塞，直到 /svc/stop 或 Ctrl+C。

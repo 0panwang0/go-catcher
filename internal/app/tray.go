@@ -128,6 +128,14 @@ func installSubclass(hwnd uintptr) {
 	enableDarkTitleBar(hwnd)
 }
 
+// hideWindow 立即隐藏主窗（"托盘常驻"形态启动时收起刚创建的窗口用）。
+func hideWindow(hwnd uintptr) {
+	if hwnd == 0 {
+		return
+	}
+	procShowWindow.Call(hwnd, swHide)
+}
+
 // 显示主窗（托盘菜单/左键托盘图标调用）
 func showMainWindow() {
 	if mainHwnd == 0 {

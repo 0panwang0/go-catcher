@@ -436,6 +436,63 @@ var __m3u8catcher = (() => {
     return item && item.type === "mp4" ? makeMP4Source(item, title, pageUrl) : makeM3U8Source(item, title, pageUrl);
   }
 
+  // src/background/native-host.js
+  var NATIVE_HOST_NAME = "com.gocatcher.browser_host";
+  var WAKE_TIMEOUT_MS = 25e3;
+  var waking = null;
+  function requestWake(timeoutMs = WAKE_TIMEOUT_MS) {
+    if (waking) return waking;
+    waking = doRequestWake(timeoutMs).finally(() => {
+      waking = null;
+    });
+    return waking;
+  }
+  function reasonOf(e) {
+    if (!e) return "";
+    if (typeof e === "string") return e;
+    return e.message || String(e);
+  }
+  function doRequestWake(timeoutMs) {
+    return new Promise((resolve) => {
+      let port = null;
+      let settled = false;
+      const finish = (value) => {
+        if (settled) return;
+        settled = true;
+        try {
+          if (port) port.disconnect();
+        } catch {
+        }
+        resolve(value);
+      };
+      const timer = setTimeout(() => finish(null), timeoutMs);
+      try {
+        port = chrome.runtime.connectNative(NATIVE_HOST_NAME);
+      } catch (e) {
+        clearTimeout(timer);
+        console.warn("[go-catcher] connectNative \u5931\u8D25:", reasonOf(e));
+        resolve(null);
+        return;
+      }
+      port.onMessage.addListener((msg) => {
+        clearTimeout(timer);
+        finish(msg && typeof msg === "object" ? msg : null);
+      });
+      port.onDisconnect.addListener(() => {
+        clearTimeout(timer);
+        const why = reasonOf(chrome.runtime.lastError);
+        if (why) console.warn("[go-catcher] \u539F\u751F\u6D88\u606F\u5BBF\u4E3B\u4E0D\u53EF\u7528:", why);
+        finish(null);
+      });
+      try {
+        port.postMessage({ type: "ensure-server" });
+      } catch {
+        clearTimeout(timer);
+        finish(null);
+      }
+    });
+  }
+
   // src/background/server-api.js
   var settingsCache = null;
   async function getSettings() {
@@ -507,16 +564,30 @@ var __m3u8catcher = (() => {
       return false;
     }
   }
+  async function ensureServerRunning() {
+    if (await pingServer()) return true;
+    const resp = await requestWake();
+    if (resp && resp.ok) return true;
+    return waitForServer(2e3);
+  }
+  async function waitForServer(totalMs) {
+    const deadline = Date.now() + totalMs;
+    for (; ; ) {
+      if (await pingServer(1e3)) return true;
+      if (Date.now() >= deadline) return false;
+      await new Promise((r) => setTimeout(r, 300));
+    }
+  }
   async function detectExePath() {
     await getApiToken(true);
   }
   async function downloadViaServer({ m3u8Url, referer, title, filename } = {}) {
     if (!m3u8Url) return { ok: false, error: "\u7F3A\u5C11 m3u8Url" };
-    const healthy = await pingServer();
+    const healthy = await ensureServerRunning();
     if (!healthy) {
       return {
         ok: false,
-        error: "\u672C\u5730\u4E0B\u8F7D\u670D\u52A1\u672A\u542F\u52A8\u3002\u8BF7\u6253\u5F00 go-catcher.exe\uFF08GoCatcher \u5BA2\u6237\u7AEF\uFF0C\u6253\u5F00\u5373\u81EA\u52A8\u542F\u52A8\u4E0B\u8F7D\u670D\u52A1\uFF09\uFF0C\u7136\u540E\u91CD\u8BD5\u3002",
+        error: "\u672C\u5730\u4E0B\u8F7D\u670D\u52A1\u672A\u542F\u52A8\uFF0C\u81EA\u52A8\u5524\u8D77\u4E5F\u6CA1\u6210\u529F\u3002\u8BF7\u624B\u52A8\u6253\u5F00 go-catcher.exe\uFF08GoCatcher \u5BA2\u6237\u7AEF\uFF0C\u6253\u5F00\u5373\u81EA\u52A8\u542F\u52A8\u4E0B\u8F7D\u670D\u52A1\uFF09\uFF0C\u7136\u540E\u91CD\u8BD5\u3002",
         code: "SERVER_DOWN"
       };
     }
@@ -817,7 +888,10 @@ var __m3u8catcher = (() => {
     setRefererRules,
     clearRefererRules,
     sweepStaleRules,
-    allocRuleIds
+    allocRuleIds,
+    // 原生消息唤起（tests/nativehost.test.js）
+    requestWake,
+    NATIVE_HOST_NAME
   };
   return __toCommonJS(main_exports);
 })();

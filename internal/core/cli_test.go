@@ -33,3 +33,44 @@ func TestParseCLI(t *testing.T) {
 		t.Fatalf("默认零值错误: %+v", o2)
 	}
 }
+
+// TestParseCLIBrowserHostInvocation 浏览器拉起宿主时不会带 --native-host：
+// 宿主清单的 path 只能写可执行文件，浏览器把调用方 origin 当第一个参数传进来。
+// 认不出这个形态 ⇒ 进程打印用法后立刻退出 ⇒ 浏览器侧"宿主已退出"，扩展永远唤不起程序。
+// 2026-09-14 用户实测到的"启动不了"就是这个回归，故锁死。
+func TestParseCLIBrowserHostInvocation(t *testing.T) {
+	const id = "jodjnfkmjplkofpgmjlmiiadnkofiopk"
+
+	for _, arg := range []string{
+		"chrome-extension://" + id + "/",
+		"chrome-extension://" + id,       // 无尾斜杠
+		"CHROME-EXTENSION://" + id + "/", // 大小写不敏感
+	} {
+		o := ParseCLI([]string{arg})
+		if !o.NativeHostMode {
+			t.Fatalf("%q 未识别为宿主模式: %+v", arg, o)
+		}
+		// 必须停在宿主模式：不能被当成 CLI 直下（URL 为空会走用法提示）或其它角色
+		if o.URL != "" || o.ServerMode || o.TrayMode || o.InstallNativeHost || o.UninstallNativeHost {
+			t.Fatalf("%q 误落到其它模式: %+v", arg, o)
+		}
+	}
+
+	// 显式开关仍然有效（手工排障用）
+	if o := ParseCLI([]string{"--native-host"}); !o.NativeHostMode {
+		t.Fatalf("--native-host 未生效: %+v", o)
+	}
+
+	// 反向：命令行下载与服务模式不受影响
+	for _, args := range [][]string{
+		{"--url=https://example.com/a.m3u8"},
+		{"--server", "--port", "7891"},
+		{"--install-native-host"},
+		{},
+	} {
+		o := ParseCLI(args)
+		if o.NativeHostMode {
+			t.Fatalf("%v 被误判为宿主模式: %+v", args, o)
+		}
+	}
+}

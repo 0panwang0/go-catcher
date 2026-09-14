@@ -7,6 +7,8 @@
 // 扩展设置（downloader.html 设置卡片里可改，存 chrome.storage.local）：
 //   exePath —— go-catcher.exe 本机路径，兜底"复制命令到终端"用；默认裸文件名（要求在 PATH）
 //   port    —— 本地服务端口，与 GoCatcher 客户端「设置」里的端口保持一致
+import { requestWake } from "./native-host.js";
+
 // 缓存 + onChanged 失效：service worker 随时可能被回收，重启后首次读取重建缓存
 let settingsCache = null;
 
@@ -82,6 +84,30 @@ export async function pingServer(timeoutMs = 2000) {
   }
 }
 
+// ensureServerRunning 确保本地服务可用：已经在跑就直接用，没在跑就通过原生消息宿主
+// 把客户端唤起来，再确认一次。
+//
+// 为什么值得这么做：HTTP 客户端没法启动服务端，"服务没开"是用户最常见的卡点；
+// 宿主通道让"先打开客户端"这一步不再需要用户手动完成。
+export async function ensureServerRunning() {
+  if (await pingServer()) return true;
+  const resp = await requestWake();
+  if (resp && resp.ok) return true;
+  // 宿主回话但报未就绪时（例如客户端已在运行、服务却被手动停掉了），它已经把
+  // 客户端拉到前台过一次；这里再等一小段，覆盖"服务刚起、健康检查还没生效"的窄窗口。
+  return waitForServer(2000);
+}
+
+// waitForServer 在给定时间内轮询，直到服务可用。
+async function waitForServer(totalMs) {
+  const deadline = Date.now() + totalMs;
+  for (;;) {
+    if (await pingServer(1000)) return true;
+    if (Date.now() >= deadline) return false;
+    await new Promise((r) => setTimeout(r, 300));
+  }
+}
+
 // 从 /svc/info 记录服务自报的 exe 绝对路径与访问令牌（同一个握手响应）。
 // 兜底"复制命令到终端"需要完整路径，但每台机器路径不同不能写死；
 // 服务跑过一次这里就缓存下来，content.js 生成兜底命令时直接用（用户零配置）。
@@ -92,11 +118,11 @@ export async function detectExePath() {
 export async function downloadViaServer({ m3u8Url, referer, title, filename } = {}) {
   if (!m3u8Url) return { ok: false, error: "缺少 m3u8Url" };
 
-  const healthy = await pingServer();
+  const healthy = await ensureServerRunning();
   if (!healthy) {
     return {
       ok: false,
-      error: "本地下载服务未启动。请打开 go-catcher.exe（GoCatcher 客户端，打开即自动启动下载服务），然后重试。",
+      error: "本地下载服务未启动，自动唤起也没成功。请手动打开 go-catcher.exe（GoCatcher 客户端，打开即自动启动下载服务），然后重试。",
       code: "SERVER_DOWN",
     };
   }

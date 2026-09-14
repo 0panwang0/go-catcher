@@ -22,6 +22,13 @@ type CLIOptions struct {
 	Limit       int
 	ServerMode  bool
 	Port        int
+
+	// 进程角色（互斥；root main.go 按固定顺序分发）。
+	NativeHostMode      bool // 浏览器原生消息宿主：stdin/stdout 走帧协议，被浏览器拉起
+	TrayMode            bool // 托盘常驻：起服务 + 托盘就位，不弹主窗（由宿主拉起）
+	InstallNativeHost   bool // 登记原生消息宿主
+	UninstallNativeHost bool // 注销原生消息宿主
+	NativeHostStatus    bool // 打印原生消息宿主登记状态
 }
 
 // CLI 运行参数（userAgent/outputFile/limit/bindAddr/referer）现为 Runtime
@@ -47,8 +54,37 @@ func ParseCLI(args []string) CLIOptions {
 	fs.IntVar(&o.Limit, "limit", 0, "只下载前 N 个分片（0 = 全部，用于试片）")
 	fs.BoolVar(&o.ServerMode, "server", false, "无头 HTTP 服务模式（监听 127.0.0.1，供浏览器扩展调用）")
 	fs.IntVar(&o.Port, "port", 0, "服务模式监听端口（仅 --server 时有效；不指定则用设置里配置的端口）")
+	fs.BoolVar(&o.NativeHostMode, "native-host", false, "以浏览器原生消息宿主形态运行（由浏览器按注册表清单拉起，正常无需手动调用）")
+	fs.BoolVar(&o.TrayMode, "tray", false, "启动客户端并只驻留系统托盘（不弹主窗口）")
+	fs.BoolVar(&o.InstallNativeHost, "install-native-host", false, "登记本程序为浏览器原生消息宿主（写入当前用户注册表）")
+	fs.BoolVar(&o.UninstallNativeHost, "uninstall-native-host", false, "注销浏览器原生消息宿主登记")
+	fs.BoolVar(&o.NativeHostStatus, "native-host-status", false, "打印原生消息宿主登记状态")
 	_ = fs.Parse(args)
+	// 浏览器按宿主清单拉起本程序时，命令行长这样：
+	//     go-catcher.exe chrome-extension://<扩展ID>/
+	// 清单的 path 只能写可执行文件本身——Chrome/Edge 用 CreateProcess 起进程，
+	// 不接受"带参数的命令行"，转而把调用方 origin 作为第一个参数传进来。
+	// 所以这个"裸 origin"必须识别成宿主模式：漏掉它，进程会落到下面的"未知模式"
+	// 分支打印用法后立刻退出，浏览器侧只看到"宿主已退出"，用户看到的是
+	// "点了没反应、程序起不来"——而这恰恰是安装清单正确、注册表正确时才发生的
+	// 情形（2026-09-14 实测踩到）。
+	if !o.NativeHostMode {
+		for _, a := range fs.Args() {
+			if isBrowserExtensionOrigin(a) {
+				o.NativeHostMode = true
+				break
+			}
+		}
+	}
 	return o
+}
+
+// isBrowserExtensionOrigin 判断某个参数是否为浏览器传入的扩展来源。
+//
+// 兼容大小写与两侧空白；不校验扩展 ID 是否在我们的允许名单里——那是宿主清单
+// allowed_origins 的职责（浏览器已经按它拦过一道），这里只做形态识别。
+func isBrowserExtensionOrigin(arg string) bool {
+	return strings.HasPrefix(strings.ToLower(strings.TrimSpace(arg)), "chrome-extension://")
 }
 
 // PrintUsage 打印 CLI 用法（无参数 GUI 启动的说明一并给出）。
@@ -59,6 +95,7 @@ func PrintUsage() {
 	fmt.Println("代理: --proxy=system 跟随系统代理（默认）| http://host:port 手动 | direct 直连")
 	fmt.Println("注意: CLI 不做断点续传；若输出文件旁存在 .part 半成品，会被丢弃后重下（需续传请用 GUI 客户端）")
 	fmt.Println("其它: --server [--port=端口] 无头服务模式 | 不带任何参数启动 GUI 客户端")
+	fmt.Println("浏览器联动: --install-native-host 登记宿主（让扩展能唤起本程序）| --native-host-status 查看登记状态 | --uninstall-native-host 注销")
 }
 
 // describeProxy 启动横幅用的代理描述：system 模式展开为注册表实际读数。

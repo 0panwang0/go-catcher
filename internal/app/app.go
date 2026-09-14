@@ -32,14 +32,27 @@ func openBrowser(url string) error {
 	return cmd.Start()
 }
 
-// Run 启动 GUI 客户端，阻塞直到用户真正退出。
-func Run() {
+// Run 启动 GUI 客户端（trayOnly=true 时为"托盘常驻"形态），阻塞直到用户真正退出。
+//
+// trayOnly 用于被浏览器原生消息宿主拉起的场景：用户只是点了一下"下载该视频"，
+// 不该被突然弹出的窗口打断——服务照常起、托盘照常就位，主窗建好即收起，
+// 想看进度时从托盘点开即可。
+func Run(trayOnly bool) {
 	// 单实例：已有实例则唤起它的窗口，本进程直接退出
 	if !acquireSingleInstance() {
 		activateExistingWindow()
 		return
 	}
 	enablePerMonitorDPI()
+
+	// 登记浏览器原生消息宿主（幂等）：登记过，扩展才能把本程序唤起来。
+	// 失败不阻断 GUI——这只是"扩展能不能自动唤起"的附加能力，不该因为它没登记上
+	// 就让客户端起不来；原因写进文件日志供排障。
+	if exe, err := os.Executable(); err == nil {
+		if _, rErr := core.EnsureNativeHost(exe); rErr != nil {
+			fmt.Printf("[app] 登记浏览器原生消息宿主失败（扩展将无法自动唤起本程序）: %v\n", rErr)
+		}
+	}
 
 	// 打开客户端即自动拉起下载服务（沿用旧双进程版行为，浏览器扩展依赖本地服务常驻）。
 	// 失败不阻断 GUI：外壳轮询显示"未运行"，用户从托盘重启能看到具体错误。
@@ -69,6 +82,13 @@ func Run() {
 		os.Exit(1)
 	}
 	defer w.Destroy()
+
+	if trayOnly {
+		// 窗口在 go-webview2 内部创建时就已经显示出来了（该库没有"创建即隐藏"的
+		// 选项，也不接受调用方传入自己的窗口句柄），因此这里只能建好立刻收起。
+		// 代价是被唤起的那一次会闪过一瞬空白窗口，换来的是之后全程不打扰用户。
+		hideWindow(uintptr(w.Window()))
+	}
 
 	// 外壳需要的两个绑定：服务是否在运行（iframe vs 降级提示）、当前端口
 	// （设置里改端口 + 托盘重启服务后，外壳据此把 iframe 切到新地址）。
