@@ -257,23 +257,285 @@ func TestLiveGapDetectedOnWindowRollover(t *testing.T) {
 	}
 }
 
-// TestLoadStateMarksLiveAsInterrupted 重启后未完成的直播任务必须标成"中断"，
-// 不能混进点播那条"已暂停，可继续下载"的路——直播没有"接着录"这回事。
-func TestLoadStateMarksLiveAsInterrupted(t *testing.T) {
-	saveRestoreState(t)
-	dir := t.TempDir()
-	data, err := json.Marshal(stateFile{Version: stateVersion, Tasks: []persistedTask{
-		{ID: "t1", Filename: "live.ts", SaveDir: dir, M3u8URL: "https://example.com/live.m3u8",
-			Stage: "录制中", Live: true, SegDone: 5},
-		{ID: "t2", Filename: "vod.ts", SaveDir: dir, M3u8URL: "https://example.com/vod.m3u8",
-			Stage: "下载分片中", SegDone: 3},
-	}})
+// seedStateFile 写一份状态文件供 loadState 恢复。
+func seedStateFile(t *testing.T, tasks []persistedTask) {
+	t.Helper()
+	data, err := json.Marshal(stateFile{Version: stateVersion, Tasks: tasks})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(testStd.getStatePath(), data, 0644); err != nil {
 		t.Fatal(err)
 	}
+}
+
+// TestSalvageInterruptedLiveFinalizesPart 程序被强杀（任务管理器 / 断电）时
+// 没有任何机会执行收尾，重启后必须补做——否则"直播中断必自动收尾"就留了一个
+// "只能手动点停止"的口子。这里直接调补偿函数（同步）；Engine.Start 里以
+// goroutine 启动它，不阻塞 GUI。
+func TestSalvageInterruptedLiveFinalizesPart(t *testing.T) {
+	saveRestoreState(t)
+	dir := t.TempDir()
+	final := filepath.Join(dir, "live.ts")
+	const want = "SEG-0SEG-1"
+	if err := os.WriteFile(final+".part", []byte(want), 0644); err != nil {
+		t.Fatal(err)
+	}
+	seedStateFile(t, []persistedTask{{
+		ID: "t1", Filename: "live.ts", SaveDir: dir, FinalPath: final,
+		M3u8URL: "https://example.com/live.m3u8",
+		Stage:   "录制中断（程序退出）", Live: true, Paused: true, SegDone: 2,
+	}})
+	testStd.loadState()
+
+	testStd.salvageInterruptedLive()
+
+	te := testStd.findTask("t1")
+	if te == nil {
+		t.Fatal("任务未被恢复")
+	}
+	te.mu.Lock()
+	st := te.st
+	te.mu.Unlock()
+	if !st.done || !st.interrupted {
+		t.Fatalf("补偿收尾未生效: done=%v interrupted=%v stage=%q", st.done, st.interrupted, st.stage)
+	}
+	if st.segDone != 2 {
+		t.Fatalf("segDone=%d want 2（已录片数必须保留）", st.segDone)
+	}
+	if st.paused {
+		t.Fatal("补偿收尾后仍是待处理态")
+	}
+	data, err := os.ReadFile(final)
+	if err != nil {
+		t.Fatalf("补偿收尾没有产出成品文件: %v", err)
+	}
+	if string(data) != want {
+		t.Fatalf("成品内容=%q want %q", data, want)
+	}
+	if _, err := os.Stat(final + ".part"); !os.IsNotExist(err) {
+		t.Fatal("补偿收尾后残留 .part")
+	}
+}
+
+// TestSalvageInterruptedLiveKeepsPartOnFailure 补偿收尾失败时必须保留 .part：
+// 那可能是用户仅有的内容，删掉就等于把他录的东西弄丢了（本项目的红线是
+// 宁可不保存，也不能悄悄销毁用户数据）。
+func TestSalvageInterruptedLiveKeepsPartOnFailure(t *testing.T) {
+	saveRestoreState(t)
+	dir := t.TempDir()
+	final := filepath.Join(dir, "live.mp4")
+	if err := os.WriteFile(final+".part", []byte("NOT-FMP4-DATA"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	seedStateFile(t, []persistedTask{{
+		ID: "t1", Filename: "live.mp4", SaveDir: dir, FinalPath: final,
+		M3u8URL: "https://example.com/live.m3u8",
+		Stage:   "录制中断（程序退出）", Live: true, Paused: true, SegDone: 3,
+		ContainerID: "fmp4-map", // 声明是 fMP4，内容却不是 → 抽样校验必然失败
+	}})
+	testStd.loadState()
+
+	testStd.salvageInterruptedLive()
+
+	te := testStd.findTask("t1")
+	if te == nil {
+		t.Fatal("任务未被恢复")
+	}
+	te.mu.Lock()
+	st := te.st
+	te.mu.Unlock()
+	if st.interrupted {
+		t.Fatal("抽样校验不通过却当成中断收尾成功了")
+	}
+	if st.stage != "失败" {
+		t.Fatalf("stage=%q want 失败", st.stage)
+	}
+	if _, err := os.Stat(final + ".part"); err != nil {
+		t.Fatalf("补偿收尾失败却删掉了 .part（用户仅有的内容）: %v", err)
+	}
+	if _, err := os.Stat(final); !os.IsNotExist(err) {
+		t.Fatal("校验失败却产出了成品文件")
+	}
+}
+
+// TestSalvageSkipsNonLiveTasks 点播任务的「已暂停」是可续的（.part 就是断点），
+// 补偿收尾会把它 rename 成成品、把断点吃掉——绝不能碰。
+func TestSalvageSkipsNonLiveTasks(t *testing.T) {
+	saveRestoreState(t)
+	dir := t.TempDir()
+	final := filepath.Join(dir, "vod.ts")
+	if err := os.WriteFile(final+".part", []byte("SEG-0"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	seedStateFile(t, []persistedTask{{
+		ID: "t1", Filename: "vod.ts", SaveDir: dir, FinalPath: final,
+		M3u8URL: "https://example.com/vod.m3u8",
+		Stage:   "已暂停", Paused: true, SegDone: 1, SegTot: 4,
+	}})
+	testStd.loadState()
+
+	testStd.salvageInterruptedLive()
+
+	te := testStd.findTask("t1")
+	if te == nil {
+		t.Fatal("任务未被恢复")
+	}
+	te.mu.Lock()
+	st := te.st
+	te.mu.Unlock()
+	if st.done || st.interrupted {
+		t.Fatalf("点播暂停任务被补偿收尾了: done=%v interrupted=%v", st.done, st.interrupted)
+	}
+	if st.stage != "已暂停" {
+		t.Fatalf("stage=%q want 已暂停（点播断点必须原样保留）", st.stage)
+	}
+	if _, err := os.Stat(final + ".part"); err != nil {
+		t.Fatalf("点播任务的 .part 被动过: %v", err)
+	}
+}
+
+// TestRestoreContainerSniffsTSWithoutMapHint 旧版状态文件没有 containerID 时，
+// 续传与收尾只能靠 .part 头部嗅探容器。嗅探以前硬编码"播放列表有 #EXT-X-MAP"
+// 这一前提，于是**任何**开头不是 ftyp 的内容都被判成 fmp4-map —— 一个 TS
+// 半成品会被 fMP4 校验器判成"内容不符合容器特征"，续传和收尾双双白白失败。
+func TestRestoreContainerSniffsTSWithoutMapHint(t *testing.T) {
+	dir := t.TempDir()
+	tsPart := filepath.Join(dir, "v.ts.part")
+	if err := os.WriteFile(tsPart, fakeTSPlain(0), 0644); err != nil {
+		t.Fatal(err)
+	}
+	job := &dlJob{rt: testStd}
+	restoreContainer(job, "", tsPart, nil)
+	if job.container == nil || job.container.ID != "ts" {
+		t.Fatalf("TS 半成品嗅探结果=%v want ts（不能靠 fMP4 校验器兜底）", job.container)
+	}
+
+	// 反向：fMP4 的 .part 头部就是 init 段（ftyp 开头），按魔数必须仍然认得出来，
+	// 否则这个修复就把 fMP4 续传弄坏了。
+	mp4Part := filepath.Join(dir, "v.mp4.part")
+	head := append([]byte{0, 0, 0, 0x18}, []byte("ftypiso5")...)
+	if err := os.WriteFile(mp4Part, append(head, make([]byte, 256)...), 0644); err != nil {
+		t.Fatal(err)
+	}
+	job2 := &dlJob{rt: testStd}
+	restoreContainer(job2, "", mp4Part, nil)
+	if job2.container == nil || job2.container.ID != "fmp4" {
+		t.Fatalf("fMP4 半成品嗅探结果=%v want fmp4", job2.container)
+	}
+}
+
+// callStop 调用 /stop?id=<id>，断言 HTTP 200。
+func callStop(t *testing.T, id string) {
+	t.Helper()
+	w := httptest.NewRecorder()
+	r := httptest.NewRequest("GET", "/stop?id="+id, nil)
+	testEngine().handleStop(w, r)
+	if w.Code != 200 {
+		t.Fatalf("stop HTTP %d: %s", w.Code, w.Body.String())
+	}
+}
+
+// TestStoppedRestoredLiveSavesPart 重启后恢复出来的直播任务（没有 job）被用户
+// 点「停止」时，必须把 .part 里的内容保存成正式文件。
+//
+// 回归：finishStop 原先只看 `job == nil` 就判"无内容"，于是把用户已经录到磁盘
+// 上的内容**整个删掉**——重启后点一次「停止」，录到的东西就没了。判据必须落在
+// ".part 里有没有内容"上，而不是"当前有没有 job"上。
+func TestStoppedRestoredLiveSavesPart(t *testing.T) {
+	saveRestoreState(t)
+	dir := t.TempDir()
+	final := filepath.Join(dir, "live.ts")
+	const want = "SEG-0SEG-1"
+	if err := os.WriteFile(final+".part", []byte(want), 0644); err != nil {
+		t.Fatal(err)
+	}
+	seedStateFile(t, []persistedTask{{
+		ID: "t1", Filename: "live.ts", SaveDir: dir, FinalPath: final,
+		M3u8URL: "https://example.com/live.m3u8",
+		Stage:   "录制中断（程序退出）", Live: true, Paused: true, SegDone: 2,
+	}})
+	testStd.loadState()
+
+	callStop(t, "t1")
+
+	te := testStd.findTask("t1")
+	if te == nil {
+		t.Fatal("任务未被恢复")
+	}
+	waitTaskState(t, te, func(s taskState) bool { return s.done }, "停止收尾")
+
+	te.mu.Lock()
+	st := te.st
+	te.mu.Unlock()
+	if !st.interrupted {
+		t.Fatalf("重启后点停止应走中断收尾: interrupted=%v stage=%q", st.interrupted, st.stage)
+	}
+	if st.segDone != 2 {
+		t.Fatalf("segDone=%d want 2", st.segDone)
+	}
+	data, err := os.ReadFile(final)
+	if err != nil {
+		t.Fatalf("点「停止」把用户录到的内容删了（成品文件不存在）: %v", err)
+	}
+	if string(data) != want {
+		t.Fatalf("成品内容=%q want %q", data, want)
+	}
+}
+
+// TestSalvageAndStopDoNotDoubleFinalize 补偿收尾与用户手点「停止」可能同时落到
+// 同一个恢复出来的任务上。两条收尾并发时，后到的那个会因为 .part 已被改名而
+// 抽样校验失败，把一次成功的保存改写成「失败」——用户的文件其实在磁盘上好好的。
+func TestSalvageAndStopDoNotDoubleFinalize(t *testing.T) {
+	saveRestoreState(t)
+	dir := t.TempDir()
+	final := filepath.Join(dir, "live.ts")
+	if err := os.WriteFile(final+".part", []byte("SEG-0SEG-1"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	seedStateFile(t, []persistedTask{{
+		ID: "t1", Filename: "live.ts", SaveDir: dir, FinalPath: final,
+		M3u8URL: "https://example.com/live.m3u8",
+		Stage:   "录制中断（程序退出）", Live: true, Paused: true, SegDone: 2,
+	}})
+	testStd.loadState()
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() { defer wg.Done(); testStd.salvageInterruptedLive() }()
+	go func() { defer wg.Done(); finishStoppedTask(testStd.findTask("t1")) }()
+	wg.Wait()
+
+	te := testStd.findTask("t1")
+	te.mu.Lock()
+	st := te.st
+	te.mu.Unlock()
+	if st.stage == "失败" {
+		t.Fatalf("两条收尾路径互相踩踏，成功保存被改写成失败: %+v", st)
+	}
+	if !st.done || !st.interrupted {
+		t.Fatalf("收尾未完成: done=%v interrupted=%v stage=%q", st.done, st.interrupted, st.stage)
+	}
+	data, err := os.ReadFile(final)
+	if err != nil {
+		t.Fatalf("成品文件不存在: %v", err)
+	}
+	if string(data) != "SEG-0SEG-1" {
+		t.Fatalf("成品内容=%q", data)
+	}
+}
+
+// TestLoadStateMarksLiveAsInterrupted 重启后未完成的直播任务必须标成"中断"，
+// 不能混进点播那条"已暂停，可继续下载"的路——直播没有"接着录"这回事。
+func TestLoadStateMarksLiveAsInterrupted(t *testing.T) {
+	saveRestoreState(t)
+	dir := t.TempDir()
+	seedStateFile(t, []persistedTask{
+		{ID: "t1", Filename: "live.ts", SaveDir: dir, M3u8URL: "https://example.com/live.m3u8",
+			Stage: "录制中", Live: true, SegDone: 5},
+		{ID: "t2", Filename: "vod.ts", SaveDir: dir, M3u8URL: "https://example.com/vod.m3u8",
+			Stage: "下载分片中", SegDone: 3},
+	})
 
 	testStd.loadState()
 

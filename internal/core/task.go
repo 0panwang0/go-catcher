@@ -75,6 +75,17 @@ type taskEntry struct {
 	job    *dlJob             // 任务上下文（运行时 segDone/segTot 原子值直接读）；指针本身必须经 jobRef 在 mu 内取
 	cancel context.CancelFunc // 中断下载（暂停/取消共用，靠 intent 区分后续处理）
 	intent int                // intentNone / intentPause / intentCancel
+
+	// finalizeMu 串行化"对同一任务的收尾"（finalizeRecording：抽样校验 →
+	// 容器回填 → .part 改名）。
+	//
+	// 正常运行时不争用：每个任务只有一条 pipeline。但**重启后**恢复出来的
+	// 直播任务没有 pipeline 了，两条路径可能同时来收尾它——
+	//   - 启动补偿收尾（Runtime.salvageInterruptedLive，强杀场景的唯一补救）；
+	//   - 用户在界面上点「停止」（handleStop → finishStoppedTask）。
+	// 两者并发时，后到的那个会因为 .part 已被 rename 走而抽样校验失败，
+	// 把一次成功的保存改写成「失败」——用户的文件其实好好地躺在磁盘上。
+	finalizeMu sync.Mutex
 }
 
 // saveDirMu / defaultSaveDir / tasksMu / tasks / seqID 均为 Runtime 字段（见 runtime.go）。

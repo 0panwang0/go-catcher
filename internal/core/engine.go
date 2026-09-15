@@ -58,6 +58,14 @@ func (e *Engine) Start() error {
 		// 先建限制器并装载持久化配置（并发数在恢复任务前就绪），再恢复历史任务
 		e.rt.initRuntimeConfig()
 		e.rt.loadState()
+		// 补偿收尾"上次进程被强杀、没来得及收尾"的直播录制。
+		//
+		// 异步：它要读用户磁盘上的文件（抽样校验）并改任务终态，而 GUI 的
+		// 启动路径正等着这里返回去建窗口。**不占并发槽**——它没有网络 IO，
+		// 只有一次 256KB 读 + 一次 rename；抢一个下载槽位只会让它排在一堆
+		// 无关下载后面白等。任务之间也是串行处理（单次遍历），不会出现
+		// "N 个任务同时敲磁盘"。
+		go e.rt.salvageInterruptedLive()
 	})
 	// 端口解析：--port 覆盖 > 配置文件；端口只在本方法和 Port() 里读，改动即时生效于下次 Start
 	port := e.override
@@ -202,6 +210,79 @@ func (r *Runtime) stopOrPauseAllTasks() {
 			cancel()
 		}
 	}
+}
+
+// salvageInterruptedLive 补偿收尾"上次进程被强杀时没来得及收尾"的直播任务。
+//
+// 正常退出走 stopOrPauseAllTasks → 收尾；但任务管理器强杀、断电这类场景里
+// 进程没有任何机会执行收尾，已录部分留在 .part 里，载入后任务停在
+// 「录制中断（程序退出）」等用户点「停止」。这里补做一次，让"直播中断必自动
+// 收尾"这条语义不留一个只能手动操作的口子。
+//
+// 三条约束：
+//   - **不阻塞启动**：调用方以 goroutine 启动；串行处理，每个任务只读 256KB
+//     样本头 + 一次 rename，开销与"用户并发下载"不在一个量级；
+//   - **失败保留 .part**：那可能是用户仅有的内容，删掉就是把他录的东西弄丢了；
+//   - **只碰直播**：点播的 .part 是断点（续传要用），rename 成成品就把断点吃掉了。
+func (r *Runtime) salvageInterruptedLive() {
+	r.tasksMu.Lock()
+	entries := make([]*taskEntry, 0, len(r.tasks))
+	for _, te := range r.tasks {
+		entries = append(entries, te)
+	}
+	r.tasksMu.Unlock()
+
+	for _, te := range entries {
+		// 单个任务出问题不能拖垮整轮补偿（收尾要解析用户磁盘上的文件，
+		// 内容不可控），所以逐个兜住 panic。
+		func() {
+			defer func() {
+				if rec := recover(); rec != nil {
+					fmt.Printf("[disk] WARN: 补偿收尾内部错误（已拦截）: %v\n", rec)
+				}
+			}()
+			r.salvageOneInterruptedLive(te)
+		}()
+	}
+}
+
+// salvageOneInterruptedLive 补偿收尾单个任务（不满足条件时静默跳过）。
+func (r *Runtime) salvageOneInterruptedLive(te *taskEntry) {
+	te.mu.Lock()
+	st := te.st
+	te.mu.Unlock()
+	if !st.live || st.done || st.canceled {
+		return
+	}
+
+	// 用户可能同时点「停止」收尾同一个任务（handleStop → finishStoppedTask）：
+	// 并发收尾会让后到者因 .part 已被改名而校验失败，把成功保存写成「失败」。
+	te.finalizeMu.Lock()
+	defer te.finalizeMu.Unlock()
+
+	// 拿锁期间可能已经被对方收尾完了——重新判一次终态。
+	if s := snapshot(te); s.done {
+		return
+	}
+
+	part := st.finalPath + ".part"
+	job := reopenJobForFinalize(te)
+	if job == nil {
+		return // 只有 init 段（或什么都没有）：没有可保存的内容
+	}
+	te.mu.Lock()
+	te.job = job
+	te.mu.Unlock()
+
+	// 校验器只看内容特征，不看播放列表：加密标志传 false 只会让判定更宽松
+	// （明文直接放行），不会把完好的文件误判成损坏。宁可漏判，不可误杀。
+	if err := finalizeRecording(te, job, part, true, "程序退出导致中断"); err != nil {
+		fmt.Printf("[disk] WARN: 直播任务 %s 的补偿收尾失败（.part 已保留）: %v\n", st.id, err)
+		failTask(te, "程序退出导致录制中断，且自动收尾失败: "+err.Error())
+		r.markDirty()
+		return
+	}
+	fmt.Printf("[disk] id=%s 已补偿收尾（上次退出时中断的录制）\n", st.id)
 }
 
 // waitTasksSettled 等所有任务脱离 running/queued（最多 max）。

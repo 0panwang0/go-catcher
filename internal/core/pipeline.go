@@ -470,12 +470,72 @@ func finishStoppedTask(te *taskEntry) {
 	finishStop(te, id, part, segDone)
 }
 
+// reopenJobForFinalize 为「没有 job 的任务」重建收尾所需的 dlJob。
+//
+// 正常运行时 job 由 pipeline 创建并挂在任务上；进程被强杀后重启，任务只剩
+// 持久化字节。此时若直接拿 `.part` 收尾，容器与跨分片规范化状态都会缺席——
+// fMP4 的 mehd/mvhd 回填整段跳过，产物总时长是 0（播放器拖不动、看不出录了多久）。
+// 所以从 containerID / normState / `.part` 头部把这两样恢复回来。
+//
+// 返回 nil 表示"没有可收尾的内容"（finalPath 为空、或 `.part` 不存在/为空）。
+func reopenJobForFinalize(te *taskEntry) *dlJob {
+	te.mu.Lock()
+	id, finalPath := te.st.id, te.st.finalPath
+	segDone, segTot := te.st.segDone, te.st.segTot
+	live, containerID := te.st.live, te.st.containerID
+	filename, saveDir := te.st.filename, te.st.saveDir
+	normState := te.st.normState
+	te.mu.Unlock()
+
+	if finalPath == "" && filename != "" {
+		// 兼容旧版状态文件（曾有版本把失败任务的 finalPath 清空）：按
+		// filename+saveDir 拼回，否则 .part 找不到，用户录的东西就成了磁盘上
+		// 无人认领的孤儿。与 pipeline 启动时的兜底同一套规则。
+		finalPath = filepath.Join(saveDir, filename)
+	}
+	if finalPath == "" {
+		return nil
+	}
+	part := finalPath + ".part"
+	// 0 字节的 .part 是 uniquePath 留下的占位（认领文件名），不是半成品
+	if !nonEmptyFile(part) {
+		return nil
+	}
+
+	job := &dlJob{rt: te.rt, id: id, live: live}
+	// 进度计数一并对齐已录片数：snapshot 优先读 job 的原子值，
+	// 不设就会把已录片数显示成 0。
+	job.setSeg(segDone, segTot)
+	job.setSegFlushed(segDone)
+	restoreContainer(job, containerID, part, normState)
+	return job
+}
+
 // finishStop 收尾一条被「停止」的直播录制。
 //
 // 有已落盘分片就保存成正式文件；一片都没录到则按无内容处理（清掉临时文件），
 // 否则用户会拿到一个只有 init 段、播不出画面的空壳。
 func finishStop(te *taskEntry, id, part string, segDone int64) {
+	// 启动补偿收尾可能正在收尾同一个（重启后恢复出来的）任务，见 finalizeMu。
+	te.finalizeMu.Lock()
+	defer te.finalizeMu.Unlock()
+
+	// 拿到锁后必须重新确认终态：等锁期间对方可能已经收尾完了。
+	// 不复检的后果不是"白做一遍"，而是把结果改坏——.part 已被改名，下一轮的
+	// 抽样校验读不到文件头直接放行，直到 moveFile 才失败，一条"已保存"的
+	// 记录被改写成「失败」，用户看到文件失败、实际文件好好地躺在磁盘上。
+	if snapshot(te).done {
+		return
+	}
+
 	job := te.jobRef()
+	if job == nil {
+		// 没有 job 不等于没有内容：重启后恢复出来的直播任务正是这个形态
+		// （pipeline 早已不在，job 为空但 .part 里有用户录到的东西）。
+		// 不重建就直接走下面的"无内容"分支，会把 .part 删掉——那是把用户
+		// 录的东西销毁掉，本项目红线。
+		job = reopenJobForFinalize(te)
+	}
 	if job == nil || job.segFlushedNow() == 0 {
 		if part != "" {
 			if err := os.Remove(part); err != nil && !os.IsNotExist(err) {
@@ -580,7 +640,12 @@ func restoreContainer(job *dlJob, containerID, partPath string, normState []byte
 			job.norm = c.NewState()
 		}
 	} else if head, err := readHead(partPath, 4096); err == nil && len(head) > 0 {
-		job.container = detectContainer(head, true)
+		// 嗅探必须 onMagic=true 等价地"只看魔数"，不能假设播放列表有 #EXT-X-MAP：
+		// 这里的入参是磁盘上的半成品，拿不到播放列表。传 hasMap=true 会让
+		// **任何**开头不含 ftyp 的内容都被判成 fmp4-map —— 一个 .ts 半成品
+		// 会被 fMP4 校验器判成"内容不符合容器特征"，续传与收尾都白白失败。
+		// 反过来，fMP4 的 .part 头部就是 init 段（必带 ftyp），按魔数同样认得出来。
+		job.container = detectContainer(head, false)
 		if job.container.NewState != nil {
 			job.norm = job.container.NewState()
 		}
