@@ -115,6 +115,9 @@ func snapshot(te *taskEntry) taskState {
 	if job != nil {
 		s.segDone = job.segNow()
 		s.segTot = job.segTotal()
+		// 录制途中出现的缺口必须当场可见：滑动窗口滚走的那段内容永远补不回来，
+		// 等到收尾才第一次告诉用户就已经晚了（他有权利立刻改录制策略）。
+		s.gapSeconds = job.gapSecondsNow()
 	}
 	// openPath：当前真实可打开的文件。done 用成品；paused/失败 用 .part 半成品（失败保留 .part 供重试）；其余空。
 	// .part 要求非空：uniquePath 会为刚创建的任务留下一个 0 字节占位（认领文件名），

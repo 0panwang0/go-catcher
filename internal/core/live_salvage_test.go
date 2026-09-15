@@ -483,6 +483,118 @@ func TestStoppedRestoredLiveSavesPart(t *testing.T) {
 	}
 }
 
+// TestUserStopOnRunningLiveMarksCompleted 用户对着"正在录制"的直播点「停止」，
+// 语义是"录到这里收工"——必须标「已完成」，不能标「已中断」。
+//
+// 学徒 2026-09-15 的判断：中断是"非用户意愿"的（源站断流、程序退出），
+// 用户自己叫停不该显示成出了故障。区别于 TestStoppedRestoredLiveSavesPart：
+// 那条路上任务早就停了，用户点的「停止」只是"保存已录部分"，仍按中断记。
+func TestUserStopOnRunningLiveMarksCompleted(t *testing.T) {
+	useFastLive(t, 1<<20) // 不让"空轮询"抢先结束
+	srv := startLiveServer(t,
+		[]string{"#EXTM3U\n#EXT-X-VERSION:3\n#EXTINF:6.0,\nseg/0.ts\n#EXTINF:6.0,\nseg/1.ts\n"},
+		map[string]string{"/seg/0.ts": "SEG-0", "/seg/1.ts": "SEG-1"},
+		nil,
+	)
+	te, _ := startLiveTask(t, "livestop", srv.URL+"/live.m3u8")
+
+	// 等到真有分片落盘再停：否则会走"无内容"分支，测不到收尾。
+	waitTaskState(t, te, func(s taskState) bool {
+		j := te.jobRef()
+		return s.running && j != nil && j.segFlushedNow() >= 2
+	}, "录到 2 片")
+
+	callStop(t, "livestop")
+	waitTaskState(t, te, func(s taskState) bool { return s.done }, "停止收尾")
+	waitLimiterDrained(t)
+
+	te.mu.Lock()
+	st := te.st
+	te.mu.Unlock()
+	if st.interrupted {
+		t.Fatalf("用户主动停止被标成「已中断」（stage=%q）——那是故障态，不该用在用户自己叫停上", st.stage)
+	}
+	if st.errorMsg != "" {
+		t.Fatalf("用户停止留下了错误原因 %q：前端会把它算进「失败」统计", st.errorMsg)
+	}
+	if !strings.Contains(st.stage, "用户停止") {
+		t.Fatalf("stage=%q want 含「用户停止录制」——得说清是谁结束的", st.stage)
+	}
+	if st.paused {
+		t.Fatal("停止收尾后 paused=true：任务又变成可恢复态")
+	}
+	data, err := os.ReadFile(st.finalPath)
+	if err != nil {
+		t.Fatalf("停止后没有产出成品文件: %v", err)
+	}
+	if string(data) != "SEG-0SEG-1" {
+		t.Fatalf("成品内容=%q want %q", data, "SEG-0SEG-1")
+	}
+	if _, err := os.Stat(st.finalPath + ".part"); !os.IsNotExist(err) {
+		t.Fatal("收尾后残留 .part 半成品")
+	}
+}
+
+// TestUserStopKeepsPartWhenValidationFails 用户点「停止」但产物抽样校验不通过时，
+// 必须保留 .part。
+//
+// 这是个容易写错的地方：把"用户停止"实现成 finalizeRecording(..., false, ...) 会
+// 顺带让它走"正常路径"的校验失败分支 —— 那里会 os.Remove(.part)。结果是"用户点一下
+// 停止，磁盘上没录完的东西被销毁"。所以保留 .part 的判据必须是 outcome != complete，
+// 不能跟"显示成已完成还是已中断"共用一个布尔。
+func TestUserStopKeepsPartWhenValidationFails(t *testing.T) {
+	saveRestoreState(t)
+	dir := t.TempDir()
+	final := filepath.Join(dir, "live.mp4")
+	if err := os.WriteFile(final+".part", []byte("NOT-FMP4-DATA"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	te := &taskEntry{rt: testStd, st: taskState{
+		id: "livestop-bad", live: true, running: true, stage: "录制直播中",
+		m3u8URL:  "https://example.com/live.m3u8",
+		filename: "live.mp4", saveDir: dir, finalPath: final,
+	}}
+	job := &dlJob{rt: testStd, id: "livestop-bad", live: true}
+	job.setSeg(3, 0)
+	job.setSegFlushed(3)
+	restoreContainer(job, "fmp4-map", final+".part", nil) // 声明 fMP4，内容不是 → 校验必失败
+	te.job = job
+	te.intent = intentStop
+	testStd.tasks[te.st.id] = te
+
+	finishInterrupt(te)
+
+	te.mu.Lock()
+	st := te.st
+	te.mu.Unlock()
+	if _, err := os.Stat(final + ".part"); err != nil {
+		t.Fatalf("用户停止 + 校验失败时删掉了 .part（那是用户仅有的内容）: %v", err)
+	}
+	if st.interrupted {
+		t.Fatal("抽样校验不通过却当成收尾成功了")
+	}
+	if !st.done || st.errorMsg == "" {
+		t.Fatalf("校验失败必须标失败并留下原因: done=%v errorMsg=%q", st.done, st.errorMsg)
+	}
+}
+
+// TestSnapshotExposesGapWhileRecording 录制途中出现的缺口必须当场就能从 /status
+// 看到。等到收尾才第一次告诉用户，他可能已经白录了几个小时。
+func TestSnapshotExposesGapWhileRecording(t *testing.T) {
+	te := &taskEntry{rt: testStd, st: taskState{id: "livegap", live: true, running: true, stage: "录制直播中"}}
+	job := &dlJob{rt: testStd, id: "livegap", live: true}
+	job.setSeg(4, 0)
+	job.addGapSeconds(12)
+	te.job = job
+
+	if got := snapshot(te).gapSeconds; got < 11 || got > 13 {
+		t.Fatalf("snapshot gapSeconds=%.1f want ≈12（运行中的缺口没暴露给前端）", got)
+	}
+	if got := toTaskStateDTO(snapshot(te)).GapSeconds; got < 11 || got > 13 {
+		t.Fatalf("DTO gapSeconds=%.1f want ≈12（前端拿不到缺口就报不出来）", got)
+	}
+}
+
 // TestSalvageAndStopDoNotDoubleFinalize 补偿收尾与用户手点「停止」可能同时落到
 // 同一个恢复出来的任务上。两条收尾并发时，后到的那个会因为 .part 已被改名而
 // 抽样校验失败，把一次成功的保存改写成「失败」——用户的文件其实在磁盘上好好的。

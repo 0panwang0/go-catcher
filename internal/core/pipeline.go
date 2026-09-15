@@ -297,7 +297,9 @@ func runDiskPipeline(te *taskEntry) {
 		//     ——不能因为是直播就把坏数据当成品（那又是"产物坏了但日志正常"）。
 		if job.live && job.segFlushedNow() > 0 {
 			fmt.Printf("[disk] LIVE-FAIL: %s\n", msg)
-			if serr := finalizeRecording(te, job, partPath, true, "录制中断: "+msg); serr == nil {
+			// reason 直接给 msg：stage 已经是「录制中断 · 已保存」，再加"录制中断:"
+			// 前缀会让界面读成"录制中断 · 已保存（录制中断: xx）"。
+			if serr := finalizeRecording(te, job, partPath, finalizeInterrupted, msg); serr == nil {
 				return
 			}
 		}
@@ -316,23 +318,44 @@ func runDiskPipeline(te *taskEntry) {
 	// 5-6. 抽样校验 → 容器收尾 → .part 改名为正式文件。
 	//      与「停止」「中断」路径共用同一个收尾函数：收尾代码一旦分叉，
 	//      两条路的产物规则就再也对不齐了。
-	if ferr := finalizeRecording(te, job, partPath, false, ""); ferr != nil {
+	if ferr := finalizeRecording(te, job, partPath, finalizeComplete, ""); ferr != nil {
 		fail(ferr.Error())
 		return
 	}
 }
 
+// finalizeOutcome 是收尾的起因，决定两件事：产物校验失败时是否保留 .part、
+// 以及对外显示成「已完成」还是「已中断」。
+//
+// 为什么不是一个 interrupted bool：这两件事的取值并不总是一致。用户主动点
+// 「停止」不该显示成"中断"（那是用户自己结束的），但它同样必须保留 .part——
+// 验不过就删等于把用户录的东西销毁掉。用一个 bool 会逼出"要么误删、要么误标"。
+type finalizeOutcome int
+
+const (
+	finalizeComplete    finalizeOutcome = iota // 正常下载/录制到自然结束
+	finalizeStopped                            // 用户主动停止（他认为录到此为止）
+	finalizeInterrupted                        // 非用户意愿中断（拉流失败、程序退出补偿）
+)
+
+// keepsPartOnInvalid 报告产物抽样校验失败时是否必须保留 .part。
+// 只有"正常走完"才允许丢弃损坏的临时文件；其余路径那份半成品可能是用户仅有的东西。
+func (o finalizeOutcome) keepsPartOnInvalid() bool { return o != finalizeComplete }
+
+// interrupted 报告这条收尾要不要对外标成「已中断」。
+func (o finalizeOutcome) interrupted() bool { return o == finalizeInterrupted }
+
 // finalizeRecording 把 .part 收尾成正式文件：抽样校验 → 容器收尾（fMP4 回填
 // 总时长 mehd/mvhd）→ 改名成成品 → 置任务终态。
 //
-// 三条路径共用：正常完成（interrupted=false）、用户停止、故障中断（后两者
-// interrupted=true，reason 写明原因）。
+// 三条路径共用（正常完成 / 用户停止 / 故障中断），差别只在 outcome。
 //
-// interrupted=true 时有两条硬约束，缺一条就是把缺陷藏起来：
+// interrupted 那一条有两条硬约束，缺一条就是把缺陷藏起来：
 //   - stage 必须与"完整录制"可区分（"录制中断 · 已保存"）；
 //   - errorMsg 必须保留原因、不能清空——本项目头号缺陷形态就是
 //     "产物不完整但日志与状态显示一切正常"。
-func finalizeRecording(te *taskEntry, job *dlJob, partPath string, interrupted bool, reason string) error {
+func finalizeRecording(te *taskEntry, job *dlJob, partPath string, outcome finalizeOutcome, reason string) error {
+	interrupted := outcome.interrupted()
 	te.mu.Lock()
 	finalPath, id, segTot := te.st.finalPath, te.st.id, te.st.segTot
 	te.mu.Unlock()
@@ -348,8 +371,8 @@ func finalizeRecording(te *taskEntry, job *dlJob, partPath string, interrupted b
 		Segments:  valSegs,
 		MinBytes:  int64(job.initLen),
 	}); verr != nil {
-		if interrupted {
-			// 中断路径保留 .part：那可能是用户仅有的半成品，交给他自己处理
+		if outcome.keepsPartOnInvalid() {
+			// 用户停止 / 故障中断：保留 .part，那可能是用户仅有的半成品，交给他自己处理
 			return fmt.Errorf("%w（临时文件保留在 %s）", verr, partPath)
 		}
 		// 正常路径判定损坏就直接丢弃：重试只会重下出同样的坏数据，
@@ -367,6 +390,8 @@ func finalizeRecording(te *taskEntry, job *dlJob, partPath string, interrupted b
 	}
 	if interrupted {
 		fmt.Printf("[disk] id=%s 已保存（录制中断: %s）-> %s\n", id, reason, finalPath)
+	} else if outcome == finalizeStopped {
+		fmt.Printf("[disk] id=%s 已保存（用户停止录制）-> %s\n", id, finalPath)
 	} else {
 		fmt.Printf("[disk] id=%s 已保存 -> %s\n", id, finalPath)
 	}
@@ -389,13 +414,18 @@ func finalizeRecording(te *taskEntry, job *dlJob, partPath string, interrupted b
 	if interrupted {
 		te.st.stage = "录制中断 · 已保存"
 		te.st.errorMsg = reason
+	} else if outcome == finalizeStopped {
+		// 用户主动点「停止」：这是"录到这里收工"，不是故障。stage 写清是谁结束的，
+		// errorMsg 必须留空——否则前端的"失败"统计会把它算进去（学徒 2026-09-15 定）。
+		te.st.stage = "已保存（用户停止录制）"
+		te.st.errorMsg = ""
 	} else {
 		te.st.stage = "已保存"
 		te.st.errorMsg = ""
 	}
-	// interrupted 标记决定前端把这条记录显示成「已中断」还是「已完成」。
-	// 缺口时长如实带上：滑动窗口滚走的分片补不回来，产物时间轴上那段确实是空的
-	// （用户主动停止不算缺口——那是"录到哪算哪"，不是中间少了一段）。
+	// interrupted 标记决定前端把这条记录显示成「已中断」还是「已完成」
+	// （用户停止算完成：是他自己叫停的，不是出了故障）。
+	// 缺口时长如实带上：滑动窗口滚走的分片补不回来，产物时间轴上那段确实是空的。
 	te.st.interrupted = interrupted
 	te.st.gapSeconds = job.gapSecondsNow()
 	te.mu.Unlock()
@@ -444,7 +474,7 @@ func finishInterrupt(te *taskEntry) {
 		}
 		fmt.Printf("[disk] id=%s 已取消\n", id)
 	case intentStop:
-		finishStop(te, id, part, segDone)
+		finishStop(te, id, part, segDone, finalizeStopped, "用户停止录制")
 	default:
 		// 暂停时也做容器收尾处理（fMP4 回填已录部分的总时长，方便直接预览/拖动）；
 		// 续传完成后会以新总时长再次回填
@@ -461,13 +491,23 @@ func finishInterrupt(te *taskEntry) {
 // finishStoppedTask 收尾一条已不在运行（失败或中断后静止）的直播任务。
 // pipeline 已经退出，没有 ctx 可取消，直接按现有 .part 走收尾；
 // 由 /stop 在"任务未运行"时排到 goroutine 里执行。
+//
+// 与 finishInterrupt 的 intentStop 分支有个关键区别：那条路上任务还在录，
+// 是用户自己叫停的，算「已完成」；这里任务早就停了（拉流失败 / 程序退出），
+// 用户点的「停止」只是"把已录部分保存下来"，中断原因不是他造成的，
+// 所以保持「已中断」并沿用原原因——把它改写成"已完成"等于抹掉故障记录。
 func finishStoppedTask(te *taskEntry) {
 	te.mu.Lock()
 	part := te.st.finalPath + ".part"
 	id := te.st.id
 	segDone := te.st.segDone
+	reason := te.st.errorMsg
 	te.mu.Unlock()
-	finishStop(te, id, part, segDone)
+	if reason == "" {
+		// 状态文件里的直播任务不带 errorMsg（中断原因是"上次程序退出"这件事本身）
+		reason = "程序退出"
+	}
+	finishStop(te, id, part, segDone, finalizeInterrupted, reason)
 }
 
 // reopenJobForFinalize 为「没有 job 的任务」重建收尾所需的 dlJob。
@@ -515,7 +555,10 @@ func reopenJobForFinalize(te *taskEntry) *dlJob {
 //
 // 有已落盘分片就保存成正式文件；一片都没录到则按无内容处理（清掉临时文件），
 // 否则用户会拿到一个只有 init 段、播不出画面的空壳。
-func finishStop(te *taskEntry, id, part string, segDone int64) {
+//
+// outcome 由调用方给：还在录时停止 = finalizeStopped（用户主动收工），
+// 已经静止时停止 = finalizeInterrupted（沿用原中断原因），见 finishStoppedTask。
+func finishStop(te *taskEntry, id, part string, segDone int64, outcome finalizeOutcome, reason string) {
 	// 启动补偿收尾可能正在收尾同一个（重启后恢复出来的）任务，见 finalizeMu。
 	te.finalizeMu.Lock()
 	defer te.finalizeMu.Unlock()
@@ -557,7 +600,7 @@ func finishStop(te *taskEntry, id, part string, segDone int64) {
 		fmt.Printf("[disk] id=%s 已停止（无内容可保存）\n", id)
 		return
 	}
-	if err := finalizeRecording(te, job, part, true, "用户停止录制"); err != nil {
+	if err := finalizeRecording(te, job, part, outcome, reason); err != nil {
 		fmt.Printf("[disk] FAIL: 停止收尾失败: %v\n", err)
 		failTask(te, err.Error())
 		return

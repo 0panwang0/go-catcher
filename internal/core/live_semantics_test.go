@@ -101,8 +101,17 @@ func TestLiveFlagExposedInStatus(t *testing.T) {
 	}
 }
 
-// TestStopLiveFinalizesFile 直播停止：已录部分收尾成正式文件，
-// 且状态必须与"完整录完"可区分（stage 含「中断」、errorMsg 保留原因）。
+// TestStopLiveFinalizesFile 用户对着"正在录制"的直播点「停止」：已录部分收尾成
+// 正式文件，并按"用户主动结束"记（学徒 2026-09-15 定：他自己叫停的不算故障，
+// 界面显示「已完成」并把谁结束的说清楚）。
+//
+// 三条必须同时成立，缺一条就会骗人：
+//   - interrupted=false：不是故障态；
+//   - stage 写明"用户停止录制"：光说"已保存"分不清是录完了还是被叫停了；
+//   - errorMsg 留空：那不是错误，留着会被前端算进「失败」统计。
+//
+// 「已中断」留给非用户意愿的中断：见 TestSalvageInterruptedLive* 与
+// TestStopIdleLiveFinalizesExistingPart（任务早就停了，用户点的「停止」只是保存）。
 func TestStopLiveFinalizesFile(t *testing.T) {
 	te, want := newStoppableLiveTask(t, "livestop")
 	waitTaskState(t, te, func(s taskState) bool { return s.segDone >= 2 }, "录到 2 片")
@@ -113,11 +122,14 @@ func TestStopLiveFinalizesFile(t *testing.T) {
 	te.mu.Lock()
 	st := te.st
 	te.mu.Unlock()
-	if !strings.Contains(st.stage, "中断") {
-		t.Fatalf("stage=%q want 含「中断」——必须区别于完整录完的「已保存」", st.stage)
+	if st.interrupted {
+		t.Fatalf("用户主动停止被标成中断态（stage=%q）：「中断」是非用户意愿的语义", st.stage)
 	}
-	if st.errorMsg == "" {
-		t.Fatal("errorMsg 为空：停止原因丢失，界面会把它显示成一次正常完成")
+	if !strings.Contains(st.stage, "用户停止") {
+		t.Fatalf("stage=%q want 含「用户停止录制」——必须说清是谁结束的", st.stage)
+	}
+	if st.errorMsg != "" {
+		t.Fatalf("errorMsg=%q want 空：用户停止不是错误，留着会被算进「失败」统计", st.errorMsg)
 	}
 	if st.paused {
 		t.Fatal("停止后 paused=true：任务又变回了可恢复态")

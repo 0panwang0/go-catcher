@@ -276,7 +276,7 @@ func (r *Runtime) salvageOneInterruptedLive(te *taskEntry) {
 
 	// 校验器只看内容特征，不看播放列表：加密标志传 false 只会让判定更宽松
 	// （明文直接放行），不会把完好的文件误判成损坏。宁可漏判，不可误杀。
-	if err := finalizeRecording(te, job, part, true, "程序退出导致中断"); err != nil {
+	if err := finalizeRecording(te, job, part, finalizeInterrupted, "程序退出导致中断"); err != nil {
 		fmt.Printf("[disk] WARN: 直播任务 %s 的补偿收尾失败（.part 已保留）: %v\n", st.id, err)
 		failTask(te, "程序退出导致录制中断，且自动收尾失败: "+err.Error())
 		r.markDirty()
