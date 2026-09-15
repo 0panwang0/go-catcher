@@ -285,9 +285,9 @@ func parsePlaylist(m3u8Text, base string) playlistInfo {
 			}
 			pl.key = nk
 		case strings.HasPrefix(line, "#EXT-X-MAP:"):
-			if m := mapURIRe.FindStringSubmatch(line); len(m) == 2 && m[1] != "" {
+			if u := mapURIAttr(line); u != "" {
 				pl.hasMap = true
-				pl.mapURI = resolveURL(base, m[1])
+				pl.mapURI = resolveURL(base, u)
 			}
 		case strings.HasPrefix(line, "#EXTINF:"):
 			// EXTINF 行在它对应的分片 URL 行之前出现，先记下等 URL 行配对
@@ -335,9 +335,27 @@ var (
 	// keyFormatRe KEYFORMAT 属性：规范要求 quoted-string，但非规范播放列表会写成
 	// 裸值（KEYFORMAT=identity,），两种都认。第 1 组是带引号形态，第 2 组是裸值。
 	keyFormatRe = regexp.MustCompile(`(?i)KEYFORMAT=(?:"([^"]*)"|([^",]*))`)
-	// mapURIRe #EXT-X-MAP 的 URI 属性（模块级编译，别在逐行循环里反复编译）
-	mapURIRe = regexp.MustCompile(`URI="([^"]*)"`)
+	// mapURIRe #EXT-X-MAP 的 URI 属性：与 keyURIRe 逐字对齐 —— 规范要求
+	// quoted-string，但非规范播放列表会写成裸值（URI=init.mp4,BYTERANGE=…）。
+	// 旧实现只认带引号形态，裸值时 hasMap/mapURI 取不到 ⇒ 容器判不出 fMP4，
+	// 任务以「识别为 fMP4 分片流，但播放列表没有 #EXT-X-MAP 初始化段」失败：
+	// 明明有 init 段却报"没有"（见 m3u8_mapuri_test.go）。
+	// 第 1 组是带引号形态，第 2 组是裸值（止于逗号/空白）。
+	mapURIRe = regexp.MustCompile(`(?i)URI=(?:"([^"]*)"|([^",\s]*))`)
 )
+
+// mapURIAttr 提取 #EXT-X-MAP 行的 URI 属性值，带引号与裸值两种形态都认。
+// 属性缺失或值为空返回 ""（调用方据此判"没有 init 段"）。
+func mapURIAttr(line string) string {
+	m := mapURIRe.FindStringSubmatch(line)
+	if len(m) != 3 {
+		return ""
+	}
+	if m[1] != "" {
+		return m[1]
+	}
+	return strings.TrimSpace(m[2])
+}
 
 // parseKeyLine 解析 #EXT-X-KEY 行：METHOD、URI（相对路径按 base 解析）、
 // 十六进制 IV 与 KEYFORMAT。
