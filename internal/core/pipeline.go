@@ -244,19 +244,17 @@ func runDiskPipeline(te *taskEntry) {
 
 	// 4. 下载：直播跟随（循环拉取增量追加）vs 点播（一次性并发）
 	//
-	// job.live 与 st.live 必须在同一个临界区里写：seenState() 在 te.mu 下读
-	// job.live，而 st.live 是 /status 与前端分流的唯一判据。此前只设了 job.live，
-	// 任务状态里的 live 恒为 false（P1-4）——前端的「录制中」徽章、无限进度条、
-	// 录制时长分支全是死代码，直播被完全按点播渲染。
+	// job.live 与 st.live 必须在同一个临界区里写：st.live 是 /status 与前端
+	// 分流的唯一判据。此前只设了 job.live，任务状态里的 live 恒为 false（P1-4）
+	// ——前端的「录制中」徽章、无限进度条、录制时长分支全是死代码，
+	// 直播被完全按点播渲染。
+	//
+	// 直播去重状态不跨会话恢复：B0 之后直播只有「停止」「取消」两态，
+	// 不存在"接着上次录"（暂停期间的分片已从滑动窗口滚走）。
 	te.mu.Lock()
 	job.live = isLive
 	te.st.live = isLive
-	seenURLs, seenSeq, seenAny := st.seen, st.seenSeq, st.seenAny
 	te.mu.Unlock()
-	if isLive {
-		// 断点恢复：水位线优先，URL 集合兜底（旧状态文件只存了 URL）
-		job.restoreSeen(seenURLs, seenSeq, seenAny)
-	}
 
 	var next int
 	if isLive {

@@ -3,6 +3,7 @@ package core
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -224,7 +225,7 @@ func TestLiveFollow(t *testing.T) {
 	defer func() { testStd.livePollInterval, testStd.liveMaxEmptyPolls = oldI, oldE }()
 
 	out := filepath.Join(t.TempDir(), "live.ts")
-	j := &dlJob{rt: testStd, m3u8URL: srv.URL + "/live.m3u8", live: true, seen: make(map[string]bool)}
+	j := &dlJob{rt: testStd, m3u8URL: srv.URL + "/live.m3u8", live: true}
 
 	next, err := j.liveDownload(context.Background(), out, 0)
 	if err != nil {
@@ -261,7 +262,7 @@ func TestLiveFollowStop(t *testing.T) {
 	defer func() { testStd.livePollInterval = oldI }()
 
 	out := filepath.Join(t.TempDir(), "live.ts")
-	j := &dlJob{rt: testStd, m3u8URL: srv.URL + "/live.m3u8", live: true, seen: make(map[string]bool)}
+	j := &dlJob{rt: testStd, m3u8URL: srv.URL + "/live.m3u8", live: true}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	go func() {
@@ -479,40 +480,64 @@ func TestLiveEventStreamNoDuplicate(t *testing.T) {
 	}
 }
 
-// TestSeenWindowBounded 去重窗口必须有界，且水位线独立于窗口工作：长直播不能
-// 把见过的每个 URL 都留在内存与状态文件里（旧实现只增不减 → 写盘近似 O(n²)）。
-func TestSeenWindowBounded(t *testing.T) {
+// TestSeenWatermarkMonotonic 直播去重靠 media sequence 水位线：单调推进、
+// 被滑动窗口淘汰的早期分片仍判为已录（否则 EVENT 列表会把它们重录一遍）、
+// 超前序号判为新分片、回退序号不拉低水位线。
+//
+// B0 之后不存在跨会话续录，旧实现里那个"兼容只存了 URL 的旧状态文件"的
+// URL 窗口已删除（见 TestLiveSeenStateNotPersisted），水位线是唯一判据。
+func TestSeenWatermarkMonotonic(t *testing.T) {
 	j := &dlJob{rt: testStd, live: true}
-	n := uint64(liveSeenWindow*3 + 7)
+	if j.seenCovers(0) {
+		t.Error("尚未录过任何分片时不该判为已录")
+	}
+	const n = uint64(5000)
 	for i := uint64(0); i < n; i++ {
-		j.seenRecord(i, fmt.Sprintf("https://cdn.example.com/seg/%d.ts", i))
+		if j.seenCovers(i) {
+			t.Fatalf("seq=%d 尚未录制却判为已录", i)
+		}
+		j.seenRecord(i)
 	}
-	seq, any, urls := j.seenSnapshotState()
-	if !any || seq != n-1 {
-		t.Fatalf("水位线应推进到最后一个序号：seq=%d any=%v want %d/true", seq, any, n-1)
+	if !j.seenCovers(0) {
+		t.Error("录过 seq=0 之后仍判为未录（EVENT 流会被重复录制）")
 	}
-	if len(urls) > liveSeenWindow {
-		t.Fatalf("URL 窗口应 ≤ %d，得到 %d", liveSeenWindow, len(urls))
-	}
-	// 判定不依赖 URL 是否还在窗口里：最早期分片已被淘汰，仍须判为已录
-	if !j.seenCovers(0, "https://cdn.example.com/seg/0.ts") {
-		t.Error("被窗口淘汰的早期分片仍应判为已录（否则 EVENT 流会重复录制）")
-	}
-	if !j.seenCovers(n-1, "") {
+	if !j.seenCovers(n - 1) {
 		t.Error("最近录过的分片应判为已录")
 	}
-	if j.seenCovers(n, "") {
+	if j.seenCovers(n) {
 		t.Error("超前序号应判为新分片")
 	}
-
-	// 恢复：水位线保留，URL 窗口截断到上限内
-	j2 := &dlJob{rt: testStd, live: true}
-	big := make([]string, liveSeenWindow+500)
-	for i := range big {
-		big[i] = fmt.Sprintf("u%d", i)
+	// 乱序回退（重复轮询里旧分片再次出现）不得把水位线拉低
+	j.seenRecord(10)
+	if wm, ok := j.seenWatermark(); !ok || wm != n-1 {
+		t.Fatalf("水位线=%d ok=%v want %d/true", wm, ok, n-1)
 	}
-	j2.restoreSeen(big, 42, true)
-	if seq2, any2, urls2 := j2.seenSnapshotState(); !any2 || seq2 != 42 || len(urls2) > liveSeenWindow {
-		t.Fatalf("恢复后 seq=%d any=%v len(urls)=%d want 42/true/≤%d", seq2, any2, len(urls2), liveSeenWindow)
+}
+
+// TestLiveSeenStateNotPersisted 直播去重状态不进状态文件。
+//
+// B0 之后直播只有「停止」「取消」两态，不存在跨会话续录——这些字段写进去
+// 没人读（复核证实此前更是从未真正写过：collectPersisted 的 s.live 分支
+// 因 P1-4 不可达），只会让状态文件随录制时长线性膨胀（6 小时直播按 2s/片
+// 是上万条 URL）。
+func TestLiveSeenStateNotPersisted(t *testing.T) {
+	saveRestoreState(t)
+	job := &dlJob{rt: testStd, live: true}
+	for i := uint64(0); i < 50; i++ {
+		job.seenRecord(i)
+	}
+	te := &taskEntry{rt: testStd, job: job, st: taskState{
+		id: "t1", live: true, stage: "录制中", segDone: 50,
+	}}
+	testStd.tasks[te.st.id] = te
+
+	data, err := json.Marshal(testStd.collectPersisted())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, frag := range []string{"seenSeq", "seenAny", "seenURLs"} {
+		if strings.Contains(string(data), frag) {
+			t.Errorf("状态文件里仍有 %s：B0 之后没有跨会话续录，这些字段没人读", frag)
+		}
 	}
 }

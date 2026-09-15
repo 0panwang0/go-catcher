@@ -42,12 +42,6 @@ type taskState struct {
 	// gapSeconds 产物时间轴上的缺口时长（秒）。直播中断/滑动窗口滚会丢片，
 	// 那段时间轴就是空的；如实报出去，别让用户以为文件是连续完整的。
 	gapSeconds float64
-	// 直播去重状态（断点恢复用；运行时以 job 的为准）：
-	// seen 是有界 URL 窗口（兼容只存了 URL 的旧状态文件），seenSeq/seenAny 是
-	// media sequence 水位线。
-	seen    []string
-	seenSeq uint64
-	seenAny bool
 
 	// containerID 探测到的容器 ID（断点续传恢复规范化等格式相关行为）
 	containerID string

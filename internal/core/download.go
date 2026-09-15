@@ -10,7 +10,6 @@ import (
 	"io"
 	"net/http"
 	"os"
-	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -50,14 +49,11 @@ type dlJob struct {
 	gapMillis int64
 	// pre 容器探测时已拉取的首个分片（from==0 时直接复用，避免重复下载）
 	pre []byte
-	// 直播去重状态。判定主依据是 media sequence 水位线（seenSeq/seenAny，见
-	// seenCovers）；seen/seenOrder 是有界 URL 窗口（liveSeenWindow），只用于
-	// 兼容「只持久化了 URL」的旧状态文件。
-	seenMu    sync.Mutex
-	seen      map[string]bool
-	seenOrder []string
-	seenSeq   uint64
-	seenAny   bool
+	// 直播去重状态：media sequence 水位线（已录到的最大序号）。
+	// 判定见 seenCovers；判定主依据就是它，没有别的判据。
+	seenMu  sync.Mutex
+	seenSeq uint64
+	seenAny bool
 
 	// container 探测到的容器（决定分片写入前是否需要规范化）
 	container *Container
@@ -77,87 +73,29 @@ type dlJob struct {
 	initLen int
 }
 
-// liveSeenWindow 直播去重 URL 窗口的上限（条数）。
+// seenCovers 报告序号为 seq 的分片是否已录制（按 media sequence 水位线判定）。
 //
-// 去重的判定主依据是 media sequence 水位线（见 seenCovers），URL 窗口只用于
-// 兼容旧状态文件。即便如此也要有界：旧实现只增不减，一段 6 小时直播（2s/片）
-// 会攒下约 10800 条 URL 常驻内存，且 markDirty 的 1.2s debounce 每次都把它
-// 整个序列化进 gocatcher_state.json（近似 O(n²) 写盘放大）。窗口只需覆盖
-// 「播放列表当前滚动窗口」内的分片，1000 条远超任何实际列表窗口。
-const liveSeenWindow = 1000
-
-// seenCovers 报告序号为 seq 的分片是否已录制。
+// 为什么不用"URL 是否见过"：EVENT 列表只增不减，旧实现那个有界 URL 窗口会把
+// 早期分片淘汰掉，于是它们被当成新分片重录一遍；不设界又解决不了内存与写盘
+// 膨胀（旧实现只增不减，6 小时直播能攒下上万条 URL 常驻内存，且每次
+// markDirty 都把它整个序列化进状态文件）。水位线对滑动窗口列表与 EVENT 列表
+// 都正确，且是 O(1)。
 //
-// 水位线已建立时按序号判定：这对滑动窗口列表与只增不减的 EVENT 列表都正确。
-// 旧实现用 URL 集合，窗口一旦有界，EVENT 列表里被淘汰过的早期分片就会被当
-// 新分片重复录制；不设界又解决不了内存与写盘的膨胀。
-// 刚恢复、水位线尚未建立时退回 URL 集合判定：兼容只存了 URL 的旧状态文件。
-func (j *dlJob) seenCovers(seq uint64, u string) bool {
+// 跨会话不恢复：B0 之后直播只有「停止」「取消」两态，不存在"接着上次录"。
+func (j *dlJob) seenCovers(seq uint64) bool {
 	j.seenMu.Lock()
 	defer j.seenMu.Unlock()
-	if j.seenAny {
-		return seq <= j.seenSeq
-	}
-	return j.seen[u]
+	return j.seenAny && seq <= j.seenSeq
 }
 
-// seenRecord 记录一个已录制分片：推进 media sequence 水位线，并把 URL 放进
-// 有界窗口（仅作旧状态文件的恢复兜底，见 seenCovers）。
-func (j *dlJob) seenRecord(seq uint64, u string) {
+// seenRecord 记录一个已录制分片：推进 media sequence 水位线（只前进，不回退）。
+func (j *dlJob) seenRecord(seq uint64) {
 	j.seenMu.Lock()
 	defer j.seenMu.Unlock()
 	if !j.seenAny || seq > j.seenSeq {
 		j.seenSeq = seq
 	}
 	j.seenAny = true
-	if j.seen == nil {
-		j.seen = make(map[string]bool)
-	}
-	if j.seen[u] {
-		return
-	}
-	j.seen[u] = true
-	j.seenOrder = append(j.seenOrder, u)
-	if len(j.seenOrder) > liveSeenWindow {
-		old := j.seenOrder[0]
-		j.seenOrder = append(j.seenOrder[:0], j.seenOrder[1:]...) // 原地左移，容量不增长
-		delete(j.seen, old)
-	}
-}
-
-// restoreSeen 断点续传时恢复直播去重状态：水位线优先，URL 集合兜底
-// （旧状态文件只存了 seenURLs）。
-func (j *dlJob) restoreSeen(urls []string, seq uint64, any bool) {
-	j.seenMu.Lock()
-	defer j.seenMu.Unlock()
-	j.seen = make(map[string]bool, len(urls))
-	j.seenOrder = j.seenOrder[:0]
-	for _, u := range urls {
-		if j.seen[u] {
-			continue
-		}
-		j.seen[u] = true
-		j.seenOrder = append(j.seenOrder, u)
-	}
-	if len(j.seenOrder) > liveSeenWindow {
-		j.seenOrder = append([]string(nil), j.seenOrder[len(j.seenOrder)-liveSeenWindow:]...)
-		j.seen = make(map[string]bool, len(j.seenOrder))
-		for _, u := range j.seenOrder {
-			j.seen[u] = true
-		}
-	}
-	j.seenSeq, j.seenAny = seq, any
-}
-
-// seenSnapshotState 导出直播去重状态（水位线 + 有界 URL 窗口）供持久化。
-// URL 稳定排序：否则文件内容会随插入顺序抖动，白白产生 diff。
-func (j *dlJob) seenSnapshotState() (uint64, bool, []string) {
-	j.seenMu.Lock()
-	defer j.seenMu.Unlock()
-	out := make([]string, len(j.seenOrder))
-	copy(out, j.seenOrder)
-	sort.Strings(out)
-	return j.seenSeq, j.seenAny, out
 }
 
 // seenWatermark 返回 media sequence 水位线（已录到的最大序号，以及是否已建立）。
@@ -913,7 +851,7 @@ dispatch:
 // 直播跟随模式：循环拉取播放列表，增量下载新分片
 // ------------------------------------------------------------
 // 直播/事件流的播放列表没有 #EXT-X-ENDLIST，且列表不断增长（旧分片会被
-// 滚动淘汰）。跟随模式每 livePollInterval 轮询一次播放列表，用 seen 集合
+// 滚动淘汰）。跟随模式每 livePollInterval 轮询一次播放列表，用 media sequence
 // 去重，只下载新增分片并 append 到 .part。用户暂停/取消即停止；
 // 播放列表出现 ENDLIST（直播自然结束）或长时间无新分片（死流兜底）也停止。
 //
@@ -970,10 +908,10 @@ func (j *dlJob) liveDownload(ctx context.Context, outPath string, from int) (int
 			// 按 media sequence 判重（列表位置 + MEDIA-SEQUENCE），而不是"URL 是否
 			// 见过"：见 seenCovers。
 			seq := cur.mediaSeq + uint64(pos)
-			if j.seenCovers(seq, u) {
+			if j.seenCovers(seq) {
 				continue
 			}
-			j.seenRecord(seq, u)
+			j.seenRecord(seq)
 			newSegs = append(newSegs, u)
 			newDurs = append(newDurs, durAt(cur, pos))
 			if firstNewPos < 0 {

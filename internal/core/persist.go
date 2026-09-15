@@ -33,13 +33,8 @@ type persistedTask struct {
 	Live      bool      `json:"live"` // 直播跟随任务（播放列表无 ENDLIST）
 	// 中断收尾（已保存已录部分但没录完）与产物时间轴上的缺口时长。
 	// 落盘是为了重启后界面仍能把"中断"与"完整录完"区分开。
-	Interrupted bool    `json:"interrupted,omitempty"`
-	GapSeconds  float64 `json:"gapSeconds,omitempty"`
-	// 直播去重状态：主依据是 seenSeq 水位线（seenAny = 是否已建立）；SeenURLs 是
-	// 有界 URL 窗口，仅用于兼容只存了 URL 的旧状态文件。
-	SeenSeq     uint64          `json:"seenSeq,omitempty"`
-	SeenAny     bool            `json:"seenAny,omitempty"`
-	SeenURLs    []string        `json:"seenURLs,omitempty"`
+	Interrupted bool            `json:"interrupted,omitempty"`
+	GapSeconds  float64         `json:"gapSeconds,omitempty"`
 	ContainerID string          `json:"containerID,omitempty"` // 探测到的容器 ID（续传恢复规范化）
 	NormState   json.RawMessage `json:"normState,omitempty"`   // 跨分片状态字节（NormState.snapshot 导出，续传 restore 恢复）
 }
@@ -129,9 +124,6 @@ func (r *Runtime) collectPersisted() []persistedTask {
 			Interrupted: s.interrupted,
 			GapSeconds:  s.gapSeconds,
 		}
-		if s.live {
-			pt.SeenSeq, pt.SeenAny, pt.SeenURLs = te.seenState()
-		}
 		pt.ContainerID = s.containerID
 		if len(s.normState) > 0 {
 			pt.NormState = json.RawMessage(s.normState)
@@ -141,16 +133,6 @@ func (r *Runtime) collectPersisted() []persistedTask {
 	// 稳定的排序，避免 map 遍历顺序导致文件内容每次都变
 	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
 	return out
-}
-
-// seenState 取直播任务的去重状态（水位线 + 有界 URL 窗口）；非直播任务返回零值。
-func (te *taskEntry) seenState() (uint64, bool, []string) {
-	te.mu.Lock()
-	defer te.mu.Unlock()
-	if te.job == nil || !te.job.live {
-		return 0, false, nil
-	}
-	return te.job.seenSnapshotState()
 }
 
 // ============================================================
@@ -262,7 +244,6 @@ func (r *Runtime) loadState() {
 			started: pt.Started, finished: pt.Finished,
 			live:        pt.Live,
 			interrupted: pt.Interrupted, gapSeconds: pt.GapSeconds,
-			seen: pt.SeenURLs, seenSeq: pt.SeenSeq, seenAny: pt.SeenAny,
 			containerID: pt.ContainerID,
 		}
 		if len(pt.NormState) > 0 {
