@@ -59,6 +59,10 @@ const (
 	intentNone = iota
 	intentPause
 	intentCancel
+	// intentStop 仅直播使用：结束录制并把已录部分收尾成正式文件。
+	// 直播没有"暂停后接着录"这回事——暂停期间的流已经从列表里滚走，
+	// 续录只会在产物时间轴上留一个空洞（见 live_semantics_test.go）。
+	intentStop
 )
 
 type taskEntry struct {

@@ -176,10 +176,22 @@ func runDiskPipeline(te *taskEntry) {
 		return
 	}
 	isLive := !pl.hasEndList
+	job.encrypted = pl.key != nil
 	fmt.Printf("[disk] id=%s segments: %d live=%v\n", st.id, len(pl.segments), isLive)
 
 	// 断点：已写入的分片数（暂停/失败后恢复时从它继续）
 	from := int(st.segDone)
+
+	// 直播 + 已有断点：显式拒绝，不硬跑。
+	// 直播流没有"接着上次录"这回事——断点期间的分片已经从滑动窗口滚走，
+	// 继续追加只会产出时间轴带空洞的产物（fMP4 的 tfdt 前跳、TS 的 PTS 前跳）。
+	// 落进这里的有两种任务：探测完成前就被暂停的（当时还不知道是直播），
+	// 以及旧状态文件遗留下来的直播断点任务。
+	if isLive && from > 0 {
+		fail(fmt.Sprintf("直播流不支持从断点继续（已有 %d 个分片）：中间的内容已从列表滚走，"+
+			"继续录制会在产物里留下时间轴空洞，请重新开始录制", from))
+		return
+	}
 
 	// 3. 容器探测（仅全新下载时）：拉取首片 → 识别真实格式 → 修正扩展名 → 取 init 段。
 	//    续传（from>0）时格式已定、扩展名已修正、init 已在文件头，全部跳过，
@@ -231,8 +243,14 @@ func runDiskPipeline(te *taskEntry) {
 	}
 
 	// 4. 下载：直播跟随（循环拉取增量追加）vs 点播（一次性并发）
+	//
+	// job.live 与 st.live 必须在同一个临界区里写：seenState() 在 te.mu 下读
+	// job.live，而 st.live 是 /status 与前端分流的唯一判据。此前只设了 job.live，
+	// 任务状态里的 live 恒为 false（P1-4）——前端的「录制中」徽章、无限进度条、
+	// 录制时长分支全是死代码，直播被完全按点播渲染。
 	te.mu.Lock()
 	job.live = isLive
+	te.st.live = isLive
 	seenURLs, seenSeq, seenAny := st.seen, st.seenSeq, st.seenAny
 	te.mu.Unlock()
 	if isLive {
@@ -272,48 +290,101 @@ func runDiskPipeline(te *taskEntry) {
 		return
 	}
 
-	// 5. 落盘前抽样校验：探测期守卫只看首片，这里对成品头/中段再确认一次。
-	//    判定损坏时直接丢弃 .part —— 重试只会重下出同样的坏数据，
-	//    留着它只会让"重试"反复失败并占着断点。
-	valSegs := len(pl.segments)
-	if isLive {
-		valSegs = 0 // 直播窗口大小不代表总量，体量合理性检查不适用
+	// 直播的「停止」/退出走这里：liveDownload 把 ctx 取消视作干净结束
+	// （返回 nil error，见其末尾的注释），若不拦一下就会落到下面"正常完成"
+	// 的收尾里——用户主动停止的录制会被显示成一次完整录完。
+	if ctx.Err() != nil {
+		finishInterrupt(te)
+		return
+	}
+
+	// 5-6. 抽样校验 → 容器收尾 → .part 改名为正式文件。
+	//      与「停止」「中断」路径共用同一个收尾函数：收尾代码一旦分叉，
+	//      两条路的产物规则就再也对不齐了。
+	if ferr := finalizeRecording(te, job, partPath, false, ""); ferr != nil {
+		fail(ferr.Error())
+		return
+	}
+}
+
+// finalizeRecording 把 .part 收尾成正式文件：抽样校验 → 容器收尾（fMP4 回填
+// 总时长 mehd/mvhd）→ 改名成成品 → 置任务终态。
+//
+// 三条路径共用：正常完成（interrupted=false）、用户停止、故障中断（后两者
+// interrupted=true，reason 写明原因）。
+//
+// interrupted=true 时有两条硬约束，缺一条就是把缺陷藏起来：
+//   - stage 必须与"完整录制"可区分（"录制中断 · 已保存"）；
+//   - errorMsg 必须保留原因、不能清空——本项目头号缺陷形态就是
+//     "产物不完整但日志与状态显示一切正常"。
+func finalizeRecording(te *taskEntry, job *dlJob, partPath string, interrupted bool, reason string) error {
+	te.mu.Lock()
+	finalPath, id, segTot := te.st.finalPath, te.st.id, te.st.segTot
+	te.mu.Unlock()
+
+	// 落盘前抽样校验：探测期守卫只看首片，这里对成品头/中段再确认一次。
+	// 直播窗口大小不代表总量，体量合理性检查不适用（valSegs=0）。
+	valSegs := 0
+	if !job.live {
+		valSegs = int(segTot)
 	}
 	if verr := validateOutput(job.container, partPath, ProbeInfo{
-		Encrypted: pl.key != nil,
+		Encrypted: job.encrypted,
 		Segments:  valSegs,
 		MinBytes:  int64(job.initLen),
 	}); verr != nil {
+		if interrupted {
+			// 中断路径保留 .part：那可能是用户仅有的半成品，交给他自己处理
+			return fmt.Errorf("%w（临时文件保留在 %s）", verr, partPath)
+		}
+		// 正常路径判定损坏就直接丢弃：重试只会重下出同样的坏数据，
+		// 留着它只会让"重试"反复失败并占着断点。
 		os.Remove(partPath)
 		os.Remove(partPath + ".meta")
-		fail(verr.Error() + "（已丢弃损坏的临时文件）")
-		return
+		return fmt.Errorf("%w（已丢弃损坏的临时文件）", verr)
 	}
 
-	// 6. 落盘：先做容器收尾处理（fMP4 回填总时长 mehd/mvhd），再 .part → 正式文件
 	if jerr := job.backfill(partPath); jerr != nil {
 		fmt.Printf("[disk] WARN: 容器收尾处理失败: %v\n", jerr)
 	}
-	if err := moveFile(partPath, st.finalPath); err != nil {
-		fail("保存文件失败: " + err.Error())
-		return
+	if err := moveFile(partPath, finalPath); err != nil {
+		return fmt.Errorf("保存文件失败: %w", err)
 	}
-	fmt.Printf("[disk] id=%s 已保存 -> %s\n", st.id, st.finalPath)
+	if interrupted {
+		fmt.Printf("[disk] id=%s 已保存（录制中断: %s）-> %s\n", id, reason, finalPath)
+	} else {
+		fmt.Printf("[disk] id=%s 已保存 -> %s\n", id, finalPath)
+	}
+
 	te.mu.Lock()
 	te.st.running = false
-	te.st.done = true
+	te.st.queued = false
 	te.st.paused = false
-	te.st.stage = "已保存"
-	te.st.finalPath = st.finalPath
-	te.st.errorMsg = ""
-	te.st.segDone = te.st.segTot
+	te.st.canceled = false
+	te.st.done = true
+	te.st.finalPath = finalPath
 	te.st.finished = time.Now()
+	// 点播收尾把进度对齐总数；直播没有总数（segTot 恒 0），保留已落盘片数
+	// ——否则界面上显示"已录制 0 片"（P2-2）。
+	if segTot > 0 {
+		te.st.segDone = segTot
+	} else {
+		te.st.segDone = job.segFlushedNow()
+	}
+	if interrupted {
+		te.st.stage = "录制中断 · 已保存"
+		te.st.errorMsg = reason
+	} else {
+		te.st.stage = "已保存"
+		te.st.errorMsg = ""
+	}
 	te.mu.Unlock()
 	te.rt.markDirty()
+	return nil
 }
 
-// finishInterrupt 处理"下载被 ctx 中断"的收尾：按用户意图标记暂停或取消。
-// 暂停保留 .part 和断点；取消删除 .part，任务不可恢复。
+// finishInterrupt 处理"下载被 ctx 中断"的收尾：按用户意图标记暂停、停止或取消。
+// 暂停保留 .part 和断点；停止把已录部分收尾成正式文件；取消删除 .part，任务不可恢复。
 
 func finishInterrupt(te *taskEntry) {
 	te.mu.Lock()
@@ -323,21 +394,26 @@ func finishInterrupt(te *taskEntry) {
 	segDone := te.st.segDone
 	te.st.running = false
 	te.st.queued = false
-	if intent == intentCancel {
+	switch intent {
+	case intentCancel:
 		te.st.canceled = true
 		te.st.done = true
 		te.st.paused = false
 		te.st.stage = "已取消"
 		te.st.errorMsg = ""
 		te.st.finalPath = "" // 已取消：没有任何成品文件，清掉避免"打开文件"指向不存在的路径
-	} else {
+	case intentStop:
+		// 直播停止：终态由 finishStop 按"有没有录到内容"决定
+		te.st.paused = false
+	default:
 		te.st.paused = true
 		te.st.stage = "已暂停"
 		te.st.finished = time.Now()
 	}
 	te.mu.Unlock()
 
-	if intent == intentCancel {
+	switch intent {
+	case intentCancel:
 		if part != "" {
 			if err := os.Remove(part); err != nil && !os.IsNotExist(err) {
 				fmt.Printf("[disk] WARN: 删除临时文件失败 %s: %v\n", part, err)
@@ -347,7 +423,9 @@ func finishInterrupt(te *taskEntry) {
 			}
 		}
 		fmt.Printf("[disk] id=%s 已取消\n", id)
-	} else {
+	case intentStop:
+		finishStop(te, id, part, segDone)
+	default:
 		// 暂停时也做容器收尾处理（fMP4 回填已录部分的总时长，方便直接预览/拖动）；
 		// 续传完成后会以新总时长再次回填
 		if j := te.jobRef(); j != nil {
@@ -358,6 +436,53 @@ func finishInterrupt(te *taskEntry) {
 		fmt.Printf("[disk] id=%s 已暂停，断点 %d\n", id, segDone)
 	}
 	te.rt.markDirty()
+}
+
+// finishStoppedTask 收尾一条已不在运行（失败或中断后静止）的直播任务。
+// pipeline 已经退出，没有 ctx 可取消，直接按现有 .part 走收尾；
+// 由 /stop 在"任务未运行"时排到 goroutine 里执行。
+func finishStoppedTask(te *taskEntry) {
+	te.mu.Lock()
+	part := te.st.finalPath + ".part"
+	id := te.st.id
+	segDone := te.st.segDone
+	te.mu.Unlock()
+	finishStop(te, id, part, segDone)
+}
+
+// finishStop 收尾一条被「停止」的直播录制。
+//
+// 有已落盘分片就保存成正式文件；一片都没录到则按无内容处理（清掉临时文件），
+// 否则用户会拿到一个只有 init 段、播不出画面的空壳。
+func finishStop(te *taskEntry, id, part string, segDone int64) {
+	job := te.jobRef()
+	if job == nil || job.segFlushedNow() == 0 {
+		if part != "" {
+			if err := os.Remove(part); err != nil && !os.IsNotExist(err) {
+				fmt.Printf("[disk] WARN: 删除临时文件失败 %s: %v\n", part, err)
+			}
+			if err := os.Remove(part + ".meta"); err != nil && !os.IsNotExist(err) {
+				fmt.Printf("[disk] WARN: 删除分片位图失败 %s: %v\n", part+".meta", err)
+			}
+		}
+		te.mu.Lock()
+		te.st.done = true
+		te.st.paused = false
+		te.st.canceled = false
+		te.st.stage = "已停止（无内容）"
+		te.st.finalPath = ""
+		te.st.errorMsg = ""
+		te.st.finished = time.Now()
+		te.mu.Unlock()
+		fmt.Printf("[disk] id=%s 已停止（无内容可保存）\n", id)
+		return
+	}
+	if err := finalizeRecording(te, job, part, true, "用户停止录制"); err != nil {
+		fmt.Printf("[disk] FAIL: 停止收尾失败: %v\n", err)
+		failTask(te, err.Error())
+		return
+	}
+	fmt.Printf("[disk] id=%s 已停止并保存（已录 %d 片）\n", id, segDone)
 }
 
 // ============================================================

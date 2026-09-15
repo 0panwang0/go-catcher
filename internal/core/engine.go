@@ -100,8 +100,9 @@ func (e *Engine) Start() error {
 	return nil
 }
 
-// Stop 优雅停机：进行中任务转暂停（保留断点）→ 状态落盘 → 关监听。
-// 幂等；不退出进程——进程退出由调用方（GUI 退出路径 / 无头模式的 Done 通道）决定。
+// Stop 优雅停机：进行中任务收尾（直播保存已录内容为正式文件，点播转暂停保留
+// 断点）→ 状态落盘 → 关监听。幂等；不退出进程——进程退出由调用方
+// （GUI 退出路径 / 无头模式的 Done 通道）决定。
 func (e *Engine) Stop() {
 	e.mu.Lock()
 	if !e.running {
@@ -114,7 +115,7 @@ func (e *Engine) Stop() {
 	e.mu.Unlock()
 
 	fmt.Println("[svc] 正在停止下载服务…")
-	e.rt.pauseAllTasks()
+	e.rt.stopOrPauseAllTasks()
 	if !e.rt.waitTasksSettled(3 * time.Second) {
 		// 超时：仍有 pipeline 没收尾。断点安全（persist 用的是"已落盘"计数，
 		// 见 swFlushBytes），但缓冲里可能还有没写出的小尾巴，提示一下。
@@ -165,10 +166,15 @@ func (e *Engine) Done() <-chan struct{} {
 	return e.done
 }
 
-// pauseAllTasks 把所有进行中/排队中的任务转为「已暂停」。
-// 与单个任务的 /pause 语义一致：intent=pause + cancel ctx，
-// pipeline 的 finishInterrupt 收尾并保留 .part 断点。
-func (r *Runtime) pauseAllTasks() {
+// stopOrPauseAllTasks 退出前把所有进行中/排队中的任务推向终态，按类型分流：
+//
+//   - 直播 → intentStop：结束录制并把已录部分收尾成正式文件。
+//     留一个"下次接着录"的直播半成品毫无意义——程序关掉的这段时间流还在走，
+//     下次接着录只会在产物中间留一个时间轴空洞。
+//   - 点播 → intentPause：断点是有意义的（下次接着下就是完整的），保留 .part。
+//
+// 与单个任务的 /stop、/pause 语义一致，收尾细节由 pipeline 的 finishInterrupt 处理。
+func (r *Runtime) stopOrPauseAllTasks() {
 	r.tasksMu.Lock()
 	entries := make([]*taskEntry, 0, len(r.tasks))
 	for _, te := range r.tasks {
@@ -182,9 +188,14 @@ func (r *Runtime) pauseAllTasks() {
 			continue
 		}
 		if te.intent == intentNone {
-			te.intent = intentPause
+			if te.st.live {
+				te.intent = intentStop
+				te.st.stage = "停止中"
+			} else {
+				te.intent = intentPause
+				te.st.stage = "暂停中"
+			}
 		}
-		te.st.stage = "暂停中"
 		cancel := te.cancel
 		te.mu.Unlock()
 		if cancel != nil {

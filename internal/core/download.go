@@ -39,6 +39,10 @@ type dlJob struct {
 
 	// live 直播跟随模式：segTot 恒为 0（列表无限增长，前端按录制时长展示）
 	live bool
+	// encrypted 播放列表声明了 #EXT-X-KEY（METHOD 非 NONE）。
+	// 落盘抽样校验要用它判断"密文长度"还是"明文长度"合理（见 validateOutput），
+	// 而收尾可能发生在拿不到 playlistInfo 的地方（停止/中断路径），故记在这里。
+	encrypted bool
 	// pre 容器探测时已拉取的首个分片（from==0 时直接复用，避免重复下载）
 	pre []byte
 	// 直播去重状态。判定主依据是 media sequence 水位线（seenSeq/seenAny，见
@@ -897,7 +901,7 @@ func (j *dlJob) liveDownload(ctx context.Context, outPath string, from int) (int
 	empty := 0
 	for {
 		if err := ctx.Err(); err != nil {
-			return next, nil // 暂停/取消：把断点交还上层
+			return next, nil // 用户中断（停止/取消/退出）：干净返回，收尾意图由上层 finishInterrupt 决定
 		}
 		content, base, isDirect, err := j.fetchPlaylist(ctx)
 		if err != nil {

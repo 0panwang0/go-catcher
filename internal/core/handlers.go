@@ -57,7 +57,8 @@ func (r *Runtime) findTask(id string) *taskEntry {
 	return r.tasks[id]
 }
 
-// handlePause 暂停任务：cancel 掉下载 ctx，pipeline 会把断点存下来
+// handlePause 暂停任务：cancel 掉下载 ctx，pipeline 会把断点存下来。
+// 直播任务不走这条路——暂停期间的流已从列表滚走，续录只会在产物里留空洞。
 
 func (e *Engine) handlePause(w http.ResponseWriter, r *http.Request) {
 	id := strings.TrimSpace(r.URL.Query().Get("id"))
@@ -70,6 +71,11 @@ func (e *Engine) handlePause(w http.ResponseWriter, r *http.Request) {
 	if te.st.done {
 		te.mu.Unlock()
 		jsonError(w, http.StatusBadRequest, "task already finished")
+		return
+	}
+	if te.st.live {
+		te.mu.Unlock()
+		jsonError(w, http.StatusBadRequest, "直播录制请使用停止：直播流不支持暂停后续录（暂停期间的分片已从列表滚走）")
 		return
 	}
 	if te.st.paused {
@@ -88,6 +94,53 @@ func (e *Engine) handlePause(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, actionResp{OK: true, ID: id, Paused: true})
 }
 
+// handleStop 停止直播录制：中断跟随，并把已录部分收尾成正式文件。
+//
+// 为什么直播只有这一条路：直播流是滑动的，暂停/停止期间的分片会从列表里
+// 滚走且不可补回。与其产出一个"看起来连续、其实中间缺一段"的文件，不如
+// 明确结束录制、保存已录内容，让用户回直播页重新开始。
+// 点播任务不走这里——它的「停」语义是可续的暂停，走 /pause。
+func (e *Engine) handleStop(w http.ResponseWriter, r *http.Request) {
+	id := strings.TrimSpace(r.URL.Query().Get("id"))
+	te := e.rt.findTask(id)
+	if te == nil {
+		jsonError(w, http.StatusNotFound, "task not found")
+		return
+	}
+	te.mu.Lock()
+	if !te.st.live {
+		te.mu.Unlock()
+		jsonError(w, http.StatusBadRequest, "非直播任务请使用暂停")
+		return
+	}
+	if te.st.done {
+		// 幂等：已结束的直播任务（含已收尾的中断态）重复点停止不算错
+		te.mu.Unlock()
+		writeJSON(w, http.StatusOK, actionResp{OK: true, ID: id})
+		return
+	}
+	if !te.st.running && !te.st.queued {
+		// pipeline 已经退出（失败/中断后的静止态）：没有下载可中断，直接按
+		// 现有 .part 收尾。抽到 goroutine 里做——校验与改名是磁盘 IO，
+		// 不该卡住 HTTP 响应。
+		te.intent = intentStop
+		te.st.stage = "停止中"
+		te.mu.Unlock()
+		go finishStoppedTask(te)
+		writeJSON(w, http.StatusOK, actionResp{OK: true, ID: id})
+		return
+	}
+	te.intent = intentStop
+	te.st.stage = "停止中"
+	cancel := te.cancel
+	te.mu.Unlock()
+
+	if cancel != nil {
+		cancel()
+	}
+	writeJSON(w, http.StatusOK, actionResp{OK: true, ID: id})
+}
+
 // handleResume 恢复任务：从上次断点继续下载（重新走一遍 pipeline，会重新排队）
 
 func (e *Engine) handleResume(w http.ResponseWriter, r *http.Request) {
@@ -104,6 +157,14 @@ func (e *Engine) handleResume(w http.ResponseWriter, r *http.Request) {
 	if te.st.done && !te.st.paused && te.st.errorMsg == "" {
 		te.mu.Unlock()
 		jsonError(w, http.StatusBadRequest, "task already finished")
+		return
+	}
+	// 直播任务一律不给恢复入口（含"录制中断"的终态与旧状态文件遗留的断点任务）。
+	// 这是产品语义，不是能力缺失：中间的内容已经从滑动窗口滚走，接着录只能
+	// 产出一个时间轴带空洞的文件。要接着录就回直播页重新开始。
+	if te.st.live {
+		te.mu.Unlock()
+		jsonError(w, http.StatusBadRequest, "直播流不支持恢复：暂停期间的内容已从列表滚走，请重新开始录制")
 		return
 	}
 	if te.st.running && !te.st.paused {

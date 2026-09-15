@@ -187,6 +187,9 @@ function cnt(f){ return tasks.filter(f).length; }
 
 function badge(t){
   if(t.canceled) return '<span class="badge cancel">已取消</span>';
+  // 直播中断收尾：文件已经保存下来了，只是没录完。显示成「失败」会让用户
+  // 以为文件没了或者没保存，所以单独一档。
+  if(t.done && t.error && t.live) return '<span class="badge pause">已中断</span>';
   if(t.error) return '<span class="badge err">失败</span>';
   if(t.paused) return '<span class="badge pause">已暂停</span>';
   if(t.queued) return '<span class="badge que">排队中</span>';
@@ -209,9 +212,15 @@ function durText(t){
 
 function stageText(t){
   if(t.canceled) return '<span class="stage err">已取消，临时文件已清理</span>';
+  // 直播中断收尾：文件已保存，但要如实说明"没录完"以及原因——否则就是
+  // 把"产物不完整"藏起来（本项目反复出现的头号缺陷形态）。
+  if(t.done && t.error && t.live)
+    return '<span class="stage pause">'+esc(t.stage||'录制中断 · 已保存')+'（'+esc(t.error)+'）</span>';
   if(t.error) return '<span class="stage err">失败：'+esc(t.error)+'</span>';
+  // 直播没有"暂停后接着录"这回事：暂停期间的流已经从列表滚走，接着录只会
+  // 在产物中间留一个时间轴空洞。所以这里不给"暂停后还能接着录"的承诺。
   if(t.paused) return t.live
-    ? '<span class="stage pause">已暂停 · 已录制 '+t.segDone+' 个分片（'+durText(t)+'），可继续录制</span>'
+    ? '<span class="stage pause">录制已中断 · 已录制 '+t.segDone+' 个分片（'+durText(t)+'），点「停止」保存已录部分</span>'
     : '<span class="stage pause">已暂停 · 已下载 '+t.segDone+' 个分片，可从断点继续</span>';
   if(t.queued) return '<span class="stage">排队中…（最多同时 '+esc(curCfg.maxConcurrent)+' 个在下载）</span>';
   if(t.done) return t.fileMissing
@@ -261,6 +270,17 @@ function actions(t){
   let b = [];
   if (t.canceled) {
     b.push(btn('ghost','🗑 移除记录','removeTask('+id+')'));
+  } else if (t.live && (t.done || t.paused || t.error)) {
+    // 直播：只有「停止（保存已录部分）」与「取消」，不给暂停/继续/重试——
+    // 中间滚走的流补不回来，续录只会产出时间轴带空洞的文件。
+    if (op) b.push(btn('primary','▶ 打开文件','openFile('+id+')'));
+    if (sd) b.push(btn('ghost','📂 打开文件夹','openFolder('+id+')'));
+    if (t.done) {
+      b.push(btn('ghost','🗑 移除记录','removeTask('+id+')'));
+    } else {
+      b.push(btn('primary','⏹ 停止（保存已录）','stopTask('+id+')'));
+      b.push(btn('danger','✕ 取消','cancelTask('+id+')'));
+    }
   } else if (t.done && !t.error) {
     if (op) b.push(btn('primary','▶ 打开文件','openFile('+id+')'));
     if (sd) b.push(btn('ghost','📂 打开文件夹','openFolder('+id+')'));
@@ -277,7 +297,9 @@ function actions(t){
   } else {
     // 下载中 / 排队中（随时可打开文件夹查看 .part 半成品）
     if (sd) b.push(btn('ghost','📂 打开文件夹','openFolder('+id+')'));
-    b.push(btn('warn','⏸ 暂停','pauseTask('+id+')'));
+    b.push(t.live
+      ? btn('warn','⏹ 停止','stopTask('+id+')')
+      : btn('warn','⏸ 暂停','pauseTask('+id+')'));
     b.push(btn('danger','✕ 取消','cancelTask('+id+')'));
   }
   return b.length ? '<div class="acts">'+b.join('')+'</div>' : '';
@@ -307,6 +329,13 @@ function rowCard(t){
   let acts = '';
   if (t.canceled) {
     acts = ibtn('','🗑','移除记录','removeTask('+id+')');
+  } else if (t.live && (t.done || t.paused || t.error)) {
+    acts = (op ? ibtn('','▶','打开文件','openFile('+id+')') : '')
+         + (sd ? ibtn('','📂','打开文件夹','openFolder('+id+')') : '')
+         + (t.done
+            ? ibtn('','🗑','移除记录','removeTask('+id+')')
+            : ibtn('primary','⏹','停止（保存已录部分）','stopTask('+id+')')
+              + ibtn('danger','✕','取消（删除文件）','cancelTask('+id+')'));
   } else if (t.done && !t.error) {
     acts = (op ? ibtn('','▶','打开文件','openFile('+id+')') : '')
          + (sd ? ibtn('','📂','打开文件夹','openFolder('+id+')') : '')
@@ -322,7 +351,9 @@ function rowCard(t){
          + ibtn('','🗑','移除记录','removeTask('+id+')');
   } else {
     acts = (sd ? ibtn('','📂','打开文件夹','openFolder('+id+')') : '')
-         + ibtn('','⏸','暂停','pauseTask('+id+')')
+         + (t.live
+            ? ibtn('','⏹','停止','stopTask('+id+')')
+            : ibtn('','⏸','暂停','pauseTask('+id+')'))
          + ibtn('danger','✕','取消（删除文件）','cancelTask('+id+')');
   }
   const name = esc(fnameOf(t));
@@ -441,6 +472,8 @@ async function call(url, okMsg){
   render();
 }
 function pauseTask(id){ return call('/pause?id='+encodeURIComponent(id),'已暂停'); }
+// 直播专用：结束录制并把已录部分保存成正式文件（服务端会拒绝非直播任务）
+function stopTask(id){ return call('/stop?id='+encodeURIComponent(id),'已停止录制，已录部分已保存'); }
 function resumeTask(id){ return call('/resume?id='+encodeURIComponent(id),'已恢复下载'); }
 function cancelTask(id){
   if (!confirm('取消后已下载的分片会被删除，确定取消该任务？')) return;

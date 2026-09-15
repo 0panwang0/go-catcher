@@ -46,6 +46,9 @@ var routeDefs = []routeDef{
 	{"/download", []string{http.MethodGet}, true, false, func(e *Engine) http.HandlerFunc { return e.handleDownload }},
 	{"/probe", []string{http.MethodGet}, true, false, func(e *Engine) http.HandlerFunc { return e.handleProbe }},
 	{"/pause", []string{http.MethodGet}, true, false, func(e *Engine) http.HandlerFunc { return e.handlePause }},
+	// /stop 只对直播任务有效（点播的"停"是可续的暂停，走 /pause）：
+	// 结束录制并把已录部分收尾成正式文件。
+	{"/stop", []string{http.MethodGet}, true, false, func(e *Engine) http.HandlerFunc { return e.handleStop }},
 	{"/resume", []string{http.MethodGet}, true, false, func(e *Engine) http.HandlerFunc { return e.handleResume }},
 	{"/cancel", []string{http.MethodGet}, true, false, func(e *Engine) http.HandlerFunc { return e.handleCancel }},
 	{"/remove", []string{http.MethodGet}, true, false, func(e *Engine) http.HandlerFunc { return e.handleRemove }},
