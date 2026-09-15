@@ -31,6 +31,10 @@ type persistedTask struct {
 	Started   time.Time `json:"started"`
 	Finished  time.Time `json:"finished"`
 	Live      bool      `json:"live"` // 直播跟随任务（播放列表无 ENDLIST）
+	// 中断收尾（已保存已录部分但没录完）与产物时间轴上的缺口时长。
+	// 落盘是为了重启后界面仍能把"中断"与"完整录完"区分开。
+	Interrupted bool    `json:"interrupted,omitempty"`
+	GapSeconds  float64 `json:"gapSeconds,omitempty"`
 	// 直播去重状态：主依据是 seenSeq 水位线（seenAny = 是否已建立）；SeenURLs 是
 	// 有界 URL 窗口，仅用于兼容只存了 URL 的旧状态文件。
 	SeenSeq     uint64          `json:"seenSeq,omitempty"`
@@ -121,7 +125,9 @@ func (r *Runtime) collectPersisted() []persistedTask {
 			Done: s.done, Paused: s.paused, Canceled: s.canceled,
 			FinalPath: s.finalPath, ErrorMsg: s.errorMsg,
 			Started: s.started, Finished: s.finished,
-			Live: s.live,
+			Live:        s.live,
+			Interrupted: s.interrupted,
+			GapSeconds:  s.gapSeconds,
 		}
 		if s.live {
 			pt.SeenSeq, pt.SeenAny, pt.SeenURLs = te.seenState()
@@ -220,8 +226,9 @@ func (r *Runtime) saveState() {
 }
 
 // loadState 启动时恢复历史任务。
-// 上次进程退出时仍在跑/排队/暂停的任务，一律置为「已暂停」——
-// 它们都保留了 .part 和断点，用户点恢复即可接着下。
+// 上次进程退出时仍在跑/排队/暂停的点播任务一律置为「已暂停」——它们保留了
+// .part 与断点，用户点恢复即可接着下；直播任务置为「录制中断」——它没有
+// "接着录"这回事（暂停期间的分片已从滑动窗口滚走）。
 
 func (r *Runtime) loadState() {
 	p := r.getStatePath()
@@ -253,7 +260,8 @@ func (r *Runtime) loadState() {
 			m3u8URL: pt.M3u8URL, referer: pt.Referer, filename: pt.Filename,
 			saveDir: pt.SaveDir, segDone: pt.SegDone, segTot: pt.SegTot,
 			started: pt.Started, finished: pt.Finished,
-			live: pt.Live,
+			live:        pt.Live,
+			interrupted: pt.Interrupted, gapSeconds: pt.GapSeconds,
 			seen: pt.SeenURLs, seenSeq: pt.SeenSeq, seenAny: pt.SeenAny,
 			containerID: pt.ContainerID,
 		}
@@ -264,13 +272,19 @@ func (r *Runtime) loadState() {
 		if pt.Canceled {
 			te.st.finalPath = ""
 		}
-		// 上次没跑完的（含 running/queued 残留）统一变成可恢复的暂停态
+		// 上次没跑完的（含 running/queued 残留）统一变成可恢复态。
+		// 直播是例外：它没有"接着录"这回事（暂停期间的分片已从滑动窗口滚走），
+		// 标成中断态等用户点「停止」收尾，界面据此只给「停止」「取消」。
 		if !te.st.done && !te.st.canceled {
-			te.st.paused = true
 			te.st.running = false
 			te.st.queued = false
-			te.st.stage = "已暂停"
-			resumed++
+			te.st.paused = true
+			if te.st.live {
+				te.st.stage = "录制中断（程序退出）"
+			} else {
+				te.st.stage = "已暂停"
+				resumed++
+			}
 		}
 		r.tasks[te.st.id] = te
 		// 历史任务的保存目录一并进白名单：重启后用户点"重试"仍写回原目录，

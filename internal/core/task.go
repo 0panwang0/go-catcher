@@ -35,6 +35,13 @@ type taskState struct {
 
 	// live 直播跟随任务（播放列表无 ENDLIST，列表不断增长）
 	live bool
+	// interrupted 任务因故障/退出而中断收尾（已保存已录部分，但没录完）。
+	// 它和"失败"（done + errorMsg，但没有产物）必须可区分：前端据此把徽章
+	// 显示成「已中断」而不是「失败」——文件其实好好地存在磁盘上。
+	interrupted bool
+	// gapSeconds 产物时间轴上的缺口时长（秒）。直播中断/滑动窗口滚会丢片，
+	// 那段时间轴就是空的；如实报出去，别让用户以为文件是连续完整的。
+	gapSeconds float64
 	// 直播去重状态（断点恢复用；运行时以 job 的为准）：
 	// seen 是有界 URL 窗口（兼容只存了 URL 的旧状态文件），seenSeq/seenAny 是
 	// media sequence 水位线。
@@ -207,6 +214,8 @@ type taskStateDTO struct {
 	Stage       string  `json:"stage"`
 	Done        bool    `json:"done"`
 	Live        bool    `json:"live"`
+	Interrupted bool    `json:"interrupted"`
+	GapSeconds  float64 `json:"gapSeconds"`
 	FileMissing bool    `json:"fileMissing"`
 	Pct         float64 `json:"pct"`
 	SegDone     int64   `json:"segDone"`
@@ -235,11 +244,15 @@ func toTaskStateDTO(t taskState) taskStateDTO {
 	}
 	// 已完成但成品文件已不在磁盘（被移动/删除）：前端显示"已失效"而不是"完成 · 已保存"。
 	// snapshot 已按磁盘实况计算 openPath（文件存在时 == finalPath），据此判断无需再 Stat 一次。
-	// 失败/取消任务不算失效：它们的成品本来就不存在（openPath 指向 .part），语义是"失败"。
-	fileMissing := t.done && t.errorMsg == "" && !t.canceled && t.finalPath != "" && t.openPath != t.finalPath
+	// 判据必须限定在"本该有成品"的任务上：正常完成（errorMsg 空）与中断收尾
+	// （interrupted，成品已保存）都算；真失败任务（errorMsg 非空且非中断）不算
+	// ——它的成品从来不存在，语义是"失败"，显示"已失效"会让人以为文件被删了。
+	fileMissing := t.done && !t.canceled && t.finalPath != "" &&
+		(t.errorMsg == "" || t.interrupted) && t.openPath != t.finalPath
 	return taskStateDTO{
 		ID: t.id, Queued: t.queued, Running: t.running, Paused: t.paused,
 		Canceled: t.canceled, Stage: t.stage, Done: t.done, Live: t.live,
+		Interrupted: t.interrupted, GapSeconds: t.gapSeconds,
 		FileMissing: fileMissing, Pct: pct, SegDone: t.segDone, SegTot: t.segTot,
 		FinalPath: t.finalPath, OpenPath: t.openPath, Error: t.errorMsg,
 		M3U8URL: t.m3u8URL, Referer: t.referer, Filename: t.filename, SaveDir: t.saveDir,

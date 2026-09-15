@@ -43,6 +43,11 @@ type dlJob struct {
 	// 落盘抽样校验要用它判断"密文长度"还是"明文长度"合理（见 validateOutput），
 	// 而收尾可能发生在拿不到 playlistInfo 的地方（停止/中断路径），故记在这里。
 	encrypted bool
+	// gapMillis 产物时间轴上的缺口累计（毫秒）。直播只有一次机会：分片一旦从
+	// 滑动窗口滚走就再也补不回来，产物里那段时间轴就是空的（fMP4 的 tfdt 前跳、
+	// TS 的 PTS 前跳）。这里如实累加，收尾时写进任务状态供界面提示——不报缺口
+	// 等于把"产物不完整"藏起来，正是本项目反复出现的头号缺陷形态。
+	gapMillis int64
 	// pre 容器探测时已拉取的首个分片（from==0 时直接复用，避免重复下载）
 	pre []byte
 	// 直播去重状态。判定主依据是 media sequence 水位线（seenSeq/seenAny，见
@@ -153,6 +158,28 @@ func (j *dlJob) seenSnapshotState() (uint64, bool, []string) {
 	copy(out, j.seenOrder)
 	sort.Strings(out)
 	return j.seenSeq, j.seenAny, out
+}
+
+// seenWatermark 返回 media sequence 水位线（已录到的最大序号，以及是否已建立）。
+// 直播用它检测"窗口滚动把分片淘汰掉了"：本轮列表首片的序号若是水位线之后
+// 一段距离，中间那些分片已经永远补不回来，产物时间轴上会留一个空洞。
+func (j *dlJob) seenWatermark() (uint64, bool) {
+	j.seenMu.Lock()
+	defer j.seenMu.Unlock()
+	return j.seenSeq, j.seenAny
+}
+
+// addGapSeconds 累加产物时间轴上的缺口时长（秒）。
+func (j *dlJob) addGapSeconds(sec float64) {
+	if sec <= 0 {
+		return
+	}
+	atomic.AddInt64(&j.gapMillis, int64(sec*1000))
+}
+
+// gapSecondsNow 返回累计缺口时长（秒）。
+func (j *dlJob) gapSecondsNow() float64 {
+	return float64(atomic.LoadInt64(&j.gapMillis)) / 1000
 }
 
 // backfill 任务完成/暂停收尾：委托规范化状态的 Finish（无状态容器为 nil，静默跳过）。
@@ -926,8 +953,19 @@ func (j *dlJob) liveDownload(ctx context.Context, outPath string, from int) (int
 			return next, kerr
 		}
 
+		// 窗口滚动检测：上一轮录到的最大序号与本轮列表首片之间若断开，说明中间
+		// 那些分片已经被滑动窗口淘汰、永远补不回来了（轮询间隔超过窗口时长时发生）。
+		// 产物时间轴上那一段就是空的，必须计入缺口——漏报等于把"产物不完整"藏起来。
+		if wm, ok := j.seenWatermark(); ok && cur.mediaSeq > wm+1 {
+			missing := int(cur.mediaSeq - wm - 1)
+			sec := estimateMissingSeconds(cur, missing)
+			j.addGapSeconds(sec)
+			fmt.Printf("[live] 窗口已滚动：%d 个分片（约 %.1fs）被淘汰，产物时间轴将出现空洞\n", missing, sec)
+		}
+
 		var newSegs []string
-		firstNewPos := -1 // 本批首个新分片在当前列表中的位置（派生 IV 的序号基准）
+		var newDurs []float64 // 与本批分片一一对应的 EXTINF，失败时用来算缺口
+		firstNewPos := -1     // 本批首个新分片在当前列表中的位置（派生 IV 的序号基准）
 		for pos, u := range cur.segments {
 			// 按 media sequence 判重（列表位置 + MEDIA-SEQUENCE），而不是"URL 是否
 			// 见过"：见 seenCovers。
@@ -937,6 +975,7 @@ func (j *dlJob) liveDownload(ctx context.Context, outPath string, from int) (int
 			}
 			j.seenRecord(seq, u)
 			newSegs = append(newSegs, u)
+			newDurs = append(newDurs, durAt(cur, pos))
 			if firstNewPos < 0 {
 				firstNewPos = pos
 			}
@@ -944,11 +983,22 @@ func (j *dlJob) liveDownload(ctx context.Context, outPath string, from int) (int
 
 		if len(newSegs) > 0 {
 			empty = 0
+			startIdx := next
 			n, derr := streamDownload(ctx, j, newSegs, next, cur.mediaSeq+uint64(firstNewPos), outPath)
 			next = n
 			if derr != nil {
 				if ctx.Err() != nil {
 					return next, nil
+				}
+				// 这批里"本该录到、却没写进文件"的分片，在产物时间轴上就是一段
+				// 真实空洞（源站故障时它们大概率已跟着窗口滚走）。用户主动停止
+				// （ctx 取消）不算缺口——那是"录到哪算哪"，不是中间少了一段。
+				written := int(j.segFlushedNow()) - startIdx
+				if written < 0 {
+					written = 0
+				}
+				if written < len(newDurs) {
+					j.addGapSeconds(sumDurs(newDurs[written:]))
 				}
 				return next, derr
 			}
@@ -974,6 +1024,35 @@ func (j *dlJob) liveDownload(ctx context.Context, outPath string, from int) (int
 		case <-time.After(j.rt.livePollInterval):
 		}
 	}
+}
+
+// durAt 取播放列表里第 pos 个分片的 #EXTINF 时长（越界或该片未声明时长返回 0）。
+func durAt(pl playlistInfo, pos int) float64 {
+	if pos < 0 || pos >= len(pl.durs) {
+		return 0
+	}
+	return pl.durs[pos]
+}
+
+// sumDurs 求一组分片时长的和（缺口时长）。
+func sumDurs(ds []float64) float64 {
+	var s float64
+	for _, d := range ds {
+		s += d
+	}
+	return s
+}
+
+// estimateMissingSeconds 估算被窗口淘汰的 n 个分片占用的时长。
+//
+// 那些分片已经取不到了（它们从列表里消失才叫"被淘汰"），拿不到各自的 EXTINF，
+// 只能用本轮列表的平均片长作系数。宁可粗报也不漏报：缺口的价值就在于
+// 让用户知道"这个文件少了一段"。
+func estimateMissingSeconds(pl playlistInfo, n int) float64 {
+	if n <= 0 || len(pl.segments) == 0 {
+		return 0
+	}
+	return pl.totalDur / float64(len(pl.segments)) * float64(n)
 }
 
 // writeInitSegment 把 fMP4 init 段写入 .part 文件头。

@@ -83,6 +83,9 @@ func runDiskPipeline(te *taskEntry) {
 		te.mu.Unlock()
 	}
 
+	// 下载期间写 .part，写完后改名成正式文件（避免半成品被当成成品）
+	partPath := st.finalPath + ".part"
+
 	fail := func(msg string) {
 		fmt.Printf("[disk] FAIL: %s\n", msg)
 		failTask(te, msg)
@@ -105,9 +108,6 @@ func runDiskPipeline(te *taskEntry) {
 		fail("获取 m3u8 失败: " + err.Error())
 		return
 	}
-
-	// 下载期间写 .part，写完后改名成正式文件（避免半成品被当成成品）
-	partPath := st.finalPath + ".part"
 
 	// 直链文件（MP4 等）：整体流式下载，跳过分片解析
 	if isDirect {
@@ -286,7 +286,24 @@ func runDiskPipeline(te *taskEntry) {
 			finishInterrupt(te)
 			return
 		}
-		fail("下载分片失败: " + err.Error())
+		msg := "下载分片失败: " + err.Error()
+		// 直播录制因故障终止（源站挂掉、列表拉取失败、响应变直链、key 轮换…）：
+		// 已录部分自动收尾成正式文件，不停在半成品上等用户处理
+		// （学徒 2026-09-15 定：直播中断肯定要自动收尾）。
+		//
+		// 三条边界：
+		//   - 只救"已经写进 .part 的"内容；一片都没落盘时没有可保存的东西，
+		//     硬保存只会给用户一个播不出画面的空壳；
+		//   - 用户主动停止/取消不归这里管（ctx.Err() 分支走 finishInterrupt）；
+		//   - 收尾内的抽样校验不通过时 finalizeRecording 返回 error，落回 failTask
+		//     ——不能因为是直播就把坏数据当成品（那又是"产物坏了但日志正常"）。
+		if job.live && job.segFlushedNow() > 0 {
+			fmt.Printf("[disk] LIVE-FAIL: %s\n", msg)
+			if serr := finalizeRecording(te, job, partPath, true, "录制中断: "+msg); serr == nil {
+				return
+			}
+		}
+		fail(msg)
 		return
 	}
 
@@ -378,6 +395,11 @@ func finalizeRecording(te *taskEntry, job *dlJob, partPath string, interrupted b
 		te.st.stage = "已保存"
 		te.st.errorMsg = ""
 	}
+	// interrupted 标记决定前端把这条记录显示成「已中断」还是「已完成」。
+	// 缺口时长如实带上：滑动窗口滚走的分片补不回来，产物时间轴上那段确实是空的
+	// （用户主动停止不算缺口——那是"录到哪算哪"，不是中间少了一段）。
+	te.st.interrupted = interrupted
+	te.st.gapSeconds = job.gapSecondsNow()
 	te.mu.Unlock()
 	te.rt.markDirty()
 	return nil

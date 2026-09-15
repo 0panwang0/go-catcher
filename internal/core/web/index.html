@@ -179,19 +179,27 @@ function updateStats(){
   el('stats').innerHTML =
       '下载中 <b>'+cnt(function(t){return t.running&&!t.done;})+'</b>'
     + ' · 排队 <b>'+cnt(function(t){return t.queued;})+'</b>'
-    + ' · 暂停 <b style="color:var(--warn)">'+cnt(function(t){return t.paused&&!t.done;})+'</b>'
+    + ' · 暂停 <b style="color:var(--warn)">'+cnt(function(t){return t.paused&&!t.done&&!liveInterrupted(t);})+'</b>'
     + ' · 已完成 <b style="color:var(--ok)">'+cnt(function(t){return t.done&&!t.error&&!t.canceled;})+'</b>'
-    + ' · 失败 <b style="color:var(--err)">'+cnt(function(t){return t.error&&!t.canceled;})+'</b>';
+    // 中断与失败分开计数：中断的产物已经保存在磁盘上（只是没录完），
+    // 混进"失败"会让用户以为文件没了。
+    + ' · 中断 <b style="color:var(--warn)">'+cnt(function(t){return t.interrupted||liveInterrupted(t);})+'</b>'
+    + ' · 失败 <b style="color:var(--err)">'+cnt(function(t){return t.error&&!t.interrupted&&!t.canceled;})+'</b>';
 }
 function cnt(f){ return tasks.filter(f).length; }
+// 直播任务没有"暂停"态：它的 paused 只可能来自"程序退出时还没录完"，
+// 语义是"中断待处理"（已录部分还在 .part 里，点「停止」才收尾）。
+function liveInterrupted(t){ return !!t.live && !t.done && !t.canceled; }
 
 function badge(t){
   if(t.canceled) return '<span class="badge cancel">已取消</span>';
   // 直播中断收尾：文件已经保存下来了，只是没录完。显示成「失败」会让用户
   // 以为文件没了或者没保存，所以单独一档。
-  if(t.done && t.error && t.live) return '<span class="badge pause">已中断</span>';
+  if(t.interrupted) return '<span class="badge pause">已中断</span>';
   if(t.error) return '<span class="badge err">失败</span>';
-  if(t.paused) return '<span class="badge pause">已暂停</span>';
+  if(t.paused) return t.live
+    ? '<span class="badge pause">已中断</span>'
+    : '<span class="badge pause">已暂停</span>';
   if(t.queued) return '<span class="badge que">排队中</span>';
   if(t.running && t.live) return '<span class="badge run">录制中</span>';
   if(t.running) return '<span class="badge run">下载中</span>';
@@ -200,6 +208,14 @@ function badge(t){
 }
 function fnameOf(t){ return t.filename || (t.finalPath? t.finalPath.split(/[\\/]/).pop() : ('任务 '+t.id)); }
 function saveDirOf(t){ return t.saveDir || (t.finalPath? t.finalPath.replace(/[\\/][^\\/]+$/,'') : ''); }
+
+// 产物时间轴上的缺口：直播中断或滑动窗口滚走分片时，那段内容是永远补不回来的。
+// 必须说出来——不报缺口等于让用户以为文件是连续完整的（本项目头号缺陷形态）。
+function gapText(t){
+  const g = Math.round(t.gapSeconds||0);
+  if (g <= 0) return '';
+  return g >= 60 ? ' · 中间缺失约 '+(g/60).toFixed(1)+' 分钟' : ' · 中间缺失约 '+g+' 秒';
+}
 
 // 直播/事件流没有总进度，用录制时长展示（运行中=现在-开始；暂停/完成=结束-开始）
 function durText(t){
@@ -212,10 +228,10 @@ function durText(t){
 
 function stageText(t){
   if(t.canceled) return '<span class="stage err">已取消，临时文件已清理</span>';
-  // 直播中断收尾：文件已保存，但要如实说明"没录完"以及原因——否则就是
-  // 把"产物不完整"藏起来（本项目反复出现的头号缺陷形态）。
-  if(t.done && t.error && t.live)
-    return '<span class="stage pause">'+esc(t.stage||'录制中断 · 已保存')+'（'+esc(t.error)+'）</span>';
+  // 直播中断收尾：文件已保存，但要如实说明"没录完"、原因、以及时间轴上的缺口
+  // ——否则就是把"产物不完整"藏起来（本项目反复出现的头号缺陷形态）。
+  if(t.interrupted)
+    return '<span class="stage pause">'+esc(t.stage||'录制中断 · 已保存')+'（'+esc(t.error)+'）'+esc(gapText(t))+'</span>';
   if(t.error) return '<span class="stage err">失败：'+esc(t.error)+'</span>';
   // 直播没有"暂停后接着录"这回事：暂停期间的流已经从列表滚走，接着录只会
   // 在产物中间留一个时间轴空洞。所以这里不给"暂停后还能接着录"的承诺。
@@ -225,15 +241,16 @@ function stageText(t){
   if(t.queued) return '<span class="stage">排队中…（最多同时 '+esc(curCfg.maxConcurrent)+' 个在下载）</span>';
   if(t.done) return t.fileMissing
     ? '<span class="stage stale">已失效 · 文件已被移动或删除</span>'
-    : '<span class="stage ok">完成 · '+esc(t.stage||'已保存')+'</span>';
-  if(t.running && t.live) return '<span class="stage">录制直播中 · 已录 '+t.segDone+' 片 · '+durText(t)+'</span>';
+    : '<span class="stage ok">完成 · '+esc(t.stage||'已保存')+esc(gapText(t))+'</span>';
+  if(t.running && t.live) return '<span class="stage">录制直播中 · 已录 '+t.segDone+' 片 · '+durText(t)+esc(gapText(t))+'</span>';
   return '<span class="stage">'+esc(t.stage||'进行中')+'</span>';
 }
 
 function card(t){
   const pct = Math.max(0, Math.min(100, t.pct||0));
   let barCls='';
-  if(t.error||t.canceled) barCls='err';
+  if(t.interrupted) barCls='pause';                  // 中断保存：文件在，只是没录完
+  else if(t.error||t.canceled) barCls='err';
   else if(t.done) barCls='done';
   else if(t.paused) barCls='pause';
   else if(t.live) barCls='indet';                    // 直播：无限进度条
@@ -241,12 +258,13 @@ function card(t){
     ? ('已录制 '+t.segDone+' 个分片')
     : ((t.segTot>0)?('分片 '+t.segDone+' / '+t.segTot):'');
   const pctTxt = (t.queued&&!t.running) ? '—'
+    : (t.interrupted ? '已中断'
     : (t.error ? '失败'
     : (t.canceled ? '已取消'
     : (t.stage==='解析视频源' ? '等待源站响应…'
     : (t.stage==='下载直链文件中' ? '下载中…'
     : (t.live ? ((t.paused||t.done)?'已录制 ':'录制中 ')+durText(t)
-    : pct.toFixed(1)+'%')))));
+    : pct.toFixed(1)+'%'))))));
   const started = t.started? new Date(t.started).toLocaleTimeString('zh-CN',{hour12:false,hour:'2-digit',minute:'2-digit'}) : '';
   const cls = t.canceled ? 'card' : (t.paused ? 'card paused' : ((t.running||t.queued) ? 'card active':'card'));
   return '<div class="'+cls+'">'

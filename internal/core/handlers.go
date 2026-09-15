@@ -208,6 +208,10 @@ func (e *Engine) handleCancel(w http.ResponseWriter, r *http.Request) {
 			te.st.stage = "已取消"
 			te.st.errorMsg = ""
 			te.st.finalPath = ""
+			// 取消 = 这个文件不要了：中断收尾的标记与缺口提示一并清掉，
+			// 否则列表里会留一条"已取消"却写着"缺失 N 秒"的记录。
+			te.st.interrupted = false
+			te.st.gapSeconds = 0
 		}
 		te.mu.Unlock()
 		if part != "" {

@@ -86,13 +86,14 @@ func directExtFromURL(raw string) string {
 
 // playlistInfo 一次媒体播放列表解析结果（含分段、init 段与直播/点播标记）。
 type playlistInfo struct {
-	segments   []string // 分片绝对 URL（播放列表内顺序）
-	hasMap     bool     // 存在 #EXT-X-MAP（fMP4 init 段声明）
-	mapURI     string   // init 段绝对 URL（hasMap 时有效）
-	hasEndList bool     // 存在 #EXT-X-ENDLIST（点播；缺失 = 直播/事件流）
-	totalDur   float64  // EXTINF 时长累加（点播总时长 / 直播已见时长）
-	mediaSeq   uint64   // #EXT-X-MEDIA-SEQUENCE（缺省 0；密钥无显式 IV 时派生 IV 用）
-	key        *KeyInfo // #EXT-X-KEY（nil = 明文流；METHOD=NONE 同样为 nil）
+	segments   []string  // 分片绝对 URL（播放列表内顺序）
+	durs       []float64 // 各分片对应的 #EXTINF 时长（与 segments 一一对应，缺失为 0）
+	hasMap     bool      // 存在 #EXT-X-MAP（fMP4 init 段声明）
+	mapURI     string    // init 段绝对 URL（hasMap 时有效）
+	hasEndList bool      // 存在 #EXT-X-ENDLIST（点播；缺失 = 直播/事件流）
+	totalDur   float64   // EXTINF 时长累加（点播总时长 / 直播已见时长）
+	mediaSeq   uint64    // #EXT-X-MEDIA-SEQUENCE（缺省 0；密钥无显式 IV 时派生 IV 用）
+	key        *KeyInfo  // #EXT-X-KEY（nil = 明文流；METHOD=NONE 同样为 nil）
 	// keyMalformed 播放列表声明了加密（METHOD 不是 NONE），但 URI 属性缺失/为空。
 	// 这种行绝不能让 pl.key 停在 nil —— nil 与「明文流」在后续每条判断里完全
 	// 不可区分：validatePlaylist 放行、ensureDecryptor(nil) 清空解密器、落盘校验的
@@ -248,6 +249,8 @@ func (j *dlJob) fetchPlaylist(ctx context.Context) (content, base string, isDire
 // 不返回错误：未知标签与非法行一律跳过，由调用方检查 segments 是否为空。
 func parsePlaylist(m3u8Text, base string) playlistInfo {
 	var pl playlistInfo
+	// pendingDur 暂存最近一条 #EXTINF 的时长，等它对应的分片 URL 行出现时一并记入 durs
+	pendingDur := 0.0
 	// 剥 BOM：带 BOM 的播放列表首行 "\ufeff#EXTM3U" 不以 # 开头，
 	// 会被当成分片 URL 产出一条垃圾条目
 	m3u8Text = strings.TrimPrefix(m3u8Text, "\ufeff")
@@ -287,7 +290,9 @@ func parsePlaylist(m3u8Text, base string) playlistInfo {
 				pl.mapURI = resolveURL(base, m[1])
 			}
 		case strings.HasPrefix(line, "#EXTINF:"):
-			pl.totalDur += parseEXTINFDuration(line)
+			// EXTINF 行在它对应的分片 URL 行之前出现，先记下等 URL 行配对
+			pendingDur = parseEXTINFDuration(line)
+			pl.totalDur += pendingDur
 		case strings.HasPrefix(line, "#EXT-X-BYTERANGE:"):
 			// 不解析区间，只记录"见过"——由 ensureNoByteRange 显式失败（见该函数注释）
 			pl.hasByteRange = true
@@ -297,6 +302,8 @@ func parsePlaylist(m3u8Text, base string) playlistInfo {
 			// 防御：含控制字符的行不是合法 URL（二进制响应切碎后的残片），跳过
 			if !looksBinary(line) {
 				pl.segments = append(pl.segments, resolveURL(base, line))
+				pl.durs = append(pl.durs, pendingDur)
+				pendingDur = 0
 				pl.segSeenForKey++
 			}
 		}
