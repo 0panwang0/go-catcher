@@ -64,13 +64,31 @@
   .stage.pause{color:#fcd34d}
   .stage.stale{color:#94a3b8}
   .pctline{display:flex;justify-content:space-between;font-size:12px;color:var(--muted);margin-bottom:5px}
-  .bar{height:10px;background:#0b1220;border-radius:6px;overflow:hidden}
+  /* 直播的指标行：左「已录时长」右「片数」。直播没有总进度，这一行不给百分比。 */
+  .metric{display:flex;justify-content:space-between;align-items:baseline;margin-bottom:6px}
+  .metric .big{font-size:15px;font-weight:600;font-variant-numeric:tabular-nums;color:var(--txt)}
+  .metric .side{font-size:12.5px;color:var(--muted)}
+  .bar{position:relative;height:10px;background:#0b1220;border-radius:6px;overflow:hidden}
   .bar>i{display:block;height:100%;width:0;background:linear-gradient(90deg,#3b82f6,#22c55e);transition:width .3s}
   .bar>i.err{background:var(--err)}
   .bar>i.done{background:var(--ok)}
   .bar>i.pause{background:var(--warn)}
-  .bar>i.indet{width:42%;background:linear-gradient(90deg,#3b82f6,#22c55e,#3b82f6);background-size:220% 100%;animation:indet 1.1s linear infinite}
-  @keyframes indet{0%{background-position:220% 0}100%{background-position:-220% 0}}
+  .bar>i.cancel{background:#475569}
+  /* 直播运行中：全宽"传送带"。整条铺满等距流动纹，刻意不表示"录到几成"——
+     直播没有总时长。
+     为什么不是"一段高光扫过整条"：高光进出场时会被条的两端切断，那一帧看着就是
+     "进度条涨到了 x%"（实测截图里就成了 82% 的填充条），又回到原来的误会。
+     铺满的纹没有进/出场，任何一帧都不存在填充边界，也不会整条空白。
+     旧实现 `width:42%` + 渐变跑马（动的是 background-position、块本身不动）
+     则更糟：永远是一条卡在 40% 的硬切口。 */
+  .bar.live{
+    background-color:rgba(59,130,246,.14);
+    background-image:repeating-linear-gradient(90deg,
+      rgba(125,211,252,0) 0,rgba(125,211,252,0) 8px,
+      rgba(125,211,252,.5) 8px,rgba(125,211,252,.5) 16px);
+    background-size:16px 100%;
+    animation:flowstripes 1s linear infinite}
+  @keyframes flowstripes{0%{background-position:0 0}100%{background-position:16px 0}}
   .acts{display:flex;gap:8px;margin-top:13px;flex-wrap:wrap}
   button{background:#3b82f6;color:#fff;border:none;padding:7px 13px;border-radius:9px;font-size:12.5px;cursor:pointer;transition:filter .15s}
   button:hover{filter:brightness(1.15)}
@@ -113,9 +131,15 @@
   .ibtn.danger:hover{border-color:rgba(239,68,68,.6);color:#fca5a5}
   .ibtn.primary{background:#3b82f6;border-color:#3b82f6;color:#fff}
   .ibtn.primary:hover{filter:brightness(1.15)}
-  .rowstrip{position:absolute;left:0;bottom:0;height:3px;width:100%;background:#0b1220}
+  .rowstrip{position:absolute;left:0;bottom:0;height:3px;width:100%;background:#0b1220;overflow:hidden}
   .rowstrip i{display:block;height:100%;background:linear-gradient(90deg,#3b82f6,#22c55e);transition:width .3s}
-  .rowstrip i.indet{width:42%;background-size:220% 100%;animation:indet 1.1s linear infinite}
+  .rowstrip.live{
+    background-color:rgba(59,130,246,.14);
+    background-image:repeating-linear-gradient(90deg,
+      rgba(125,211,252,0) 0,rgba(125,211,252,0) 4px,
+      rgba(125,211,252,.5) 4px,rgba(125,211,252,.5) 8px);
+    background-size:8px 100%;
+    animation:flowstripes 1s linear infinite}
 </style>
 </head>
 <body>
@@ -189,7 +213,9 @@ function updateStats(){
 function cnt(f){ return tasks.filter(f).length; }
 // 直播任务没有"暂停"态：它的 paused 只可能来自"程序退出时还没录完"，
 // 语义是"中断待处理"（已录部分还在 .part 里，点「停止」才收尾）。
-function liveInterrupted(t){ return !!t.live && !t.done && !t.canceled; }
+// 必须带上 paused：正在录、排队中、已失败的直播都不是"中断"——漏了这一条
+// 会把每条在录的直播都统计成"中断"。
+function liveInterrupted(t){ return !!t.live && !t.done && !t.canceled && !!t.paused; }
 
 function badge(t){
   if(t.canceled) return '<span class="badge cancel">已取消</span>';
@@ -214,8 +240,10 @@ function saveDirOf(t){ return t.saveDir || (t.finalPath? t.finalPath.replace(/[\
 function gapText(t){
   const g = Math.round(t.gapSeconds||0);
   if (g <= 0) return '';
-  return g >= 60 ? ' · 中间缺失约 '+(g/60).toFixed(1)+' 分钟' : ' · 中间缺失约 '+g+' 秒';
+  return g >= 60 ? '中间缺失约 '+(g/60).toFixed(1)+' 分钟' : '中间缺失约 '+g+' 秒';
 }
+// 同一条缺口信息的两种拼法：跟在别的文案后面用 gapTail（自带分隔符），单独成行用 gapText。
+function gapTail(t){ const g = gapText(t); return g ? ' · '+g : ''; }
 
 // 直播/事件流没有总进度，用录制时长展示（运行中=现在-开始；暂停/完成=结束-开始）
 function durText(t){
@@ -225,46 +253,69 @@ function durText(t){
   const m = Math.floor(s/60), ss = s%60;
   return (m<10?'0':'')+m+':'+(ss<10?'0':'')+ss;
 }
+// 已结束但没有有效结束时间（旧状态文件、收尾前就失败的记录）时不要编造 00:00：
+// 那会让人以为"什么都没录到"，而实际内容可能好好地躺在 .part 里。显示"—"更诚实。
+function recordedText(t){
+  const fin = t.finished ? new Date(t.finished).getTime() : 0;
+  if (!(t.running||t.queued) && !(fin > 0)) return '—';
+  return durText(t);
+}
 
 function stageText(t){
   if(t.canceled) return '<span class="stage err">已取消，临时文件已清理</span>';
   // 直播中断收尾：文件已保存，但要如实说明"没录完"、原因、以及时间轴上的缺口
   // ——否则就是把"产物不完整"藏起来（本项目反复出现的头号缺陷形态）。
   if(t.interrupted)
-    return '<span class="stage pause">'+esc(t.stage||'录制中断 · 已保存')+'（'+esc(t.error)+'）'+esc(gapText(t))+'</span>';
+    return '<span class="stage pause">'+esc(t.stage||'录制中断 · 已保存')+'（'+esc(t.error)+'）'+esc(gapTail(t))+'</span>';
   if(t.error) return '<span class="stage err">失败：'+esc(t.error)+'</span>';
   // 直播没有"暂停后接着录"这回事：暂停期间的流已经从列表滚走，接着录只会
   // 在产物中间留一个时间轴空洞。所以这里不给"暂停后还能接着录"的承诺。
+  // 时长与片数由指标行给，这里只说"该怎么办"。
   if(t.paused) return t.live
-    ? '<span class="stage pause">录制已中断 · 已录制 '+t.segDone+' 个分片（'+durText(t)+'），点「停止」保存已录部分</span>'
+    ? '<span class="stage pause">录制已中断 · 点「停止」保存已录部分</span>'
     : '<span class="stage pause">已暂停 · 已下载 '+t.segDone+' 个分片，可从断点继续</span>';
   if(t.queued) return '<span class="stage">排队中…（最多同时 '+esc(curCfg.maxConcurrent)+' 个在下载）</span>';
+  // 直播完成态：stage 已经是"已保存（用户停止录制）"这类完整说法，不再套"完成 · "；
+  // 点播仍用"完成 · 已保存"。
   if(t.done) return t.fileMissing
     ? '<span class="stage stale">已失效 · 文件已被移动或删除</span>'
-    : '<span class="stage ok">完成 · '+esc(t.stage||'已保存')+esc(gapText(t))+'</span>';
-  if(t.running && t.live) return '<span class="stage">录制直播中 · 已录 '+t.segDone+' 片 · '+durText(t)+esc(gapText(t))+'</span>';
+    : '<span class="stage ok">'+(t.live?esc(t.stage||'已保存'):'完成 · '+esc(t.stage||'已保存'))+esc(gapTail(t))+'</span>';
+  // 录制中：时长与片数已在指标行里，这里只在真出现缺口时说话。
+  // 同一件事说三遍（状态行/进度行左/进度行右）是最容易让人以为界面坏掉的写法。
+  if(t.running && t.live){
+    const g = gapText(t);
+    return g ? '<span class="stage pause">'+esc(g)+'（分片已从播放列表滚走，补不回来）</span>' : '';
+  }
   return '<span class="stage">'+esc(t.stage||'进行中')+'</span>';
+}
+
+// 直播指标行的左侧文本：只回答"录了多久"。
+function liveTitle(t){
+  if(t.canceled) return '已取消';
+  if(t.queued && !t.running) return '排队中…';
+  return '已录 '+recordedText(t);
 }
 
 function card(t){
   const pct = Math.max(0, Math.min(100, t.pct||0));
   let barCls='';
   if(t.interrupted) barCls='pause';                  // 中断保存：文件在，只是没录完
-  else if(t.error||t.canceled) barCls='err';
+  else if(t.canceled) barCls='cancel';               // 取消：没有产物，用灰色而不是红色
+  else if(t.error) barCls='err';
   else if(t.done) barCls='done';
   else if(t.paused) barCls='pause';
-  else if(t.live) barCls='indet';                    // 直播：无限进度条
+  else if(t.live) barCls='flow';                     // 直播运行中：全宽活性带（无百分比）
   const seg = t.live
-    ? ('已录制 '+t.segDone+' 个分片')
+    ? (t.segDone+' 片')
     : ((t.segTot>0)?('分片 '+t.segDone+' / '+t.segTot):'');
   const pctTxt = (t.queued&&!t.running) ? '—'
     : (t.interrupted ? '已中断'
     : (t.error ? '失败'
-    : (t.canceled ? '已取消'
+    // 取消态徽章与状态行都已经说了"已取消"，这里不再重复第三遍
+    : (t.canceled ? '—'
     : (t.stage==='解析视频源' ? '等待源站响应…'
     : (t.stage==='下载直链文件中' ? '下载中…'
-    : (t.live ? ((t.paused||t.done)?'已录制 ':'录制中 ')+durText(t)
-    : pct.toFixed(1)+'%'))))));
+    : pct.toFixed(1)+'%')))));
   const started = t.started? new Date(t.started).toLocaleTimeString('zh-CN',{hour12:false,hour:'2-digit',minute:'2-digit'}) : '';
   const cls = t.canceled ? 'card' : (t.paused ? 'card paused' : ((t.running||t.queued) ? 'card active':'card'));
   return '<div class="'+cls+'">'
@@ -273,11 +324,24 @@ function card(t){
     +   (saveDirOf(t)?'<div>保存到</div><div class="mv">'+esc(saveDirOf(t))+'</div>':'')
     +   (started?'<div>开始</div><div class="mv" style="color:var(--muted)">'+started+'</div>':'')
     + '</div>'
-    + '<div style="margin-bottom:6px">'+stageText(t)+'</div>'
-    + '<div class="pctline"><span>'+pctTxt+'</span><span style="color:var(--muted)">'+seg+'</span></div>'
-    + '<div class="bar"><i class="'+barCls+'"'+(barCls==='indet'?'':' style="width:'+(t.stage==='解析视频源'||t.done&&!t.error?100:(t.live?100:pct))+'%"')+'></i></div>'
+    + stageRow(t)
+    + (t.live
+        // 直播：一行定指标（录了多久 / 录了多少片），下面用活性带表示"还在录"。
+        // 不画百分比进度——直播没有总时长，画出来只会是假的。
+        ? '<div class="metric"><span class="big">'+esc(liveTitle(t))+'</span><span class="side">'+esc(seg)+'</span></div>'
+        : '<div class="pctline"><span>'+esc(pctTxt)+'</span><span style="color:var(--muted)">'+esc(seg)+'</span></div>')
+    + (barCls==='flow'
+        // 直播运行中：整条自带流动纹，不需要内层填充元素（也刻意不给宽度）
+        ? '<div class="bar live"></div>'
+        : '<div class="bar"><i class="'+barCls+'" style="width:'+((t.stage==='解析视频源'||(t.done&&!t.error))?100:(t.live?100:pct))+'%"></i></div>')
     + actions(t)
     + '</div>';
+}
+// stageText 可能返回空串（直播录制中且无缺口时没有别的话要说），
+// 空串就别占一行留出多余间距。
+function stageRow(t){
+  const s = stageText(t);
+  return s ? '<div style="margin-bottom:6px">'+s+'</div>' : '';
 }
 
 // 每个任务按状态给出可用操作
@@ -343,7 +407,7 @@ function rowCard(t){
   const pct = Math.max(0, Math.min(100, t.pct||0));
   const isRun = t.running && !t.done && !t.error && !t.canceled;
   let pctTxt = '';
-  if (isRun || t.paused) pctTxt = (t.stage==='解析视频源'||t.stage==='下载直链文件中') ? '…' : (t.live ? durText(t) : pct.toFixed(1)+'%');
+  if (isRun || t.paused) pctTxt = (t.stage==='解析视频源'||t.stage==='下载直链文件中') ? '…' : (t.live ? recordedText(t) : pct.toFixed(1)+'%');
   let acts = '';
   if (t.canceled) {
     acts = ibtn('','🗑','移除记录','removeTask('+id+')');
@@ -380,7 +444,10 @@ function rowCard(t){
     + '<div class="rowname"><span>'+name+'</span></div>'
     + (pctTxt ? '<span class="rowpct">'+pctTxt+'</span>' : '')
     + '<span class="rowacts">'+acts+'</span>'
-    + (isRun ? '<span class="rowstrip"><i class="'+(t.live?'indet':'')+'" style="'+(t.live?'':'width:'+pct+'%')+'"></i></span>' : '')
+    + (isRun
+        // 直播：整条自带流动纹；点播：内层按百分比填充（少一层空元素也少一处写错宽度的机会）
+        ? '<span class="rowstrip'+(t.live?' live':'')+'">'+(t.live?'':'<i style="width:'+pct+'%"></i>')+'</span>'
+        : '')
     + '</div>';
 }
 // —— 名称滚动：放不下才滚 ——
@@ -428,12 +495,17 @@ function setupScroll(){
 }
 
 // —— 按天分组渲染 ——
+// 时间戳无效/缺失（旧状态文件里的零值时间）时返回空串，落到"日期未知"那一组：
+// 直接算下去会渲染出"NaN月NaN日 undefined"这种明显的坏界面。
 function dayKey(s){
   const d = new Date(s);
+  const y = d.getFullYear();
+  if (!(y >= 1970)) return '';
   const p = function(n){return n<10?'0'+n:''+n;};
-  return d.getFullYear()+'-'+p(d.getMonth()+1)+'-'+p(d.getDate());
+  return y+'-'+p(d.getMonth()+1)+'-'+p(d.getDate());
 }
 function dayLabel(key){
+  if (!key) return '日期未知';
   const today = dayKey(new Date());
   const y = new Date(); y.setDate(y.getDate()-1);
   if (key === today) return '今天';

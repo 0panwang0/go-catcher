@@ -52,3 +52,49 @@ func TestLiveUIOffersStopNotResume(t *testing.T) {
 		t.Error("web/index.html 仍在用 done&&error&&live 判断中断态，应改用服务端的 interrupted 字段")
 	}
 }
+
+// TestLiveUIRendersNoFakeProgress 直播卡片不得画"假进度条"。
+//
+// 学徒 2026-09-15 报的原始现象：录制中的进度条只有一半、样式奇怪。根因是
+// `.bar>i.indet` 写死 width:42%，只让内部渐变来回跑（动的是 background-position，
+// 色块本身不动），于是永远像一条卡在 40% 的坏进度条。直播本来就没有总时长，
+// 套"进度条"这个隐喻本身就是错的：运行中应当画全宽活性带，终态画全宽实色条。
+func TestLiveUIRendersNoFakeProgress(t *testing.T) {
+	page := homePageHTML
+
+	mustHave := []struct{ frag, why string }{
+		{".bar.live", "直播运行中缺少活性带"},
+		{"flowstripes", "活性带没有流动动画，看着像一条死掉的空条"},
+		{"<div class=\"metric\">", "直播卡片缺少单行指标行（左「已录时长」右「片数」）"},
+		{"function liveTitle(t)", "缺少直播指标文案函数"},
+		{"function stageRow(t)", "stageText 可能返回空串，空行会留出多余间距"},
+		// 指标行的右侧（片数）与 stageText 左边（时长）不能再互相重复
+		{"t.segDone+' 片'", "直播片数文案变了，请确认指标行右侧仍显示片数"},
+		{"if (!key) return '日期未知'", "日期分组没兜住无效时间戳（会渲染成 NaN月NaN日）"},
+	}
+	for _, c := range mustHave {
+		if !strings.Contains(page, c.frag) {
+			t.Errorf("web/index.html 缺少 %q —— %s", c.frag, c.why)
+		}
+	}
+
+	mustNotHave := []struct{ frag, why string }{
+		{".bar>i.indet", "直播仍在用 42% 定宽的假进度条（永远像卡在半路）"},
+		{".rowstrip i.indet", "简略模式仍在用 42% 定宽的假进度条"},
+		{".indet{width:42%", "还有写死 42% 宽度的假进度条样式"},
+		{"keyframes indet", "indet 动画已无人使用（只让渐变跑、色块不动的假动效）"},
+		{"录制直播中 · 已录 ", "直播录制中的状态行又把时长/片数说了一遍（指标行已经说过）"},
+		{"已录制 '+t.segDone+' 个分片", "旧的重复片数文案回来了"},
+	}
+	for _, c := range mustNotHave {
+		if strings.Contains(page, c.frag) {
+			t.Errorf("web/index.html 仍含 %q —— %s", c.frag, c.why)
+		}
+	}
+
+	// 顶部统计：直播运行中/排队中不得算进"中断"。这个判据漏掉 paused 时，
+	// 每条正在录的直播都会被统计成"中断"。
+	if !strings.Contains(page, "!t.canceled && !!t.paused") {
+		t.Error("liveInterrupted 少了 paused 条件：正在录制的直播会被统计成「中断」")
+	}
+}
