@@ -53,6 +53,11 @@
   .field input[type=number]::-webkit-inner-spin-button{-webkit-appearance:none;margin:0}
   .field .desc{color:var(--muted);font-size:12px;line-height:1.6;margin-top:6px}
   .field .desc em{font-style:normal;color:#7dd3fc}
+  /* 系统代理不可用时的字段内警示（琥珀，与页脚 .note 同色系）：
+     「跟随系统」静默降级成直连必须看得见，否则用户以为走了代理、其实暴露真实 IP。 */
+  .field .desc.warnhint{display:flex;gap:8px;align-items:flex-start;
+        background:rgba(245,158,11,.08);border:1px solid rgba(245,158,11,.35);
+        border-radius:8px;padding:8px 11px;color:#fcd34d;font-size:12px;line-height:1.65}
 
   .segrow{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap}
   .segrow .lb{font-size:13px;font-weight:600}
@@ -167,13 +172,36 @@ el('viewseg').addEventListener('click', function(e){
 });
 // —— 代理模式（跟随系统 / 直连 / 手动）——
 var proxyMode = 'system';
+var sysProxyAddr = '';  // 服务端读到的系统代理（空 = 没读到可用的）
+var sysProxyWarn = '';  // 系统代理启用了但协议不受支持时的说明（空 = 无话可说）
 function syncProxySeg(){
   var bs = el('proxyseg').querySelectorAll('button');
   for (var i=0;i<bs.length;i++) bs[i].className = (bs[i].getAttribute('data-v')===proxyMode) ? 'on' : '';
   el('proxyaddr').style.display = (proxyMode === 'manual') ? '' : 'none';
+  syncSysHint();
 }
-function syncSysHint(sysProxy){
-  el('syshint').textContent = '';
+// 提示只在「跟随系统」下出现：另两种模式走哪儿由代理地址栏自己说明，再加一行是噪音。
+// 文案一律经 textContent / createElement 落 DOM——注册表里的 ProxyServer 是不可信
+// 输入，拼 innerHTML 等于给自己挖 XSS。
+function syncSysHint(){
+  var h = el('syshint');
+  h.className = 'desc';
+  h.textContent = '';
+  if (proxyMode !== 'system') return;
+  if (sysProxyWarn){
+    h.className = 'desc warnhint';
+    var ic = document.createElement('span'); ic.textContent = '⚠';
+    var tx = document.createElement('span'); tx.textContent = sysProxyWarn;
+    h.appendChild(ic); h.appendChild(tx);
+    return;
+  }
+  if (!sysProxyAddr){
+    h.textContent = '跟随系统：系统未启用代理，当前等价于直连';
+    return;
+  }
+  h.appendChild(document.createTextNode('跟随系统：当前系统代理 '));
+  var a = document.createElement('em'); a.textContent = sysProxyAddr;
+  h.appendChild(a);
 }
 el('proxyseg').addEventListener('click', function(e){
   var b = e.target.closest('button');
@@ -196,8 +224,9 @@ async function load(){
     el('f_port').value = d.port;
     el('f_proxy').value = (proxyModeOf(d.proxy) === 'manual') ? d.proxy : '';
     proxyMode = proxyModeOf(d.proxy);
+    sysProxyAddr = d.systemProxy || '';
+    sysProxyWarn = d.systemProxyWarning || '';
     syncProxySeg();
-    syncSysHint(d.systemProxy || '');
     segVal = (d.uiView === 'compact') ? 'compact' : 'detail';
     syncSeg(segVal);
   }catch(e){ toast('无法读取服务端配置', true); }

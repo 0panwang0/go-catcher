@@ -70,16 +70,34 @@ func SystemProxyWarning(proxyMode string) string {
 	return systemProxyNotice(r.server)
 }
 
-// systemProxyNotice 解释 ProxyServer 为何不可用；无法归因时返回通用提示。
+// systemProxyNotice 解释 ProxyServer 为何不可用；无法归因时返回空串。
+//
+// 文案刻意短：「系统代理协议不受支持（当前为 socks5），已按直连处理」。只说事实、
+// 不解释原理，括号里点名注册表里的实际协议——用户据此就知道该把代理软件切成
+// http 模式，比笼统的「协议不受支持」少一轮排查。
 func systemProxyNotice(server string) string {
-	s := strings.TrimSpace(server)
+	proto := unsupportedProtoName(server)
+	if proto == "" {
+		return ""
+	}
+	return fmt.Sprintf("系统代理协议不受支持（当前为 %s），已按直连处理", proto)
+}
+
+// unsupportedProtoName 从 ProxyServer 原始值里提取「不受支持」的协议名；
+// 空串 = 无话可说。注册表有两种已知形态：
+//
+//   - scheme 形态 "socks5://host:port" → 取 scheme；
+//   - 分协议形态 "ftp=h:21;http=h:8080" → 取所有键名。
+//
+// 出现 http/https 键即返回空：那意味着有能用的项，轮不到这条提示。
+func unsupportedProtoName(s string) string {
+	s = strings.TrimSpace(s)
 	if s == "" {
 		return ""
 	}
-	const rule = "本工具只支持 http:// 代理（socks5 等无法走 CONNECT 隧道），已按直连处理"
 	if !strings.Contains(s, "=") {
 		if i := strings.Index(s, "://"); i > 0 {
-			return fmt.Sprintf("系统代理协议为 %s，%s", strings.ToLower(s[:i]), rule)
+			return strings.ToLower(s[:i])
 		}
 		return ""
 	}
@@ -91,15 +109,18 @@ func systemProxyNotice(server string) string {
 			continue
 		}
 		p := strings.ToLower(strings.TrimSpace(kv[:eq]))
+		if p == "" {
+			continue
+		}
 		protos = append(protos, p)
 		if p == "http" || p == "https" {
 			hasHTTP = true
 		}
 	}
-	if !hasHTTP && len(protos) > 0 {
-		return fmt.Sprintf("系统代理只配置了 %s，%s", strings.Join(protos, "/"), rule)
+	if hasHTTP || len(protos) == 0 {
+		return ""
 	}
-	return ""
+	return strings.Join(protos, "/")
 }
 
 // NormalizeSystemProxy 规范化 ProxyServer 值：可能是 "host:port"、

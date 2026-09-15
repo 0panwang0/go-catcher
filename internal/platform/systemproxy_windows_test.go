@@ -70,3 +70,25 @@ func TestSystemProxyWarning(t *testing.T) {
 	// system 模式但注册表未启用 → 不提示（由真实注册表状态决定，只验证不 panic）
 	_ = SystemProxyWarning("system")
 }
+
+// TestSystemProxyNotice 提示文案（学徒 2026-09-15 定稿）：短句 + 括号里点名实际协议。
+// 点名协议不是装饰——用户据此就知道该把代理软件切成 http 模式，而不是对着
+// 「协议不受支持」发呆。所以措辞与协议名都要钉住。
+func TestSystemProxyNotice(t *testing.T) {
+	const tail = "），已按直连处理"
+	cases := []struct{ in, want string }{
+		{"socks5://x:1080", "系统代理协议不受支持（当前为 socks5" + tail},
+		{"https://x:8443", "系统代理协议不受支持（当前为 https" + tail},
+		{"ftp=1.1.1.1:21", "系统代理协议不受支持（当前为 ftp" + tail},
+		{"ftp=1.1.1.1:21;socks=2.2.2.2:1080", "系统代理协议不受支持（当前为 ftp/socks" + tail},
+		// 有可用项（http/https 键）→ 轮不到这条提示；压根解析不出协议 → 无话可说
+		{"ftp=1.1.1.1:21;http=127.0.0.1:7890", ""},
+		{"not a url", ""},
+		{"", ""},
+	}
+	for _, c := range cases {
+		if got := systemProxyNotice(c.in); got != c.want {
+			t.Errorf("systemProxyNotice(%q)\n got %q\nwant %q", c.in, got, c.want)
+		}
+	}
+}
