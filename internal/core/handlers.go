@@ -182,7 +182,9 @@ func (e *Engine) handleResume(w http.ResponseWriter, r *http.Request) {
 	te.st.queued = true
 	te.mu.Unlock()
 
-	go runDiskPipeline(te)
+	// 清掉旧意图，重新起一个 goroutine（会重新拿并发槽并接着断点下）。
+	// 与新建任务同一入口，也必须走 runGuarded：续传会重新跑一遍 init 段处理。
+	go runGuarded(te, func() { runDiskPipeline(te) })
 	writeJSON(w, http.StatusOK, actionResp{OK: true, ID: id, Resumed: true})
 }
 

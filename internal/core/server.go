@@ -210,8 +210,10 @@ func (e *Engine) handleDownload(w http.ResponseWriter, r *http.Request) {
 	e.rt.tasksMu.Unlock()
 	e.rt.pruneOldTasks()
 
-	// 启动 goroutine：先排队等并发槽，拿到后真正跑 pipeline
-	go runDiskPipeline(te)
+	// 启动 goroutine：先排队等并发槽，拿到后真正跑 pipeline。
+	// 必须走 runGuarded：管线里的任何漏网 panic 都只能让这一个任务失败，
+	// 不能带走整个进程（畸形 fMP4/init 段的崩溃就是这么进来的）。
+	go runGuarded(te, func() { runDiskPipeline(te) })
 
 	// 统一走 writeJSON：%q 是 strconv.Quote，对控制字符会产出 \x01 这类
 	// JSON 非法转义（见 handlers.go 顶部说明）。saveDir/fname 来自调用方，

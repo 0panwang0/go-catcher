@@ -8,9 +8,38 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime/debug"
 	"strings"
 	"time"
 )
+
+// runGuarded 在独立 goroutine 里跑 fn（= 下载管线），拦下任何漏网的 panic。
+//
+// 为什么必须有这一层：runDiskPipeline 由 `go` 启动、没有返回值，一旦 panic
+// 就是整个进程消失——GUI 没了，其它正在下载/录制的任务也一起没了。fMP4 解析
+// 那边已经做了边界校验 + 入口 recover，这里是最后一道，覆盖"没人想到的那条路"
+// （畸形 init 段、收尾阶段的容器操作等）。
+//
+// 独立成函数而不是内联 defer：内联没法写测试，而"崩溃被拦住了"这件事必须可验。
+//
+// 已经在终态的任务不改写状态：panic 完全可能发生在收尾成功之后，
+// 把一次成功保存改写成"失败"和崩溃一样糟（用户会以为文件没了）。
+func runGuarded(te *taskEntry, fn func()) {
+	defer func() {
+		if r := recover(); r != nil {
+			fmt.Printf("[core] FATAL: 任务 %s 内部错误（已拦截）: %v\n%s\n", te.st.id, r, debug.Stack())
+			te.mu.Lock()
+			finished := te.st.done
+			te.mu.Unlock()
+			if finished {
+				return
+			}
+			failTask(te, fmt.Sprintf("内部错误（已拦截崩溃）: %v", r))
+			te.rt.markDirty()
+		}
+	}()
+	fn()
+}
 
 func runDiskPipeline(te *taskEntry) {
 	acquired := false
