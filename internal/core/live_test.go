@@ -514,6 +514,64 @@ func TestSeenWatermarkMonotonic(t *testing.T) {
 	}
 }
 
+// TestLiveFailureDoesNotAdvanceWaterline 记账必须晚于落盘（P1-1）：
+// 一批分片全下载失败时，水位线一步都不能前进——推进了，后续轮询就会把它们
+// 当"已录制"跳过，产物时间轴上留一段空洞，而状态与日志都说一切正常。
+func TestLiveFailureDoesNotAdvanceWaterline(t *testing.T) {
+	useFastLive(t, 1<<20) // 不让"空轮询"抢先结束：失败必须来自分片下载
+	list := "#EXTM3U\n#EXT-X-VERSION:3\n#EXTINF:6.0,\nseg/0.ts\n" +
+		"#EXTINF:6.0,\nseg/1.ts\n#EXTINF:6.0,\nseg/2.ts\n"
+	srv := startLiveServer(t, []string{list}, map[string]string{},
+		map[string]bool{"/seg/0.ts": true, "/seg/1.ts": true, "/seg/2.ts": true})
+
+	job := &dlJob{rt: testStd, id: "twater", live: true, m3u8URL: srv.URL + "/live.m3u8"}
+	out := filepath.Join(t.TempDir(), "live.ts")
+	if _, err := job.liveDownload(context.Background(), out, 0); err == nil {
+		t.Fatal("分片全 500 应返回错误")
+	}
+	if wm, ok := job.seenWatermark(); ok {
+		t.Fatalf("3 片全部下载失败，水位线却推进到 %d：下一轮会把它们当已录制跳过", wm)
+	}
+	if info, err := os.Stat(out); err == nil && info.Size() > 0 {
+		t.Fatalf("一片都没落盘，输出文件却有 %d 字节", info.Size())
+	}
+}
+
+// TestLivePartialBatchCommitsOnlyFlushed 只提交"确认落盘"的前缀：
+// 3 片里第 2 片失败时，只有第 1 片能记成已录制；第 3 片虽然内容正常，
+// 但它后面的分片没写进去，序号必须留在水位线之后（下一轮窗口里还在就补）。
+func TestLivePartialBatchCommitsOnlyFlushed(t *testing.T) {
+	useFastLive(t, 1<<20)
+	list := "#EXTM3U\n#EXT-X-VERSION:3\n#EXTINF:6.0,\nseg/0.ts\n" +
+		"#EXTINF:6.0,\nseg/1.ts\n#EXTINF:6.0,\nseg/2.ts\n"
+	srv := startLiveServer(t, []string{list},
+		map[string]string{"/seg/0.ts": "SEG-0", "/seg/2.ts": "SEG-2"},
+		map[string]bool{"/seg/1.ts": true})
+
+	job := &dlJob{rt: testStd, id: "tpartial", live: true, m3u8URL: srv.URL + "/live.m3u8"}
+	out := filepath.Join(t.TempDir(), "live.ts")
+	if _, err := job.liveDownload(context.Background(), out, 0); err == nil {
+		t.Fatal("分片失败应返回错误")
+	}
+	wm, ok := job.seenWatermark()
+	if !ok || wm != 0 {
+		t.Fatalf("水位线=%d ok=%v want 0/true（只有第 1 片落盘）", wm, ok)
+	}
+	if job.seenCovers(1) {
+		t.Fatal("没落盘的第 2 片被记成已录制")
+	}
+	if job.seenCovers(2) {
+		t.Fatal("第 3 片被提前记成已录制：它的写入序号在第 2 片之后，文件里根本没有")
+	}
+	data, err := os.ReadFile(out)
+	if err != nil {
+		t.Fatalf("读输出: %v", err)
+	}
+	if string(data) != "SEG-0" {
+		t.Fatalf("输出内容=%q want %q", data, "SEG-0")
+	}
+}
+
 // TestLiveSeenStateNotPersisted 直播去重状态不进状态文件。
 //
 // B0 之后直播只有「停止」「取消」两态，不存在跨会话续录——这些字段写进去

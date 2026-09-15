@@ -98,6 +98,27 @@ func (j *dlJob) seenRecord(seq uint64) {
 	j.seenAny = true
 }
 
+// commitLiveWaterline 按"已确认落盘"的前缀推进直播去重水位线（P1-1）。
+//
+// 记账必须晚于落盘：旧实现是收集阶段就 seenRecord(seq)，也就是**下载之前**
+// 就把分片记成"已录制"，下载失败也不会撤销——后续轮询据此把它们跳过，
+// 产物时间轴上留一段空洞，而状态、日志都说一切正常。
+//
+// 用已落盘前缀（segFlushedNow）而不是 streamDownload 返回的 next：正常完成
+// 两者相等，但"落盘断点"才是唯一有语义的判据（它就是给断点续传用的那个计数）。
+func commitLiveWaterline(j *dlJob, seqs []uint64, startIdx int) {
+	n := int(j.segFlushedNow()) - startIdx
+	if n > len(seqs) {
+		n = len(seqs)
+	}
+	if n < 0 {
+		n = 0
+	}
+	for i := 0; i < n; i++ {
+		j.seenRecord(seqs[i])
+	}
+}
+
 // seenWatermark 返回 media sequence 水位线（已录到的最大序号，以及是否已建立）。
 // 直播用它检测"窗口滚动把分片淘汰掉了"：本轮列表首片的序号若是水位线之后
 // 一段距离，中间那些分片已经永远补不回来，产物时间轴上会留一个空洞。
@@ -903,15 +924,17 @@ func (j *dlJob) liveDownload(ctx context.Context, outPath string, from int) (int
 
 		var newSegs []string
 		var newDurs []float64 // 与本批分片一一对应的 EXTINF，失败时用来算缺口
+		var pendSeqs []uint64 // 本批分片的 media sequence：落盘确认后才提交给水位线
 		firstNewPos := -1     // 本批首个新分片在当前列表中的位置（派生 IV 的序号基准）
 		for pos, u := range cur.segments {
 			// 按 media sequence 判重（列表位置 + MEDIA-SEQUENCE），而不是"URL 是否
-			// 见过"：见 seenCovers。
+			// 见过"：见 seenCovers。判重只看水位线，提交在落盘之后（见
+			// commitLiveWaterline）——在这里记会把没下成的分片也算成已录制。
 			seq := cur.mediaSeq + uint64(pos)
 			if j.seenCovers(seq) {
 				continue
 			}
-			j.seenRecord(seq)
+			pendSeqs = append(pendSeqs, seq)
 			newSegs = append(newSegs, u)
 			newDurs = append(newDurs, durAt(cur, pos))
 			if firstNewPos < 0 {
@@ -924,6 +947,8 @@ func (j *dlJob) liveDownload(ctx context.Context, outPath string, from int) (int
 			startIdx := next
 			n, derr := streamDownload(ctx, j, newSegs, next, cur.mediaSeq+uint64(firstNewPos), outPath)
 			next = n
+			// 落盘之后再记账（P1-1）：只有确认写进文件的前缀才算"已录制"。
+			commitLiveWaterline(j, pendSeqs, startIdx)
 			if derr != nil {
 				if ctx.Err() != nil {
 					return next, nil
