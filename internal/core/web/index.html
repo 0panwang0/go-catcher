@@ -103,7 +103,6 @@
   button:disabled{opacity:.4;cursor:not-allowed}
   button.ghost{background:transparent;border:1px solid var(--line);color:var(--muted)}
   button.danger{background:rgba(239,68,68,.16);border:1px solid rgba(239,68,68,.5);color:#fca5a5}
-  button.warn{background:rgba(245,158,11,.16);border:1px solid rgba(245,158,11,.5);color:#fcd34d}
   .empty{color:var(--muted);text-align:center;padding:50px 0;font-size:14px;background:var(--card);border:1px dashed var(--line);border-radius:14px}
   .foot{color:#64748b;font-size:11.5px;margin-top:8px;display:flex;justify-content:space-between;flex-wrap:wrap;gap:6px}
   #errline{color:var(--err)}
@@ -371,12 +370,15 @@ function stageRow(t){
 
 // 每个任务按状态给出可用操作。
 //
-// ⚠️ 按钮顺序是**统一约定**，不要逐状态自由发挥 —— 简略模式的 rowCard() 必须给出同一套顺序：
-//   ① 主操作（运行中 ⏸ / 直播运行中 ⏹；已暂停 ▶继续；失败 ▶重试；已完成 ▶打开文件）
-//   ② 📂 打开文件夹
-//   ③ ✕ 取消 / 🗑 移除记录
+// ⚠️ 按钮顺序 **和配色** 都是统一约定，不要逐状态自由发挥 —— 简略模式的 rowCard() 必须给同一套：
+//   ① 主操作（运行中 ⏸ / 直播运行中 ⏹；已暂停 ⏯继续；失败 ↻重试；已完成 ▶打开文件）
+//      —— 一律 `primary`（蓝底）：这些是"让任务动起来"的媒体控制键，同色才是一组；
+//   ② 📂 打开文件夹 —— 中性描边（ghost）：不改任务状态，只是看一眼磁盘；
+//   ③ ✕ 取消 = `danger`（红）/ 🗑 移除记录 = 中性描边。
 // 两处各拼各的会露馅：📂 曾在"运行中"排第 1、在"已完成"排第 2，图标列横向漂移、
-// 右对齐也救不回来（2026-09-16 学徒截图抓到）。新增状态时照这个顺序往 b 里塞。
+// 右对齐也救不回来（2026-09-16 学徒截图抓到）。后来配色又各拼各的：运行中的 ⏸/⏹ 是
+// warn(黄底)、而 ⏯继续/↻重试 是 primary(蓝底) —— 同一行"运行中"在点播与直播下长得不一样。
+// 新增状态时照这个顺序与配色往 b 里塞。
 function actions(t){
   const id = JSON.stringify(t.id);
   const op = t.openPath ? JSON.stringify(t.openPath) : null; // 真实存在的文件（成品或 .part 半成品）
@@ -400,19 +402,19 @@ function actions(t){
     if (sd) b.push(btn('ghost','📂 打开文件夹','openFolder('+id+')'));
     b.push(btn('ghost','🗑 移除记录','removeTask('+id+')'));
   } else if (t.paused) {
-    b.push(btn('primary','▶ 继续下载','resumeTask('+id+')'));
+    b.push(btn('primary','⏯ 继续下载','resumeTask('+id+')'));
     if (sd) b.push(btn('ghost','📂 打开文件夹','openFolder('+id+')'));
     b.push(btn('danger','✕ 取消','cancelTask('+id+')'));
   } else if (t.error) {
-    b.push(btn('primary','▶ 重试','resumeTask('+id+')'));
+    b.push(btn('primary','↻ 重试','resumeTask('+id+')'));
     if (sd) b.push(btn('ghost','📂 打开文件夹','openFolder('+id+')'));
     b.push(btn('danger','✕ 取消','cancelTask('+id+')'));
     b.push(btn('ghost','🗑 移除记录','removeTask('+id+')'));
   } else {
     // 下载中 / 排队中（随时可打开文件夹查看 .part 半成品）
     b.push(t.live
-      ? btn('warn','⏹ 停止','stopTask('+id+')')
-      : btn('warn','⏸ 暂停','pauseTask('+id+')'));
+      ? btn('primary','⏹ 停止','stopTask('+id+')')
+      : btn('primary','⏸ 暂停','pauseTask('+id+')'));
     if (sd) b.push(btn('ghost','📂 打开文件夹','openFolder('+id+')'));
     b.push(btn('danger','✕ 取消','cancelTask('+id+')'));
   }
@@ -440,25 +442,25 @@ function rowCard(t){
   const isRun = t.running && !t.done && !t.error && !t.canceled;
   let pctTxt = '';
   if (isRun || t.paused) pctTxt = (t.stage==='解析视频源'||t.stage==='下载直链文件中') ? '…' : (t.live ? recordedText(t) : pct.toFixed(1)+'%');
-  // ⚠️ 顺序必须与详细模式的 actions() 完全一致（约定写在其函数头注释里）：
-  //    ① 主操作 ② 📂 打开文件夹 ③ ✕ 取消 / 🗑 移除记录。
-  //    两处是同一条规则的两份实现，改一处必须同步改另一处，否则图标列又开始漂移。
+  // ⚠️ 顺序与配色都必须与详细模式的 actions() 完全一致（约定写在其函数头注释里）：
+  //    ① 主操作（蓝底 primary） ② 📂 打开文件夹（中性） ③ ✕ 取消（红 danger）/ 🗑 移除记录（中性）。
+  //    两处是同一条规则的两份实现，改一处必须同步改另一处，否则图标列又开始漂移、配色又开始打架。
   let acts = '';
   if (t.canceled) {
     acts = ibtn('','🗑','移除记录','removeTask('+id+')');
   } else if (t.live && (t.done || t.paused || t.error)) {
-    acts = (op ? ibtn('','▶','打开文件','openFile('+id+')') : '')
+    acts = (op ? ibtn('primary','▶','打开文件','openFile('+id+')') : '')
          + (sd ? ibtn('','📂','打开文件夹','openFolder('+id+')') : '')
          + (t.done
             ? ibtn('','🗑','移除记录','removeTask('+id+')')
             : ibtn('primary','⏹','停止（保存已录部分）','stopTask('+id+')')
               + ibtn('danger','✕','取消（删除文件）','cancelTask('+id+')'));
   } else if (t.done && !t.error) {
-    acts = (op ? ibtn('','▶','打开文件','openFile('+id+')') : '')
+    acts = (op ? ibtn('primary','▶','打开文件','openFile('+id+')') : '')
          + (sd ? ibtn('','📂','打开文件夹','openFolder('+id+')') : '')
          + ibtn('','🗑','移除记录','removeTask('+id+')');
   } else if (t.paused) {
-    acts = ibtn('primary','▶','继续下载','resumeTask('+id+')')
+    acts = ibtn('primary','⏯','继续下载','resumeTask('+id+')')
          + (sd ? ibtn('','📂','打开文件夹','openFolder('+id+')') : '')
          + ibtn('danger','✕','取消（删除文件）','cancelTask('+id+')');
   } else if (t.error) {
@@ -468,8 +470,8 @@ function rowCard(t){
          + ibtn('','🗑','移除记录','removeTask('+id+')');
   } else {
     acts = (t.live
-            ? ibtn('','⏹','停止','stopTask('+id+')')
-            : ibtn('','⏸','暂停','pauseTask('+id+')'))
+            ? ibtn('primary','⏹','停止','stopTask('+id+')')
+            : ibtn('primary','⏸','暂停','pauseTask('+id+')'))
          + (sd ? ibtn('','📂','打开文件夹','openFolder('+id+')') : '')
          + ibtn('danger','✕','取消（删除文件）','cancelTask('+id+')');
   }

@@ -87,6 +87,30 @@ check("暂停中 → resume + cancel", JSON.stringify(ctls(false, true)) === '["
 check("暂停态文案仍是\"继续下载\"", hasText(false, true, "继续"));
 check("点播运行中的 pause 按钮不带\"停止\"字样", !hasText(false, false, "停止"));
 
+console.log("配色与图标：与内置前端同一套");
+const CASES = [
+  [true, false, "直播运行中"],
+  [false, false, "点播运行中"],
+  [false, true, "点播已暂停"],
+];
+check(
+  "三个态的主操作都是 primary（蓝底）——暂停原先漏成 plain",
+  CASES.every(([live, paused]) => ui.controlButtons(live, paused)[0].kind === "primary"),
+  CASES.map(([l, p]) => ui.controlButtons(l, p)[0].kind)
+);
+check(
+  "三个态的 cancel 都是 danger（红）——暂停态的取消原先漏成 plain",
+  CASES.every(([live, paused]) => {
+    const c = ui.controlButtons(live, paused).find((b) => b.ctl === "cancel");
+    return c && c.kind === "danger";
+  }),
+  CASES.map(([l, p]) => (ui.controlButtons(l, p).find((b) => b.ctl === "cancel") || {}).kind)
+);
+check("「继续」用 ⏯ 不用 ▶ —— ▶ 已被「打开文件 / 播放」占用，同形不同义",
+  hasText(false, true, "⏯") && !hasText(false, true, "▶"));
+check("控制按钮的 kind 只剩 primary/danger 两种（plain 退为未知 kind 的兜底）",
+  !/ctl:\s*"[a-z]+",\s*label:\s*"[^"]*",\s*kind:\s*"plain"/.test(src));
+
 console.log("接线：面板与 background 真的懂 stop");
 check("renderInitiatedControls 消费 controlButtons", /renderInitiatedControls[\s\S]{0,700}?controlButtons\(/.test(src));
 check("trackDownload 按服务端 live 字段更新本地态",

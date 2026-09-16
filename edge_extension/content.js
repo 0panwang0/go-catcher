@@ -1305,6 +1305,11 @@
   //     这与主界面 index.html 的控制按钮（'⏹ 停止（保存已录）'）一致。
   //   - 点播：运行中「暂停」，暂停后「继续下载」——断点续传在这里是真的。
   // 纯函数、不碰 DOM，renderInitiatedControls 与回归测试共用同一份判据。
+  //
+  // 配色与图标跟内置前端（web/index.html 的 actions()/rowCard()）保持同一套：
+  //   - 主操作（⏸ 暂停 / ⏹ 停止 / ⏯ 继续）一律 primary 蓝底 —— 它们都是"让任务动起来"；
+  //   - ✕ 取消一律 danger 红底（学徒 2026-09-16：取消不用改）；
+  //   - 「继续」用 ⏯ 而不是 ▶：▶ 已被「打开文件 / 播放」占用，同形不同义。
   function controlButtons(live, paused) {
     if (live) {
       return [
@@ -1314,18 +1319,19 @@
     }
     if (paused) {
       return [
-        { ctl: "resume", label: "▶ 继续下载", kind: "primary" },
-        { ctl: "cancel", label: "✕ 取消", kind: "plain" },
+        { ctl: "resume", label: "⏯ 继续下载", kind: "primary" },
+        { ctl: "cancel", label: "✕ 取消", kind: "danger" },
       ];
     }
     return [
-      { ctl: "pause", label: "⏸ 暂停", kind: "plain" },
+      { ctl: "pause", label: "⏸ 暂停", kind: "primary" },
       { ctl: "cancel", label: "✕ 取消", kind: "danger" },
     ];
   }
 
-  // 控制按钮的三种外观。label 全是我们自己的常量、不含页面数据，所以下面拼
+  // 控制按钮的外观。label 全是我们自己的常量、不含页面数据，所以下面拼
   // innerHTML 是安全的（与 settings.html 那个"注册表值不可信"的场景不同）。
+  // plain 只是未知 kind 的兜底：现有按钮都会命中 primary / danger。
   const CTL_STYLE = {
     primary: "border:none;background:#3b82f6;color:#fff;font-weight:600;",
     danger: "border:none;background:#ef4444;color:#fff;font-weight:600;",

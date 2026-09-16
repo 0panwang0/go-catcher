@@ -68,8 +68,8 @@ func TestActionButtonOrderIsUnified(t *testing.T) {
 	const (
 		// 详细模式（按钮带文字）
 		aMainRun    = "'⏸ 暂停','pauseTask("
-		aMainResume = "'▶ 继续下载','resumeTask("
-		aMainRetry  = "'▶ 重试','resumeTask("
+		aMainResume = "'⏯ 继续下载','resumeTask("
+		aMainRetry  = "'↻ 重试','resumeTask("
 		aMainOpen   = "'▶ 打开文件','openFile("
 		aMainStop   = "'⏹ 停止（保存已录）'"
 		aFolder     = "'📂 打开文件夹','openFolder("
@@ -77,7 +77,7 @@ func TestActionButtonOrderIsUnified(t *testing.T) {
 		aRemove     = "'🗑 移除记录','removeTask("
 		// 简略模式（图标按钮）
 		rMainRun    = "'⏸','暂停','pauseTask("
-		rMainResume = "'▶','继续下载','resumeTask("
+		rMainResume = "'⏯','继续下载','resumeTask("
 		rMainRetry  = "'↻','重试','resumeTask("
 		rMainOpen   = "'▶','打开文件','openFile("
 		rMainStop   = "'⏹','停止（保存已录部分）'"
@@ -181,6 +181,98 @@ func TestActionOrderConventionIsDocumented(t *testing.T) {
 	} {
 		if !strings.Contains(page, frag) {
 			t.Errorf("web/index.html 缺少顺序约定的说明片段 %q —— 后来的人会继续逐状态自由发挥", frag)
+		}
+	}
+}
+
+// TestControlButtonColorIsUnified 按钮配色也是统一约定（学徒 2026-09-16 定）。
+//
+//	媒体控制键（▶ 播放 / ⏸ 暂停 / ⏹ 停止 / ⏯ 继续 / ↻ 重试）一律 `primary`（蓝底）——
+//	  它们都是"让任务动起来"，同色才成一组；
+//	`📂 打开文件夹`、`🗑 移除记录` 保持中性描边 —— 它们不改任务状态，只是看一眼磁盘 / 清列表；
+//	`✕ 取消` 保持 `danger` 红。
+//
+// 为什么要有这条回归：同一位置原先各拼各的配色 —— 运行中的 ⏸/⏹ 是 warn（黄底）、
+// 而 ⏯继续 / ↻重试 是 primary（蓝底），于是"运行中"在点播与直播下长得不一样，
+// 已暂停行与已完成行也不是同一族。**只改一处就会把不统一挪个地方出现。**
+func TestControlButtonColorIsUnified(t *testing.T) {
+	page := homePageHTML
+
+	iActs := strings.Index(page, "function actions(t){")
+	iRow := strings.Index(page, "function rowCard(t){")
+	if iActs < 0 || iRow < 0 || iRow <= iActs {
+		t.Fatal("找不到 actions()/rowCard() —— 页面结构变了，本测试的锚点要跟着改")
+	}
+	actionsRegion := page[iActs:iRow]
+	rowRegion := page[iRow:]
+
+	// —— 主操作必须是蓝底 ——
+	cases := []struct {
+		where    string
+		src      string
+		from, to string
+		frags    []string
+	}{
+		{"详细模式·运行中", actionsRegion, "// 下载中 / 排队中", "return b.length",
+			[]string{"btn('primary','⏸ 暂停'", "btn('primary','⏹ 停止'"}},
+		{"详细模式·已暂停", actionsRegion, "} else if (t.paused) {", "} else if (t.error) {",
+			[]string{"btn('primary','⏯ 继续下载'"}},
+		{"详细模式·失败", actionsRegion, "} else if (t.error) {", "// 下载中 / 排队中",
+			[]string{"btn('primary','↻ 重试'"}},
+		{"详细模式·已完成", actionsRegion, "} else if (t.done && !t.error) {", "} else if (t.paused) {",
+			[]string{"btn('primary','▶ 打开文件'"}},
+		{"详细模式·直播终态", actionsRegion, "} else if (t.live &&", "} else if (t.done && !t.error) {",
+			[]string{"btn('primary','▶ 打开文件'", "btn('primary','⏹ 停止（保存已录）'"}},
+
+		{"简略模式·运行中", rowRegion, "acts = (t.live", "const name = esc(fnameOf(t));",
+			[]string{"ibtn('primary','⏸','暂停'", "ibtn('primary','⏹','停止'"}},
+		{"简略模式·已暂停", rowRegion, "} else if (t.paused) {", "} else if (t.error) {",
+			[]string{"ibtn('primary','⏯','继续下载'"}},
+		{"简略模式·失败", rowRegion, "} else if (t.error) {", "acts = (t.live",
+			[]string{"ibtn('primary','↻','重试'"}},
+		{"简略模式·已完成", rowRegion, "} else if (t.done && !t.error) {", "} else if (t.paused) {",
+			[]string{"ibtn('primary','▶','打开文件'"}},
+		{"简略模式·直播终态", rowRegion, "} else if (t.live &&", "} else if (t.done && !t.error) {",
+			[]string{"ibtn('primary','▶','打开文件'", "ibtn('primary','⏹','停止（保存已录部分）'"}},
+	}
+	for _, c := range cases {
+		reg, ok := spanBetween(c.src, c.from, c.to)
+		if !ok {
+			t.Errorf("%s：区间锚点取不到 —— 分支结构变了，测试锚点要跟着改", c.where)
+			continue
+		}
+		for _, frag := range c.frags {
+			if !strings.Contains(reg, frag) {
+				t.Errorf("%s：主操作不是蓝底的 %q —— 媒体控制键必须统一 `primary`", c.where, frag)
+			}
+		}
+	}
+
+	// —— 非主操作：中性 / 红 ——
+	for _, c := range []struct{ where, src, frag string }{
+		{"详细模式·打开文件夹保持中性", actionsRegion, "btn('ghost','📂 打开文件夹'"},
+		{"详细模式·移除记录保持中性", actionsRegion, "btn('ghost','🗑 移除记录'"},
+		{"详细模式·取消保持红", actionsRegion, "btn('danger','✕ 取消'"},
+		{"简略模式·打开文件夹保持中性", rowRegion, "ibtn('','📂','打开文件夹'"},
+		{"简略模式·移除记录保持中性", rowRegion, "ibtn('','🗑','移除记录'"},
+		{"简略模式·取消保持红", rowRegion, "ibtn('danger','✕','取消（删除文件）'"},
+	} {
+		if !strings.Contains(c.src, c.frag) {
+			t.Errorf("%s：找不到 %q —— 配色约定被改动了（学徒定：这两类不动）", c.where, c.frag)
+		}
+	}
+
+	// —— 反向：这几样不该再回来 ——
+	for _, c := range []struct{ why, src, frag string }{
+		{"黄底按钮已废弃（主操作改蓝底）", actionsRegion, "btn('warn'"},
+		{"`button.warn` 样式已删，定义不得复活", page, "button.warn{"},
+		{"「继续」不得再用 ▶ —— 会和「打开文件」同形", rowRegion, "ibtn('primary','▶','继续下载'"},
+		{"详细模式「继续」同样不得用 ▶", actionsRegion, "'▶ 继续下载'"},
+		{"详细模式「重试」不得用 ▶ —— 与「打开文件」同形，简略模式用的是 ↻", actionsRegion, "'▶ 重试'"},
+		{"简略模式「打开文件」不得退回中性（学徒定：播放要蓝底）", rowRegion, "ibtn('','▶','打开文件'"},
+	} {
+		if strings.Contains(c.src, c.frag) {
+			t.Errorf("发现 %q —— %s", c.frag, c.why)
 		}
 	}
 }
