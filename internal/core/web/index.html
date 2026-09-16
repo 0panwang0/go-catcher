@@ -369,7 +369,14 @@ function stageRow(t){
   return s ? '<div style="margin-bottom:6px">'+s+'</div>' : '';
 }
 
-// 每个任务按状态给出可用操作
+// 每个任务按状态给出可用操作。
+//
+// ⚠️ 按钮顺序是**统一约定**，不要逐状态自由发挥 —— 简略模式的 rowCard() 必须给出同一套顺序：
+//   ① 主操作（运行中 ⏸ / 直播运行中 ⏹；已暂停 ▶继续；失败 ▶重试；已完成 ▶打开文件）
+//   ② 📂 打开文件夹
+//   ③ ✕ 取消 / 🗑 移除记录
+// 两处各拼各的会露馅：📂 曾在"运行中"排第 1、在"已完成"排第 2，图标列横向漂移、
+// 右对齐也救不回来（2026-09-16 学徒截图抓到）。新增状态时照这个顺序往 b 里塞。
 function actions(t){
   const id = JSON.stringify(t.id);
   const op = t.openPath ? JSON.stringify(t.openPath) : null; // 真实存在的文件（成品或 .part 半成品）
@@ -393,20 +400,20 @@ function actions(t){
     if (sd) b.push(btn('ghost','📂 打开文件夹','openFolder('+id+')'));
     b.push(btn('ghost','🗑 移除记录','removeTask('+id+')'));
   } else if (t.paused) {
-    if (sd) b.push(btn('ghost','📂 打开文件夹','openFolder('+id+')'));
     b.push(btn('primary','▶ 继续下载','resumeTask('+id+')'));
+    if (sd) b.push(btn('ghost','📂 打开文件夹','openFolder('+id+')'));
     b.push(btn('danger','✕ 取消','cancelTask('+id+')'));
   } else if (t.error) {
     b.push(btn('primary','▶ 重试','resumeTask('+id+')'));
-    b.push(btn('danger','✕ 取消','cancelTask('+id+')'));
     if (sd) b.push(btn('ghost','📂 打开文件夹','openFolder('+id+')'));
+    b.push(btn('danger','✕ 取消','cancelTask('+id+')'));
     b.push(btn('ghost','🗑 移除记录','removeTask('+id+')'));
   } else {
     // 下载中 / 排队中（随时可打开文件夹查看 .part 半成品）
-    if (sd) b.push(btn('ghost','📂 打开文件夹','openFolder('+id+')'));
     b.push(t.live
       ? btn('warn','⏹ 停止','stopTask('+id+')')
       : btn('warn','⏸ 暂停','pauseTask('+id+')'));
+    if (sd) b.push(btn('ghost','📂 打开文件夹','openFolder('+id+')'));
     b.push(btn('danger','✕ 取消','cancelTask('+id+')'));
   }
   return b.length ? '<div class="acts">'+b.join('')+'</div>' : '';
@@ -433,6 +440,9 @@ function rowCard(t){
   const isRun = t.running && !t.done && !t.error && !t.canceled;
   let pctTxt = '';
   if (isRun || t.paused) pctTxt = (t.stage==='解析视频源'||t.stage==='下载直链文件中') ? '…' : (t.live ? recordedText(t) : pct.toFixed(1)+'%');
+  // ⚠️ 顺序必须与详细模式的 actions() 完全一致（约定写在其函数头注释里）：
+  //    ① 主操作 ② 📂 打开文件夹 ③ ✕ 取消 / 🗑 移除记录。
+  //    两处是同一条规则的两份实现，改一处必须同步改另一处，否则图标列又开始漂移。
   let acts = '';
   if (t.canceled) {
     acts = ibtn('','🗑','移除记录','removeTask('+id+')');
@@ -448,19 +458,19 @@ function rowCard(t){
          + (sd ? ibtn('','📂','打开文件夹','openFolder('+id+')') : '')
          + ibtn('','🗑','移除记录','removeTask('+id+')');
   } else if (t.paused) {
-    acts = (sd ? ibtn('','📂','打开文件夹','openFolder('+id+')') : '')
-         + ibtn('primary','▶','继续下载','resumeTask('+id+')')
+    acts = ibtn('primary','▶','继续下载','resumeTask('+id+')')
+         + (sd ? ibtn('','📂','打开文件夹','openFolder('+id+')') : '')
          + ibtn('danger','✕','取消（删除文件）','cancelTask('+id+')');
   } else if (t.error) {
-    acts = (sd ? ibtn('','📂','打开文件夹','openFolder('+id+')') : '')
-         + ibtn('primary','↻','重试','resumeTask('+id+')')
+    acts = ibtn('primary','↻','重试','resumeTask('+id+')')
+         + (sd ? ibtn('','📂','打开文件夹','openFolder('+id+')') : '')
          + ibtn('danger','✕','取消（删除文件）','cancelTask('+id+')')
          + ibtn('','🗑','移除记录','removeTask('+id+')');
   } else {
-    acts = (sd ? ibtn('','📂','打开文件夹','openFolder('+id+')') : '')
-         + (t.live
+    acts = (t.live
             ? ibtn('','⏹','停止','stopTask('+id+')')
             : ibtn('','⏸','暂停','pauseTask('+id+')'))
+         + (sd ? ibtn('','📂','打开文件夹','openFolder('+id+')') : '')
          + ibtn('danger','✕','取消（删除文件）','cancelTask('+id+')');
   }
   const name = esc(fnameOf(t));
