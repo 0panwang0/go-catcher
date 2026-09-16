@@ -40,8 +40,13 @@ const (
 type NormState interface {
 	// Snapshot 导出全部跨分片状态（tfdt 基准、结束时间、init 信息）为不透明字节
 	Snapshot() []byte
-	// Restore 载入持久化的状态（断点续传；格式自解释，未知/损坏字节静默忽略）
-	Restore(b []byte)
+	// Restore 载入持久化的状态（断点续传），返回是否真的采用了这份状态。
+	//
+	// 版本不符、字节损坏一律整份丢弃并返回 false —— 不猜测、不部分解析。
+	// 返回值是续传能否安全进行的判据：状态丢了而容器又依赖它（fMP4 的 tfdt
+	// 基准），新分片会从头计时、与已录内容重叠，属"成品能播、内容是错的"，
+	// 必须由调用方显式拒绝（见 restoreContainer）。
+	Restore(b []byte) bool
 
 	// Normalize 处理一段写入前的数据（fMP4：init 段补 mehd 占位 + 分片时间戳
 	// 归一化 + 裸 NAL→AVCC）；非本容器数据原样返回（不报错），保证管线不受影响

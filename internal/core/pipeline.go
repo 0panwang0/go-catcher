@@ -268,7 +268,10 @@ func runDiskPipeline(te *taskEntry) {
 		te.mu.Lock()
 		normState := te.st.normState
 		te.mu.Unlock()
-		restoreContainer(job, st.containerID, partPath, normState)
+		if rerr := restoreContainer(job, st.containerID, partPath, normState); rerr != nil {
+			fail(rerr.Error())
+			return
+		}
 	}
 
 	// 4. 下载：直播跟随（循环拉取增量追加）vs 点播（一次性并发）
@@ -576,7 +579,10 @@ func reopenJobForFinalize(te *taskEntry) *dlJob {
 	// 不设就会把已录片数显示成 0。
 	job.setSeg(segDone, segTot)
 	job.setSegFlushed(segDone)
-	restoreContainer(job, containerID, part, normState)
+	// 收尾路径**有意忽略** restoreContainer 的错误：用户要的是把已录内容保住，
+	// 状态不可用只影响时间轴刻度（mehd 回填），不该让他丢掉整份录像。
+	// 续传路径（runDownload）才是必须拒绝的地方。
+	_ = restoreContainer(job, containerID, part, normState)
 	return job
 }
 
@@ -704,8 +710,17 @@ func writeInitSegmentFor(ctx context.Context, job *dlJob, pl *playlistInfo, part
 
 // restoreContainer 断点续传（from>0）时恢复格式相关行为：
 // 优先按持久化的容器 ID 找回条目，旧版本任务回退为从 .part 文件头嗅探；
-// 随后恢复跨分片规范化状态（无持久化字节时从 .part 头部重新解析 init，幂等）。
-func restoreContainer(job *dlJob, containerID, partPath string, normState []byte) {
+// 随后恢复跨分片规范化状态。
+//
+// 返回错误表示「续传不安全」：容器依赖跨分片状态（fMP4 的 tfdt 基准，判据是
+// NewState != nil），而状态没能恢复。此时新分片会从头计时、与已录内容在时间轴上
+// 重叠 —— 产物能播、内容是错的，属本项目头号缺陷形态，所以显式拒绝而不硬跑。
+// 无状态容器（TS 等）恒返回 nil：它们续传本来就不依赖外部状态。
+//
+// 落到"状态不可用"的两种情形：旧版本任务文件里没有状态字节；字节版本不符或损坏
+// （快照版本号见 fmp4.normPersistVersion）。从 .part 重建 fMP4 基准需要扫全文件，
+// 不在本轮范围 —— 让用户重新开始，好过悄悄拼出坏时间轴。
+func restoreContainer(job *dlJob, containerID, partPath string, normState []byte) error {
 	if c := findContainerByID(containerID); c != nil {
 		job.container = c
 		if c.NewState != nil {
@@ -723,13 +738,16 @@ func restoreContainer(job *dlJob, containerID, partPath string, normState []byte
 		}
 	}
 	if job.norm == nil {
-		return
+		return nil // 无状态容器：续传不依赖跨分片状态
 	}
-	if len(normState) > 0 {
-		job.norm.Restore(normState)
-	} else if head, err := readHead(partPath, 64<<10); err == nil && len(head) > 8 {
-		job.norm.Normalize(head)
+	// 空字节、版本不符、损坏都归这一处：Restore 全返回 false。
+	// 不再单列"字节为空"的分支 —— 它与 Restore(nil)=false 等价，
+	// 多一条路径只是多一处可能写错的地方（反向验证抓到过）。
+	if !job.norm.Restore(normState) {
+		return fmt.Errorf("断点续传状态不可用（旧版本任务文件、版本不符或已损坏），" +
+			"继续追加会让新分片与已录内容在时间轴上重叠，请重新开始下载")
 	}
+	return nil
 }
 
 // correctExtName 按容器输出扩展名修正文件名（fMP4 内容绝不能存成 .ts）。

@@ -313,7 +313,9 @@ func (sw *streamWriter) Close() error {
 //  2. 分片下载：全新文件且服务器支持 Range（Content-Range 给出总大小）→ 并发分片
 //  3. 单连接续传：其余情况 → Range 追加（206）/ 全量覆盖（200）/ 丢弃重下（416）
 //
-// 分片模式下 ctx 取消或失败保留 .part 与 .meta，任务恢复后从位图断点继续。
+// 分片模式下 ctx 取消或失败会保留 .part 与 .meta（位图记下已落盘的片），
+// 任务恢复后只重下缺失片。片长固定为 chunkSizeFixed、与并发数解耦，
+// 否则片数恒等于并发数、中断时位图上一个 true 都来不及有（详见该常量说明）。
 func (j *dlJob) downloadDirect(ctx context.Context, outPath string) error {
 	// 模式 1：分片续传（位图恢复）
 	if m, ok := loadChunkMeta(outPath); ok {
@@ -323,11 +325,13 @@ func (j *dlJob) downloadDirect(ctx context.Context, outPath string) error {
 	// 模式 2：全新下载且服务器支持 Range → 分片下载（小文件不值得分片）
 	if partFileOffset(outPath) == 0 {
 		if total, ok := j.probeRange(ctx); ok && total > minChunkedSize {
-			m := newChunkMeta(total, j.rt.concurrencyNow())
-			if err := saveChunkMeta(outPath, m); err != nil {
-				return err
+			if m, ok := j.newChunkPlan(total); ok {
+				if err := saveChunkMeta(outPath, m); err != nil {
+					return err
+				}
+				return j.downloadChunked(ctx, outPath, m)
 			}
-			return j.downloadChunked(ctx, outPath, m)
+			// 片数超限（total 来自 Content-Range、不可信）：退回单连接，不建位图
 		}
 	}
 
@@ -372,8 +376,22 @@ func (j *dlJob) downloadDirect(ctx context.Context, outPath string) error {
 	}
 }
 
-// minChunkedSize 低于该大小的直链不分片（并发开销不划算）。
+// minChunkedSize 低于该大小的直链不分片（并发与位图文件的开销都不划算）。
 const minChunkedSize = 1 << 20
+
+// chunkSizeFixed 直链分片的目标片长。
+//
+// 刻意**不**按并发数均分（旧实现 size = ceil(total/workers)）：那样片数恒等于并发数
+// （默认 10），十片等长、齐头并进，中断时往往一片都没跑完 —— 位图上一个 true 都
+// 来不及有，注释里承诺的「只下载未完成的分片」等于没做（4GB 下到 50% 中断，一片
+// 未完成，重下 100%）。固定片长让位图粒度与并发解耦：4GB / 8MiB = 512 片，下到
+// 一半中断能真省下约 2GB。片数远多于并发时由 sem 限流，天然支持。
+const chunkSizeFixed = 8 << 20 // 8 MiB
+
+// maxChunkCount 位图允许的最大片数。
+// total 来自 Content-Range（远端字节，不可信），片长固定后片数与 total 成正比 ——
+// 一个离奇的 total 会撑出巨大的位图。8TiB 以内正常可用，超限则退回单连接。
+const maxChunkCount = 1 << 20
 
 // chunkMeta 直链分片下载的断点位图，JSON 持久化在 <part>.meta。
 // Done[i] 标记第 i 片是否已完整落盘；恢复时只重下未完成片。
@@ -385,6 +403,18 @@ type chunkMeta struct {
 
 func chunkMetaPath(partPath string) string { return partPath + ".meta" }
 
+// chunkCount 按片长切分 total 字节得到的片数（向上取整；用除余避免 total+size 溢出）。
+func chunkCount(total, size int64) int64 {
+	if size < 1 {
+		size = chunkSizeFixed
+	}
+	n := total / size
+	if total%size != 0 {
+		n++
+	}
+	return n
+}
+
 func loadChunkMeta(partPath string) (*chunkMeta, bool) {
 	data, err := os.ReadFile(chunkMetaPath(partPath))
 	if err != nil {
@@ -392,6 +422,13 @@ func loadChunkMeta(partPath string) (*chunkMeta, bool) {
 	}
 	var m chunkMeta
 	if json.Unmarshal(data, &m) != nil || m.Total <= 0 || m.Size <= 0 || len(m.Done) == 0 {
+		return nil, false
+	}
+	// 位图必须与片划分自洽：短了会漏下尾部（成品短一截），长了会在末尾请求越界区间
+	// （416 → 判为"内容已变" → 白删重下）。不自洽一律当没有位图 —— 宁可重下，
+	// 也不能按错位图拼出坏文件。
+	want := chunkCount(m.Total, m.Size)
+	if want != int64(len(m.Done)) || want > maxChunkCount {
 		return nil, false
 	}
 	return &m, true
@@ -405,14 +442,132 @@ func saveChunkMeta(partPath string, m *chunkMeta) error {
 	return os.WriteFile(chunkMetaPath(partPath), data, 0644)
 }
 
-// newChunkMeta 按并发数均分文件：每片大小 = ceil(total/workers)。
-func newChunkMeta(total int64, workers int) *chunkMeta {
-	if workers < 1 {
-		workers = 1
+// 位图落盘节流：每完成这么多片、或距上次落盘达到这么久，就写一次盘。
+// 逐片写盘在 512 片的文件上是白烧 IO；太懒又会在中断时丢掉最近的完成片（白下）。
+// 因此「结束」路径（失败/中断）必须显式 Flush 一次 —— 见 downloadChunked。
+const (
+	chunkMetaFlushEvery = 8
+	chunkMetaFlushGap   = time.Second
+)
+
+// chunkMetaStore 位图的并发安全记账 + 节流持久化。
+//
+// 记账时机是硬约束：MarkDone 只能在分片数据**真正落盘之后**调用（downloadRange
+// 成功返回）。先记账后落盘会在中断时留下"位图说完成了、盘上却没有"的空洞 ——
+// 恢复时那片被跳过，成品里就是一段坏数据。
+type chunkMetaStore struct {
+	partPath  string
+	mu        sync.Mutex
+	m         *chunkMeta
+	done      int
+	stale     bool
+	since     int       // 距上次落盘的完成片数
+	flushedAt time.Time // 上次落盘时刻
+}
+
+func newChunkMetaStore(partPath string, m *chunkMeta) *chunkMetaStore {
+	s := &chunkMetaStore{partPath: partPath, m: m, flushedAt: time.Now()}
+	for _, d := range m.Done {
+		if d {
+			s.done++
+		}
 	}
-	size := (total + int64(workers) - 1) / int64(workers)
-	n := int((total + size - 1) / size)
-	return &chunkMeta{Total: total, Size: size, Done: make([]bool, n)}
+	return s
+}
+
+// MarkDone 标记第 idx 片已完成（调用前该片数据必须已落盘），按节流策略落盘。
+// 返回当前完成数与总片数，供进度上报。
+func (s *chunkMetaStore) MarkDone(idx int) (done, total int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if idx < 0 || idx >= len(s.m.Done) || s.m.Done[idx] {
+		return s.done, len(s.m.Done)
+	}
+	s.m.Done[idx] = true
+	s.done++
+	s.since++
+	if s.since >= chunkMetaFlushEvery || time.Since(s.flushedAt) >= chunkMetaFlushGap {
+		s.flushLocked()
+	}
+	return s.done, len(s.m.Done)
+}
+
+// MarkStale 服务器内容已变（HTTP 416）：整份位图失效。
+func (s *chunkMetaStore) MarkStale() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.stale = true
+}
+
+func (s *chunkMetaStore) Stale() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.stale
+}
+
+func (s *chunkMetaStore) Done() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.done
+}
+
+func (s *chunkMetaStore) Total() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.m.Done)
+}
+
+// Pending 尚未完成的分片下标（升序）。
+func (s *chunkMetaStore) Pending() []int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]int, 0, len(s.m.Done)-s.done)
+	for i, d := range s.m.Done {
+		if !d {
+			out = append(out, i)
+		}
+	}
+	return out
+}
+
+// Flush 强制落盘（无未落盘改动时跳过）。
+func (s *chunkMetaStore) Flush() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.flushLocked()
+}
+
+// flushLocked 在持锁状态下写盘。写失败不中断下载：位图丢了只是下次多下几片，
+// 数据本身是对的，不该因此把任务判失败。
+// （诊断输出沿用本文件既有的 fmt.Printf 风格，待统一日志设施时一并收。）
+func (s *chunkMetaStore) flushLocked() {
+	if s.since == 0 {
+		return
+	}
+	s.since = 0
+	s.flushedAt = time.Now()
+	if err := saveChunkMeta(s.partPath, s.m); err != nil {
+		fmt.Printf("[direct] 分片位图落盘失败: %v\n", err)
+	}
+}
+
+// newChunkMeta 按固定片长切分：Size = size（末片可能不足），片数 = ceil(total/size)。
+func newChunkMeta(total, size int64) *chunkMeta {
+	if size < 1 {
+		size = chunkSizeFixed
+	}
+	return &chunkMeta{Total: total, Size: size, Done: make([]bool, chunkCount(total, size))}
+}
+
+// newChunkPlan 为 total 字节的直链规划分片。片数超过 maxChunkCount 时不规划
+// （调用方退回单连接）—— Content-Range 是不可信输入，别让一个离奇的 total
+// 撑出巨大位图。
+func (j *dlJob) newChunkPlan(total int64) (*chunkMeta, bool) {
+	size := j.rt.chunkSizeNow()
+	if chunkCount(total, size) > maxChunkCount {
+		return nil, false
+	}
+	return newChunkMeta(total, size), true
 }
 
 // probeRange 探测服务器是否支持 Range 并取得文件总大小。
@@ -446,8 +601,8 @@ func (j *dlJob) probeRange(ctx context.Context) (int64, bool) {
 var errChunkStale = errors.New("服务器内容已变化（HTTP 416）")
 
 // downloadChunked 并发下载未完成分片：每片独立 Range 请求，WriteAt 按偏移落盘。
-// 失败的分片在片内重试（maxRetriesNow() 次）；整体出错时保留位图供下次续传。
-// 全部完成后删除 .meta（分片状态失效）。
+// 失败的分片在片内重试（maxRetriesNow() 次）；整体出错时把位图落盘后保留，
+// 供下次续传只下缺失片。全部完成后删除 .meta（分片状态失效）。
 func (j *dlJob) downloadChunked(ctx context.Context, outPath string, m *chunkMeta) error {
 	f, err := os.OpenFile(outPath, os.O_RDWR|os.O_CREATE, 0644)
 	if err != nil {
@@ -459,25 +614,15 @@ func (j *dlJob) downloadChunked(ctx context.Context, outPath string, m *chunkMet
 	closeFile := func() { closeOnce.Do(func() { _ = f.Close() }) }
 	defer closeFile()
 
+	store := newChunkMetaStore(outPath, m)
 	total := m.Total
-	var mu sync.Mutex
-	stale := false
-	done := 0
-	for _, d := range m.Done {
-		if d {
-			done++
-		}
-	}
 	if j.progress != nil {
-		j.progress("下载直链文件中", int64(done), int64(len(m.Done)))
+		j.progress("下载直链文件中", int64(store.Done()), int64(store.Total()))
 	}
 
 	var wg sync.WaitGroup
 	sem := make(chan struct{}, j.rt.concurrencyNow())
-	for i, d := range m.Done {
-		if d {
-			continue
-		}
+	for _, idx := range store.Pending() {
 		wg.Add(1)
 		go func(idx int) {
 			defer wg.Done()
@@ -489,26 +634,23 @@ func (j *dlJob) downloadChunked(ctx context.Context, outPath string, m *chunkMet
 				end = total - 1
 			}
 			if err := j.downloadRange(ctx, f, start, end); err != nil {
-				mu.Lock()
 				if errors.Is(err, errChunkStale) {
-					stale = true
+					store.MarkStale()
 				}
 				fmt.Printf("[direct] 分片 %d-%d 失败: %v\n", start, end, err)
-				mu.Unlock()
 				return
 			}
-			mu.Lock()
-			m.Done[idx] = true
-			done++
+			// 数据已落盘（downloadRange 用 WriteAt 直写，返回即已交给内核），
+			// 这时才允许记账 —— 反过来会留下"位图说完成了、盘上却是空洞"的假状态。
+			done, tot := store.MarkDone(idx)
 			if j.progress != nil {
-				j.progress("下载直链文件中", int64(done), int64(len(m.Done)))
+				j.progress("下载直链文件中", int64(done), int64(tot))
 			}
-			mu.Unlock()
-		}(i)
+		}(idx)
 	}
 	wg.Wait()
 
-	if stale {
+	if store.Stale() {
 		// 服务器内容已变：先关句柄（Windows 上打开中的文件删不掉），再丢弃 part/meta，
 		// 下次任务全量重下
 		closeFile()
@@ -516,11 +658,11 @@ func (j *dlJob) downloadChunked(ctx context.Context, outPath string, m *chunkMet
 		os.Remove(chunkMetaPath(outPath))
 		return errChunkStale
 	}
-	for _, d := range m.Done {
-		if !d {
-			// 有分片失败：保留 .part/.meta，任务恢复后续传
-			return fmt.Errorf("分片下载未完成")
-		}
+	if store.Done() != store.Total() {
+		// 有分片失败/被取消：位图必须落盘再退出，否则本次已完成的片下次白下一遍
+		// （这正是「中断即全量重下」的根因）。
+		store.Flush()
+		return fmt.Errorf("分片下载未完成")
 	}
 	os.Remove(chunkMetaPath(outPath))
 	return nil

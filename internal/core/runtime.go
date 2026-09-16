@@ -79,7 +79,8 @@ type Runtime struct {
 	systemProxyAddrFn func() string
 
 	// ---- /probe SSRF 防护的测试开关（原 probe.go 包级变量）----
-	// 单测的上游是 httptest 起的 127.0.0.1 服务，需放行本机地址；生产恒为 false。
+	// 单测的上游是 httptest 起的 127.0.0.1 服务，需放行环回地址；生产恒为 false。
+	// 只放行环回，不放行私网/链路本地/元数据地址（见 probe.go 的说明）。
 	probeAllowLocal bool
 
 	// ---- CLI / 引擎运行参数（原 cli.go 包级变量）----
@@ -92,6 +93,11 @@ type Runtime struct {
 	// ---- 直播跟随轮询参数（原 download.go 包级变量，测试可调短）----
 	livePollInterval  time.Duration
 	liveMaxEmptyPolls int
+
+	// ---- 直链分片参数 ----
+	// chunkSizeBytes 目标片长；0 = 用 chunkSizeFixed（生产值）。
+	// 仅供测试调小以覆盖多片/续传路径，未暴露到 /config。
+	chunkSizeBytes int64
 }
 
 // newRuntime 创建一份带默认值的运行时。Engine 与 CLI 各持一份，互不共享。
@@ -108,6 +114,7 @@ func newRuntime() *Runtime {
 		bindAddr:          "127.0.0.1",
 		livePollInterval:  3 * time.Second,
 		liveMaxEmptyPolls: 25,
+		chunkSizeBytes:    chunkSizeFixed,
 	}
 	r.systemProxyAddrFn = platform.RealSystemProxyAddr
 	// 原包级 init()：热路径原子变量的默认值

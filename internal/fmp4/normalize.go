@@ -49,9 +49,21 @@ func NewState() *normState {
 	}
 }
 
+// normPersistVersion 快照格式版本。
+//
+// 快照里存的是**回填位置**（init 段 mehd/mvhd 的字节偏移）与各轨 tfdt 基准，
+// 一旦按错位的结构解读，写出的成品会"能播但时间轴/时长是坏的"——正是本项目
+// 反复出现的头号缺陷形态。所以版本不认识就整份丢弃，不接受"尽力解析"。
+//
+// 副作用如实记：升级后**旧的未完成任务**其快照没有 v 字段（V=0）会被拒，
+// 该任务续传时基准与回填位置重算，已录部分与新分段之间可能出现时间轴跳变。
+// 这个代价比静默按错偏移回填小，且只影响跨越格式变更的在途任务。
+const normPersistVersion = 1
+
 // normPersist snapshot/restore 的持久化字节格式（JSON）：全部跨分片状态。
 // Init 字段复用 fmp4InitInfo.persist() 的字节。
 type normPersist struct {
+	V        int               `json:"v"`                  // 格式版本，不匹配即整份丢弃
 	Baseline map[string]uint64 `json:"baseline,omitempty"` // trackID -> tfdt 基准
 	End      map[string]uint64 `json:"end,omitempty"`      // trackID -> 累计结束时间
 	Init     json.RawMessage   `json:"init,omitempty"`     // init 段解析结果（mehd/mvhd 回填位置）
@@ -67,7 +79,7 @@ func (n *normState) Normalize(data []byte) ([]byte, error) {
 func (n *normState) Snapshot() []byte {
 	n.mu.Lock()
 	defer n.mu.Unlock()
-	p := normPersist{Baseline: n.baselineStrings(), End: n.endStrings()}
+	p := normPersist{V: normPersistVersion, Baseline: n.baselineStrings(), End: n.endStrings()}
 	if n.init != nil {
 		if b, err := json.Marshal(n.init.persist()); err == nil {
 			p.Init = b
@@ -80,14 +92,22 @@ func (n *normState) Snapshot() []byte {
 	return out
 }
 
-// Restore 载入持久化的全部状态（断点续传）；未知/损坏字节静默忽略。
-func (n *normState) Restore(b []byte) {
+// Restore 载入持久化的全部状态（断点续传），返回是否采用了这份状态。
+//
+// 版本不符（含旧格式的无版本字节）或字节损坏一律整份丢弃并返回 false：
+// 快照里的偏移与基准错了不会立刻报错，而是写进成品才暴露，宁可让调用方
+// 显式拒绝续传（tfdt 基准丢了会让新分片从头计时、与已录内容重叠），
+// 也不按错结构解析。
+func (n *normState) Restore(b []byte) bool {
 	if len(b) == 0 {
-		return
+		return false
 	}
 	var p normPersist
 	if err := json.Unmarshal(b, &p); err != nil {
-		return
+		return false
+	}
+	if p.V != normPersistVersion {
+		return false
 	}
 	n.mu.Lock()
 	defer n.mu.Unlock()
@@ -112,6 +132,9 @@ func (n *normState) Restore(b []byte) {
 			}
 		}
 	}
+	// 续传真正需要的是 tfdt 基准：只有 init 信息（没有任何分片）的快照，
+	// 拿它续传同样会让新分片从头计时。故判据取 baseline 非空。
+	return len(n.baseline) > 0
 }
 
 // baselineStrings 导出基准（持久化，续传恢复用）。

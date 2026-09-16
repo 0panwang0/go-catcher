@@ -5,11 +5,13 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -194,33 +196,114 @@ func saveRestoreSeg(t *testing.T, n int) {
 	testStd.setDownloadTuning(n, -1)
 }
 
-// TestNewChunkMeta 分片均分与末片边界。
+// saveRestoreChunkSize 临时把直链片长调小（生产是 8MiB，测试文件没那么大）。
+// 片长决定片数，进而决定走不走多片路径 —— 不调小的话小测试文件只会切出 1 片。
+func saveRestoreChunkSize(t *testing.T, n int64) {
+	t.Helper()
+	old := testStd.chunkSizeBytes
+	t.Cleanup(func() { testStd.chunkSizeBytes = old })
+	testStd.chunkSizeBytes = n
+}
+
+// TestNewChunkMeta 固定片长切分与末片边界。
 func TestNewChunkMeta(t *testing.T) {
-	m := newChunkMeta(1000, 4)
+	m := newChunkMeta(1000, 250)
 	if m.Size != 250 || len(m.Done) != 4 {
-		t.Fatalf("1000/4: size=%d n=%d want 250,4", m.Size, len(m.Done))
+		t.Fatalf("1000/250: size=%d n=%d want 250,4", m.Size, len(m.Done))
 	}
-	m2 := newChunkMeta(999, 4) // 末片 249
+	m2 := newChunkMeta(999, 250) // 末片 249
 	if m2.Size != 250 || len(m2.Done) != 4 {
-		t.Fatalf("999/4: size=%d n=%d want 250,4", m2.Size, len(m2.Done))
+		t.Fatalf("999/250: size=%d n=%d want 250,4", m2.Size, len(m2.Done))
 	}
-	m3 := newChunkMeta(10, 3) // ceil(10/3)=4，3 片
+	m3 := newChunkMeta(10, 4) // ceil(10/4)=3
 	if m3.Size != 4 || len(m3.Done) != 3 {
-		t.Fatalf("10/3: size=%d n=%d want 4,3", m3.Size, len(m3.Done))
+		t.Fatalf("10/4: size=%d n=%d want 4,3", m3.Size, len(m3.Done))
 	}
-	m4 := newChunkMeta(100, 1)
-	if m4.Size != 100 || len(m4.Done) != 1 {
-		t.Fatalf("100/1: size=%d n=%d want 100,1", m4.Size, len(m4.Done))
+	m4 := newChunkMeta(1000, 1000) // 整片：不凑第二片
+	if m4.Size != 1000 || len(m4.Done) != 1 {
+		t.Fatalf("1000/1000: size=%d n=%d want 1000,1", m4.Size, len(m4.Done))
+	}
+	m5 := newChunkMeta(1000, 0) // 片长非法 → 退回默认片长
+	if m5.Size != chunkSizeFixed || len(m5.Done) != 1 {
+		t.Fatalf("片长非法应退回默认: size=%d n=%d", m5.Size, len(m5.Done))
+	}
+}
+
+// TestChunkCount 片数计算：向上取整，且不因 total+size 溢出（total 是远端声明值）。
+func TestChunkCount(t *testing.T) {
+	cases := []struct {
+		total, size, want int64
+	}{
+		{1000, 250, 4},
+		{999, 250, 4},
+		{1000, 333, 4}, // 3×333=999 < 1000
+		{1, chunkSizeFixed, 1},
+		{chunkSizeFixed, chunkSizeFixed, 1},
+		{chunkSizeFixed + 1, chunkSizeFixed, 2},
+		{1000, 0, 1}, // 片长非法 → 默认片长
+		// 旧写法 (total+size-1)/size 在这里会溢出成负数
+		{math.MaxInt64, chunkSizeFixed, math.MaxInt64/chunkSizeFixed + 1},
+	}
+	for _, c := range cases {
+		if got := chunkCount(c.total, c.size); got != c.want {
+			t.Errorf("chunkCount(%d, %d)=%d want %d", c.total, c.size, got, c.want)
+		}
+	}
+}
+
+// TestLoadChunkMetaRejectsInconsistent 位图与片划分不自洽时一律当没有位图。
+//
+// 短了会漏下尾部（成品短一截）、长了会在末尾请求越界区间（416 → 白删重下），
+// 两者都比"重下"更糟，所以宁可不认。
+func TestLoadChunkMetaRejectsInconsistent(t *testing.T) {
+	part := filepath.Join(t.TempDir(), "x.mp4.part")
+	cases := []struct {
+		name string
+		meta chunkMeta
+		want bool
+	}{
+		{"自洽", chunkMeta{Total: 1000, Size: 250, Done: make([]bool, 4)}, true},
+		{"长度短了", chunkMeta{Total: 1000, Size: 250, Done: make([]bool, 3)}, false},
+		{"长度长了", chunkMeta{Total: 1000, Size: 250, Done: make([]bool, 5)}, false},
+		{"Total 非正", chunkMeta{Total: 0, Size: 250, Done: make([]bool, 4)}, false},
+		{"Size 非正", chunkMeta{Total: 1000, Size: 0, Done: make([]bool, 4)}, false},
+		{"空位图", chunkMeta{Total: 1000, Size: 250}, false},
+	}
+	for _, c := range cases {
+		if err := saveChunkMeta(part, &c.meta); err != nil {
+			t.Fatalf("saveChunkMeta: %v", err)
+		}
+		_, ok := loadChunkMeta(part)
+		if ok != c.want {
+			t.Errorf("%s: loadChunkMeta ok=%v want %v", c.name, ok, c.want)
+		}
 	}
 }
 
 // TestDownloadDirectChunked 大文件走并发分片：探测 + N 路 Range，文件完整、meta 删除。
 func TestDownloadDirectChunked(t *testing.T) {
-	content := bytes.Repeat([]byte("abcde"), 512*1024) // 2.5MB > 1MB 阈值
-	srv := rangeServer(content)
+	content := bytes.Repeat([]byte("abcde"), 512*1024) // 2.5MB
+	const chunk = 512 << 10                            // 512KiB/片 → 5 片
+	var ranges int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		rng := r.Header.Get("Range")
+		if rng == "bytes=0-0" { // 能力探测
+			w.Header().Set("Content-Range", fmt.Sprintf("bytes 0-0/%d", len(content)))
+			w.WriteHeader(http.StatusPartialContent)
+			w.Write(content[:1])
+			return
+		}
+		var start, end int
+		fmt.Sscanf(rng, "bytes=%d-%d", &start, &end)
+		atomic.AddInt32(&ranges, 1)
+		w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, len(content)))
+		w.WriteHeader(http.StatusPartialContent)
+		w.Write(content[start : end+1])
+	}))
 	defer srv.Close()
 	saveRestoreHTTP(t, srv.Client(), 3)
 	saveRestoreSeg(t, 4)
+	saveRestoreChunkSize(t, chunk)
 
 	dir := t.TempDir()
 	part := filepath.Join(dir, "big.mp4.part")
@@ -235,24 +318,28 @@ func TestDownloadDirectChunked(t *testing.T) {
 	if !bytes.Equal(data, content) {
 		t.Fatalf("分片拼接损坏: len=%d want %d", len(data), len(content))
 	}
+	if got := atomic.LoadInt32(&ranges); got != 5 {
+		t.Fatalf("完整分片请求数=%d want 5（2.5MB / 512KiB）", got)
+	}
 	if _, err := os.Stat(part + ".meta"); !os.IsNotExist(err) {
 		t.Fatal("完成后 .meta 应删除")
 	}
 }
 
-// TestDownloadDirectChunkedResume 位图续传：已完成片跳过，只重下未完成片。
+// TestDownloadDirectChunkedResume 位图续传：已完成的片一个请求都不发。
 func TestDownloadDirectChunkedResume(t *testing.T) {
 	content := bytes.Repeat([]byte("xyz"), 512*1024) // 1.5MB
+	const chunk = 256 << 10                          // 256KiB/片 → 6 片
 	var fullRanges int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		rng := r.Header.Get("Range")
+		if rng == "bytes=0-0" {
+			w.Header().Set("Content-Range", fmt.Sprintf("bytes 0-0/%d", len(content)))
+			w.WriteHeader(http.StatusPartialContent)
+			w.Write(content[:1])
+			return
+		}
 		if strings.HasPrefix(rng, "bytes=") {
-			if rng == "bytes=0-0" {
-				w.Header().Set("Content-Range", fmt.Sprintf("bytes 0-0/%d", len(content)))
-				w.WriteHeader(http.StatusPartialContent)
-				w.Write(content[:1])
-				return
-			}
 			var start, end int
 			fmt.Sscanf(rng, "bytes=%d-%d", &start, &end)
 			atomic.AddInt32(&fullRanges, 1)
@@ -266,11 +353,12 @@ func TestDownloadDirectChunkedResume(t *testing.T) {
 	defer srv.Close()
 	saveRestoreHTTP(t, srv.Client(), 3)
 	saveRestoreSeg(t, 4)
+	saveRestoreChunkSize(t, chunk)
 
 	dir := t.TempDir()
 	part := filepath.Join(dir, "big.mp4.part")
 	total := int64(len(content))
-	m := newChunkMeta(total, 4)
+	m := newChunkMeta(total, chunk)
 	// 预写前 2 片并标记完成，模拟中断后的位图
 	os.WriteFile(part, content[:2*m.Size], 0644)
 	m.Done[0], m.Done[1] = true, true
@@ -286,8 +374,8 @@ func TestDownloadDirectChunkedResume(t *testing.T) {
 	if !bytes.Equal(data, content) {
 		t.Fatalf("续传拼接损坏: len=%d want %d", len(data), len(content))
 	}
-	if got := atomic.LoadInt32(&fullRanges); got != 2 {
-		t.Fatalf("完整分片请求数=%d want 2（只下未完成片）", got)
+	if got := atomic.LoadInt32(&fullRanges); got != 4 {
+		t.Fatalf("完整分片请求数=%d want 4（6 片里前 2 片已完成）", got)
 	}
 	if _, err := os.Stat(part + ".meta"); !os.IsNotExist(err) {
 		t.Fatal("完成后 .meta 应删除")
@@ -364,6 +452,99 @@ func TestDownloadDirectChunk416(t *testing.T) {
 	}
 	if _, merr := os.Stat(part + ".meta"); !os.IsNotExist(merr) {
 		t.Fatal("416 后 .meta 应删除")
+	}
+}
+
+// TestChunkedBitmapSurvivesFailureAndResumes 分片下载中途失败：
+//  1. 位图必须落盘并记下已完成的片（修复前位图只在创建时写过一次，全是 false，
+//     于是"只下载未完成的分片"从未生效 —— 中断即全量重下）；
+//  2. 恢复时只请求缺失片，已完成的片一个请求都不发。
+func TestChunkedBitmapSurvivesFailureAndResumes(t *testing.T) {
+	content := bytes.Repeat([]byte("m"), 5*(256<<10)) // 1.25MB（须 > minChunkedSize 才分片）
+	const chunk = 256 << 10                           // 256KiB/片 → 5 片
+	var (
+		mu       sync.Mutex
+		ranges         = map[int]int{} // 片下标 → 完整分片请求次数
+		failLast int32 = 1
+	)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		rng := r.Header.Get("Range")
+		if rng == "bytes=0-0" {
+			w.Header().Set("Content-Range", fmt.Sprintf("bytes 0-0/%d", len(content)))
+			w.WriteHeader(http.StatusPartialContent)
+			w.Write(content[:1])
+			return
+		}
+		var start, end int
+		fmt.Sscanf(rng, "bytes=%d-%d", &start, &end)
+		idx := start / chunk
+		if idx == 4 && atomic.LoadInt32(&failLast) == 1 {
+			http.Error(w, "boom", http.StatusInternalServerError)
+			return
+		}
+		mu.Lock()
+		ranges[idx]++
+		mu.Unlock()
+		w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, len(content)))
+		w.WriteHeader(http.StatusPartialContent)
+		w.Write(content[start : end+1])
+	}))
+	defer srv.Close()
+	saveRestoreHTTP(t, srv.Client(), 1) // 不重试，失败即返回
+	saveRestoreSeg(t, 1)                // 串行
+	saveRestoreChunkSize(t, chunk)
+
+	dir := t.TempDir()
+	part := filepath.Join(dir, "big.mp4.part")
+	job := &dlJob{rt: testStd, m3u8URL: srv.URL}
+
+	// ① 末片恒 500：整体失败，但位图必须留住已完成的前 4 片
+	if err := job.downloadDirect(context.Background(), part); err == nil {
+		t.Fatal("末片 500 应报错")
+	}
+	m, ok := loadChunkMeta(part)
+	if !ok {
+		t.Fatal("失败后位图必须存在（留给续传用）")
+	}
+	if len(m.Done) != 5 || !m.Done[0] || !m.Done[1] || !m.Done[2] || !m.Done[3] || m.Done[4] {
+		t.Fatalf("位图应精确记录已完成的前 4 片: %v", m.Done)
+	}
+	if fi, err := os.Stat(part); err != nil || fi.Size() != 4*chunk {
+		t.Fatalf("已落盘字节数=%v want %d", fi, 4*chunk)
+	}
+
+	// ② 源站恢复：只应请求缺失的末片
+	atomic.StoreInt32(&failLast, 0)
+	mu.Lock()
+	ranges = map[int]int{}
+	mu.Unlock()
+	if err := job.downloadDirect(context.Background(), part); err != nil {
+		t.Fatalf("续传: %v", err)
+	}
+	data, _ := os.ReadFile(part)
+	if !bytes.Equal(data, content) {
+		t.Fatalf("续传后内容不完整: len=%d want %d", len(data), len(content))
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(ranges) != 1 || ranges[4] == 0 {
+		t.Fatalf("续传应只请求缺失的末片，实际请求了 %v", ranges)
+	}
+	if _, err := os.Stat(part + ".meta"); !os.IsNotExist(err) {
+		t.Fatal("全部完成后 .meta 应删除")
+	}
+}
+
+// TestNewChunkPlanRejectsHugeTotal 片数超限时不规划分片（调用方退回单连接）：
+// total 来自 Content-Range、不可信，别让一个离奇的值撑出巨大位图。
+func TestNewChunkPlanRejectsHugeTotal(t *testing.T) {
+	saveRestoreChunkSize(t, 1) // 1 字节/片 → 片数 = total
+	job := &dlJob{rt: testStd}
+	if _, ok := job.newChunkPlan(maxChunkCount); !ok {
+		t.Fatal("恰好达到上限仍应规划分片")
+	}
+	if _, ok := job.newChunkPlan(maxChunkCount + 1); ok {
+		t.Fatal("超过上限必须放弃分片")
 	}
 }
 

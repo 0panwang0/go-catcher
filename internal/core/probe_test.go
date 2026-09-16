@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"strings"
+	"sync/atomic"
 	"testing"
 )
 
@@ -186,5 +187,98 @@ func TestProbeUpstreamUnavailable(t *testing.T) {
 	testEngine().handleProbe(rec, probeRequest(t, upstream.URL+"/live.m3u8", ""))
 	if rec.Code != http.StatusBadGateway {
 		t.Fatalf("上游不可达应映射 502: status=%d", rec.Code)
+	}
+}
+
+// TestProbeRejectsRedirectToInternal 重定向不能当 SSRF 跳板。
+//
+// 首跳 URL 由 validProbeTarget 校验，但跟随重定向后的目标此前从不过问：
+// 公网 URL 302 到云元数据地址即可读走凭据。逐跳校验是这条的正面防御。
+func TestProbeRejectsRedirectToInternal(t *testing.T) {
+	setupProbeTest(t)
+	targets := []string{
+		"http://169.254.169.254/latest/meta-data/", // 云元数据
+		"http://10.1.2.3/internal.m3u8",            // 私网
+	}
+	for _, dst := range targets {
+		upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			http.Redirect(w, r, dst, http.StatusFound)
+		}))
+		rec := httptest.NewRecorder()
+		testEngine().handleProbe(rec, probeRequest(t, upstream.URL+"/live.m3u8", ""))
+		upstream.Close()
+
+		if rec.Code != http.StatusBadGateway {
+			t.Fatalf("重定向到 %s 应被拒绝（502），实际 status=%d body=%s",
+				dst, rec.Code, rec.Body.String())
+		}
+		if body := rec.Body.String(); !strings.Contains(body, "重定向") {
+			t.Fatalf("错误应指明是重定向被拒: %q", body)
+		}
+	}
+}
+
+// TestProbeFollowsAllowedRedirect 正常的 CDN 重定向必须照旧跟随。
+//
+// 反向约束：逐跳校验若写成"见重定向就拒"，这条会红 —— 那等于把合法跳转一起废掉。
+func TestProbeFollowsAllowedRedirect(t *testing.T) {
+	setupProbeTest(t)
+	final := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("#EXTM3U\n#EXTINF:6,\nseg0.ts\n"))
+	}))
+	defer final.Close()
+	hop := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, final.URL+"/real.m3u8", http.StatusFound)
+	}))
+	defer hop.Close()
+
+	rec := httptest.NewRecorder()
+	testEngine().handleProbe(rec, probeRequest(t, hop.URL+"/live.m3u8", "https://page.example"))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("合法重定向应跟随: status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if body := rec.Body.String(); !strings.Contains(body, "#EXTM3U") {
+		t.Fatalf("应拿到重定向后的内容: %q", body)
+	}
+}
+
+// TestProbeRedirectHopLimit 重定向链过长即拒，不能无限跟下去。
+func TestProbeRedirectHopLimit(t *testing.T) {
+	setupProbeTest(t)
+	var served int32
+	loop := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&served, 1)
+		http.Redirect(w, r, "/loop.m3u8", http.StatusFound) // 指向自己，永不收敛
+	}))
+	defer loop.Close()
+
+	rec := httptest.NewRecorder()
+	testEngine().handleProbe(rec, probeRequest(t, loop.URL+"/loop.m3u8", ""))
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("无限重定向应被拒绝: status=%d", rec.Code)
+	}
+	if n := atomic.LoadInt32(&served); n > probeMaxRedirects {
+		t.Fatalf("跟跳次数 %d 超过上限 %d", n, probeMaxRedirects)
+	}
+}
+
+// TestProbeAllowLocalOnlyLoopsBack 测试开关不得成为"关掉 SSRF 防护"的后门。
+//
+// 它只放行环回地址（单测上游是 httptest），否则上面那条"重定向到元数据地址
+// 必须被拒"的用例会因为开关而假绿。
+func TestProbeAllowLocalOnlyLoopsBack(t *testing.T) {
+	setupProbeTest(t) // 打开 probeAllowLocal
+	if !testStd.validProbeTarget("http://127.0.0.1:9000/x.m3u8") {
+		t.Error("开关应放行环回地址（测试上游就在环回上）")
+	}
+	for _, raw := range []string{
+		"http://169.254.169.254/latest/meta-data/",
+		"http://10.0.0.5/a.m3u8",
+		"http://192.168.1.1/a.m3u8",
+		"http://100.64.0.1/a.m3u8",
+	} {
+		if testStd.validProbeTarget(raw) {
+			t.Errorf("开关不得放行非环回内网地址: %s", raw)
+		}
 	}
 }

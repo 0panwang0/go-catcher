@@ -145,6 +145,14 @@ func defaultConfig() appConfig {
 func (r *Runtime) concurrencyNow() int { return int(r.segConcurrency.Load()) }
 func (r *Runtime) maxRetriesNow() int  { return int(r.retryLimit.Load()) }
 
+// chunkSizeNow 本次直链分片使用的片长（0 视为默认，测试可调小）。
+func (r *Runtime) chunkSizeNow() int64 {
+	if r.chunkSizeBytes > 0 {
+		return r.chunkSizeBytes
+	}
+	return chunkSizeFixed
+}
+
 // setDownloadTuning 写入运行时下载调参。CLI 初始化与 /config 热更新都走这里。
 // conc<=0 表示不改分片并发；retries<0 表示不改重试次数（CLI 未暴露该参数）。
 func (r *Runtime) setDownloadTuning(conc, retries int) {
