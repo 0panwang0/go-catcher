@@ -36,6 +36,9 @@
   let panel = null;
   let activeTaskId = null; // 多任务并发：本次下载的 server 任务 id，轮询用
   let activePaused = false; // 当前任务是否处于暂停态（控制按钮切换用）
+  // 当前任务是否为直播录制。**判据以服务端 taskState.live 为准**（每次轮询用
+  // resp.live 覆盖），启动时先用嗅探结果占位，免得首帧先画成点播的「暂停」。
+  let activeLive = false;
   let analyzing = false;
   let abortController = null;
 
@@ -1006,7 +1009,7 @@
             <div id="initiated-progress-fill" style="width:0%;height:100%;background:#3b82f6;transition:width .2s;"></div>
           </div>
           <div id="initiated-controls" style="margin-top:14px;display:flex;gap:8px;align-items:center;justify-content:flex-end;"></div>
-          <div style="margin-top:8px;font-size:11px;color:#9ca3af;">下载过程不经过浏览器下载栏，可在此暂停/继续或取消。</div>
+          <div id="initiated-hint" style="margin-top:8px;font-size:11px;color:#9ca3af;"></div>
         </div>`
       );
     } else if (state === "completed") {
@@ -1239,6 +1242,10 @@
 
   // 追踪 Go server 下载进度（轮询 /status），把阶段/百分比回写到面板，并按暂停态切换控制按钮
   function trackDownload(source) {
+    // 首帧先用嗅探结果占位（服务端的 live 标记要等第一次轮询才到），否则会先
+    // 闪一下点播的「暂停」按钮 —— 而直播点它就是一条 400。只做单向置位：
+    // 嗅探的 live 是启发式，false 不代表点播，不能反向覆盖。
+    if (source && source.live) activeLive = true;
     const interval = setInterval(async () => {
       try {
         const resp = await chrome.runtime.sendMessage({ type: "queryDownload", taskId: activeTaskId });
@@ -1247,8 +1254,12 @@
         if (state === "inProgress" || state === "paused") {
           const stage = resp.stage || "下载中";
           const pct = typeof resp.pct === "number" ? resp.pct / 100 : 0;
-          if (activePaused !== !!resp.paused) {
+          // 直播标记以服务端 taskState.live 为准：嗅探的 live 只是启发式（看有没有
+          // ENDLIST），任务真正走的是哪条路径只有服务端知道。任一状态变化都重画控件。
+          const live = !!resp.live;
+          if (activePaused !== !!resp.paused || activeLive !== live) {
             activePaused = !!resp.paused;
+            activeLive = live;
             renderInitiatedControls();
           }
           updateInitiatedProgress(pct, stage, resp);
@@ -1285,18 +1296,60 @@
     renderInitiatedControls();
   }
 
-  // 渲染进度面板底部的 暂停/继续 + 取消 控制按钮
+  // controlButtons 决定进度面板底部放哪些控制按钮。
+  //
+  // 直播与点播是两套语义，混用会直接坏掉 —— 服务端 /pause 对直播返回 400
+  // （"直播录制请使用停止：直播流不支持暂停后续录"）：
+  //   - 直播：只有「停止（保存已录）」与「取消」，**没有任何恢复入口**。
+  //     暂停期间的分片已从滑动窗口滚走，接着录只会在产物里留一个时间轴空洞。
+  //     这与主界面 index.html 的控制按钮（'⏹ 停止（保存已录）'）一致。
+  //   - 点播：运行中「暂停」，暂停后「继续下载」——断点续传在这里是真的。
+  // 纯函数、不碰 DOM，renderInitiatedControls 与回归测试共用同一份判据。
+  function controlButtons(live, paused) {
+    if (live) {
+      return [
+        { ctl: "stop", label: "⏹ 停止（保存已录）", kind: "primary" },
+        { ctl: "cancel", label: "✕ 取消", kind: "danger" },
+      ];
+    }
+    if (paused) {
+      return [
+        { ctl: "resume", label: "▶ 继续下载", kind: "primary" },
+        { ctl: "cancel", label: "✕ 取消", kind: "plain" },
+      ];
+    }
+    return [
+      { ctl: "pause", label: "⏸ 暂停", kind: "plain" },
+      { ctl: "cancel", label: "✕ 取消", kind: "danger" },
+    ];
+  }
+
+  // 控制按钮的三种外观。label 全是我们自己的常量、不含页面数据，所以下面拼
+  // innerHTML 是安全的（与 settings.html 那个"注册表值不可信"的场景不同）。
+  const CTL_STYLE = {
+    primary: "border:none;background:#3b82f6;color:#fff;font-weight:600;",
+    danger: "border:none;background:#ef4444;color:#fff;font-weight:600;",
+    plain: "border:1px solid #e5e7eb;background:#fff;color:#374151;",
+  };
+
+  // 渲染底部控制按钮，并同步底部那行说明 —— 说明与按钮必须同源，
+  // 否则会出现"按钮已经是停止、提示还在说可以暂停继续"的错位。
   function renderInitiatedControls() {
     const wrap = panel && panel.querySelector("#initiated-controls");
     if (!wrap) return;
-    if (activePaused) {
-      wrap.innerHTML =
-        '<button data-ctl="resume" style="padding:6px 16px;font-size:13px;border:none;background:#3b82f6;color:#fff;border-radius:5px;cursor:pointer;font-weight:600;">▶ 继续下载</button>' +
-        '<button data-ctl="cancel" style="padding:6px 16px;font-size:13px;border:1px solid #e5e7eb;background:#fff;color:#374151;border-radius:5px;cursor:pointer;">✕ 取消</button>';
-    } else {
-      wrap.innerHTML =
-        '<button data-ctl="pause" style="padding:6px 16px;font-size:13px;border:1px solid #e5e7eb;background:#fff;color:#374151;border-radius:5px;cursor:pointer;">⏸ 暂停</button>' +
-        '<button data-ctl="cancel" style="padding:6px 16px;font-size:13px;border:none;background:#ef4444;color:#fff;border-radius:5px;cursor:pointer;font-weight:600;">✕ 取消</button>';
+    wrap.innerHTML = controlButtons(activeLive, activePaused)
+      .map(
+        (b) =>
+          `<button data-ctl="${b.ctl}" style="padding:6px 16px;font-size:13px;border-radius:5px;cursor:pointer;${
+            CTL_STYLE[b.kind] || CTL_STYLE.plain
+          }">${b.label}</button>`
+      )
+      .join("");
+    const hint = panel.querySelector("#initiated-hint");
+    if (hint) {
+      hint.textContent = activeLive
+        ? "直播只有「停止」：停止后已录部分会保存成文件；要接着录请回直播页重新开始。"
+        : "下载过程不经过浏览器下载栏，可在此暂停/继续或取消。";
     }
     wrap.querySelectorAll("button[data-ctl]").forEach((btn) => {
       btn.addEventListener("click", () => {
@@ -1305,7 +1358,7 @@
     });
   }
 
-  // 向 Go server 发送 暂停/继续/取消（经 background 代理）；立即切换本地按钮态，等 poll 确认
+  // 向 Go server 发送 暂停/继续/停止/取消（经 background 代理）；立即切换本地按钮态，等 poll 确认
   async function sendControl(action) {
     const btn = panel && panel.querySelector(`#initiated-controls button[data-ctl="${action}"]`);
     if (btn) { btn.disabled = true; btn.style.opacity = ".5"; }
@@ -1318,9 +1371,20 @@
         renderInitiatedControls();
         return;
       }
-      // pause → 立即进暂停态（省一次 poll）；resume → 立即回到下载态
+      // 本地立即反馈（省一次 poll 的往返）：
       if (action === "pause") { activePaused = true; renderInitiatedControls(); updateInitiatedProgress(0, "已暂停，点击继续可恢复", {}); }
       else if (action === "resume") { activePaused = false; renderInitiatedControls(); }
+      else if (action === "stop") {
+        // 直播收尾要落盘（校验 + 改名），不是瞬时的。把按钮换成不可点的提示，
+        // 免得用户以为没生效又点一次 —— 后端虽然幂等，但连点会让人怀疑没反应。
+        const wrap = panel && panel.querySelector("#initiated-controls");
+        if (wrap) {
+          wrap.innerHTML =
+            '<button disabled style="padding:6px 16px;font-size:13px;border:none;background:#9ca3af;color:#fff;border-radius:5px;cursor:default;">停止中…</button>';
+        }
+        const hint = panel && panel.querySelector("#initiated-hint");
+        if (hint) hint.textContent = "正在保存已录部分…";
+      }
       else if (action === "cancel") { activePaused = false; renderInitiatedControls(); }
     } catch (e) {
       renderInitiatedControls();
@@ -1460,6 +1524,13 @@
       if (m) return m[1].toUpperCase();
     } catch {}
     return "";
+  }
+
+  // 测试钩子：node 环境下（有 module、无扩展 API）把纯函数挂出去，供
+  // tests/livecontrols.test.js 直接调用。content script 里没有 module，
+  // 整段不执行 —— 对线上行为零影响（不加模块化改造是怕动坏这个 1400 行的闭包）。
+  if (typeof module !== "undefined" && module.exports) {
+    module.exports.__ui = { controlButtons, CTL_STYLE };
   }
 
   if (document.readyState === "loading") {

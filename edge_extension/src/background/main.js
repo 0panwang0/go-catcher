@@ -93,7 +93,8 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     return true;
   }
   if (msg.type === "controlTask") {
-    // 暂停 / 恢复 / 取消 Go server 上某个任务（disk 落盘模式）
+    // 暂停 / 恢复 / 停止 / 取消 Go server 上某个任务（disk 落盘模式）。
+    // 直播的"停"走 stop（结束录制并保存已录部分），点播才是 pause/resume。
     controlTask(msg)
       .then((res) => sendResponse(res))
       .catch((e) => sendResponse({ ok: false, error: String(e) }));

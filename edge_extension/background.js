@@ -678,7 +678,13 @@ var __m3u8catcher = (() => {
         exists: true,
         id: t.id,
         state: t.paused ? "paused" : "inProgress",
-        stage: t.queued ? "\u6392\u961F\u4E2D" : t.paused ? "\u5DF2\u6682\u505C" : t.stage || "\u4E0B\u8F7D\u4E2D",
+        // 直播任务没有"暂停"语义：它的 paused 只可能来自"程序退出时还没录完"，
+        // 那是"中断待处理"而不是"可继续的暂停"。直说后端的 stage，别覆盖成
+        // "已暂停"——面板据此显示「停止」，用户才不会去找不存在的「继续」。
+        stage: t.queued ? "\u6392\u961F\u4E2D" : t.live ? t.stage || "\u5F55\u5236\u4E2D" : t.paused ? "\u5DF2\u6682\u505C" : t.stage || "\u4E0B\u8F7D\u4E2D",
+        // live 是控制按钮分流的判据（content.js 的 activeLive）：服务端说了算，
+        // 嗅探侧的 live 只是启发式。
+        live: !!t.live,
         pct: t.pct || 0,
         segDone: t.segDone || 0,
         segTot: t.segTot || 0,
@@ -693,7 +699,7 @@ var __m3u8catcher = (() => {
   }
   async function controlTask({ taskId, action } = {}) {
     if (!taskId) return { ok: false, error: "\u7F3A\u5C11 taskId" };
-    const actionMap = { pause: "pause", resume: "resume", cancel: "cancel" };
+    const actionMap = { pause: "pause", resume: "resume", stop: "stop", cancel: "cancel" };
     const path = actionMap[action];
     if (!path) return { ok: false, error: `\u672A\u77E5\u52A8\u4F5C: ${action}` };
     const healthy = await pingServer();

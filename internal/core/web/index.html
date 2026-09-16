@@ -74,21 +74,29 @@
   .bar>i.done{background:var(--ok)}
   .bar>i.pause{background:var(--warn)}
   .bar>i.cancel{background:#475569}
-  /* 直播运行中：全宽"传送带"。整条铺满等距流动纹，刻意不表示"录到几成"——
-     直播没有总时长。
-     为什么不是"一段高光扫过整条"：高光进出场时会被条的两端切断，那一帧看着就是
-     "进度条涨到了 x%"（实测截图里就成了 82% 的填充条），又回到原来的误会。
-     铺满的纹没有进/出场，任何一帧都不存在填充边界，也不会整条空白。
-     旧实现 `width:42%` + 渐变跑马（动的是 background-position、块本身不动）
-     则更糟：永远是一条卡在 40% 的硬切口。 */
-  .bar.live{
-    background-color:rgba(59,130,246,.14);
-    background-image:repeating-linear-gradient(90deg,
-      rgba(125,211,252,0) 0,rgba(125,211,252,0) 8px,
-      rgba(125,211,252,.5) 8px,rgba(125,211,252,.5) 16px);
-    background-size:16px 100%;
-    animation:flowstripes 1s linear infinite}
-  @keyframes flowstripes{0%{background-position:0 0}100%{background-position:16px 0}}
+  /* 直播运行中：全宽"双胶囊传送带"。两条彼此分离的圆头光条，一长一短、一快一慢，
+     各自滚出画面再从另一侧进来，线性无缝循环。刻意不表示"录到几成"——直播没有总时长。
+     为什么这样不会被读成进度条：进度条是"左端贴死、右端是推进边界"的实心块，右端
+     永远在往右长；这里两端都可以是空的，任何一帧都找不到一个"正在推进的边界"。
+     旧实现（等距流动纹）的问题不是会被误读，而是丑：硬边 + 16px 方块在 10px 高的条上
+     就是一排脏虚线。 */
+  .bar.live{background-color:#0b1220}
+  .bar.live::before,.bar.live::after{
+    content:'';position:absolute;top:2px;bottom:2px;border-radius:99px}
+  /* 长条 · 快（2.2s 走完全程） */
+  .bar.live::before{width:30%;
+    background:linear-gradient(90deg,rgba(125,211,252,.34),rgba(125,211,252,.60));
+    animation:rollLong 2.2s linear infinite;
+    animation-delay:var(--ad,0s)}
+  /* 短条 · 慢（3.6s，比长条慢一倍多）；相位错开半程，免得与长条并肩同步。
+     注意顺序：animation 简写会把 animation-delay 重置为 0，必须写在它后面。 */
+  .bar.live::after{width:13%;
+    background:linear-gradient(90deg,rgba(186,230,253,.95),rgba(125,211,252,.72));
+    animation:rollShort 3.6s linear infinite;
+    animation-delay:calc(var(--ad,0s) - 2s)}
+  /* 出画起点正好是自身宽度：一圈结束时整条恰好在画外，回绕不跳变 */
+  @keyframes rollLong{0%{left:-30%}100%{left:100%}}
+  @keyframes rollShort{0%{left:-13%}100%{left:100%}}
   .acts{display:flex;gap:8px;margin-top:13px;flex-wrap:wrap}
   button{background:#3b82f6;color:#fff;border:none;padding:7px 13px;border-radius:9px;font-size:12.5px;cursor:pointer;transition:filter .15s}
   button:hover{filter:brightness(1.15)}
@@ -133,13 +141,20 @@
   .ibtn.primary:hover{filter:brightness(1.15)}
   .rowstrip{position:absolute;left:0;bottom:0;height:3px;width:100%;background:#0b1220;overflow:hidden}
   .rowstrip i{display:block;height:100%;background:linear-gradient(90deg,#3b82f6,#22c55e);transition:width .3s}
-  .rowstrip.live{
-    background-color:rgba(59,130,246,.14);
-    background-image:repeating-linear-gradient(90deg,
-      rgba(125,211,252,0) 0,rgba(125,211,252,0) 4px,
-      rgba(125,211,252,.5) 4px,rgba(125,211,252,.5) 8px);
-    background-size:8px 100%;
-    animation:flowstripes 1s linear infinite}
+  /* 简略行：同一套双胶囊、同一组参数（周期与错相都跟卡片一致，同一时刻两处
+     位置才对得上）。3px 高度上两条只剩两根短线，长短与快慢仍然看得出来。
+     底色/裁剪/贴底都由上面的 .rowstrip 基类给，这里只补伪元素。
+     ⚠️ 这里**绝不能写 position**：.rowstrip 自带 position:absolute，
+     覆写成 relative 会让它退回文档流、变成行内 flex 项、把文件名整段挤掉
+     （伪元素的定位祖先靠基类的 absolute 就够）。 */
+  .rowstrip.live::before,.rowstrip.live::after{
+    content:'';position:absolute;top:0;bottom:0;border-radius:99px}
+  .rowstrip.live::before{width:30%;background:rgba(125,211,252,.50);
+    animation:rollLong 2.2s linear infinite;
+    animation-delay:var(--ad,0s)}
+  .rowstrip.live::after{width:13%;background:rgba(186,230,253,.85);
+    animation:rollShort 3.6s linear infinite;
+    animation-delay:calc(var(--ad,0s) - 2s)}
 </style>
 </head>
 <body>
@@ -296,6 +311,15 @@ function liveTitle(t){
   return '已录 '+recordedText(t);
 }
 
+// bandPhase 给活性带的动画一个与墙钟对齐的负延迟。
+// 列表每 900ms 会因 pct/时长变化整表重建 DOM，CSS 动画跟着重启 —— 等距流动纹时
+// 看不出来（周期对齐），换成有形状的胶囊后就会明显地"每次从左边重新开始"。
+// 按当前时刻对周期取模作为负延迟，等于说"动画已经跑了这么久"，重建后相位接得上。
+// 周期取两条的最小公倍数 lcm(2200,3600)=39600ms，长条与短条能同时接续。
+// 内联在宿主元素上的 --ad 会被伪元素读到（自定义属性可继承）。
+var BAND_CYCLE_MS = 39600;
+function bandPhase(){ return '--ad:-'+(Date.now()%BAND_CYCLE_MS)+'ms'; }
+
 function card(t){
   const pct = Math.max(0, Math.min(100, t.pct||0));
   let barCls='';
@@ -331,8 +355,9 @@ function card(t){
         ? '<div class="metric"><span class="big">'+esc(liveTitle(t))+'</span><span class="side">'+esc(seg)+'</span></div>'
         : '<div class="pctline"><span>'+esc(pctTxt)+'</span><span style="color:var(--muted)">'+esc(seg)+'</span></div>')
     + (barCls==='flow'
-        // 直播运行中：整条自带流动纹，不需要内层填充元素（也刻意不给宽度）
-        ? '<div class="bar live"></div>'
+        // 直播运行中：两条胶囊由 CSS 伪元素画（::before 长条 / ::after 短条），
+        // 不需要内层填充元素（也刻意不给宽度）。内联的 --ad 是墙钟相位。
+        ? '<div class="bar live" style="'+bandPhase()+'"></div>'
         : '<div class="bar"><i class="'+barCls+'" style="width:'+((t.stage==='解析视频源'||(t.done&&!t.error))?100:(t.live?100:pct))+'%"></i></div>')
     + actions(t)
     + '</div>';
@@ -439,15 +464,17 @@ function rowCard(t){
          + ibtn('danger','✕','取消（删除文件）','cancelTask('+id+')');
   }
   const name = esc(fnameOf(t));
+  // 直播：两条胶囊由伪元素画，宿主只需墙钟相位；点播：内层按百分比填充
+  // （少一层空元素也少一处写错宽度的机会）
+  const strip = t.live
+    ? '<span class="rowstrip live" style="'+bandPhase()+'"></span>'
+    : '<span class="rowstrip"><i style="width:'+pct+'%"></i></span>';
   return '<div class="row'+(isRun?' run':'')+'" data-id="'+esc(t.id)+'">'
     + badge(t)
     + '<div class="rowname"><span>'+name+'</span></div>'
     + (pctTxt ? '<span class="rowpct">'+pctTxt+'</span>' : '')
     + '<span class="rowacts">'+acts+'</span>'
-    + (isRun
-        // 直播：整条自带流动纹；点播：内层按百分比填充（少一层空元素也少一处写错宽度的机会）
-        ? '<span class="rowstrip'+(t.live?' live':'')+'">'+(t.live?'':'<i style="width:'+pct+'%"></i>')+'</span>'
-        : '')
+    + (isRun ? strip : '')
     + '</div>';
 }
 // —— 名称滚动：放不下才滚 ——

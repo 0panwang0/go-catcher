@@ -59,12 +59,33 @@ func TestLiveUIOffersStopNotResume(t *testing.T) {
 // `.bar>i.indet` 写死 width:42%，只让内部渐变来回跑（动的是 background-position，
 // 色块本身不动），于是永远像一条卡在 40% 的坏进度条。直播本来就没有总时长，
 // 套"进度条"这个隐喻本身就是错的：运行中应当画全宽活性带，终态画全宽实色条。
+//
+// 学徒 2026-09-16 追加：第一版活性带用"铺满的等距硬边流动纹"解决"不能像进度条"，
+// 但形态本身丑（10px 高的条上就是一排脏虚线）。指定形态改为两条圆头胶囊 ——
+// 一长一短、一快一慢、各自轮回，相位错开半程。判据不变：任何一帧都不能出现
+// "左端贴死、右端是推进边界"的实心块，且两端都可以是空的。
+// 卡片的 ::before/::after 与简略行的 .rowstrip.live 必须同机制同参数，
+// 否则同一时刻两处位置对不上。
 func TestLiveUIRendersNoFakeProgress(t *testing.T) {
 	page := homePageHTML
 
 	mustHave := []struct{ frag, why string }{
 		{".bar.live", "直播运行中缺少活性带"},
-		{"flowstripes", "活性带没有流动动画，看着像一条死掉的空条"},
+		// 学徒 2026-09-16 指定的形态：两条圆头胶囊，一长一短、一快一慢，各自轮回。
+		// 旧实现是"硬边等距流动纹"，在 10px 高的条上就是一排脏虚线。
+		{".bar.live::before", "卡片活性带缺少长胶囊（::before）"},
+		{".bar.live::after", "卡片活性带缺少短胶囊（::after）"},
+		{"@keyframes rollLong", "缺少长胶囊的轮回动画"},
+		{"@keyframes rollShort", "缺少短胶囊的轮回动画"},
+		{"animation:rollLong 2.2s linear infinite", "长胶囊的周期变了（越长越快是这套形态的关键）"},
+		{"animation:rollShort 3.6s linear infinite", "短胶囊的周期变了（必须比长条慢，才有错落感）"},
+		{"border-radius:99px", "胶囊不是圆头（两端没做圆角）"},
+		// 简略行必须与卡片同机制、同参数：同一时刻两处位置才对得上
+		{".rowstrip.live::before", "简略行的活性带没有跟卡片同机制（伪元素缺失）"},
+		{".rowstrip.live::after", "简略行缺少短胶囊"},
+		// 墙钟相位：列表每 900ms 整表重建，动画会重启，不接续就是"每次从左边重来"
+		{"function bandPhase()", "缺少墙钟相位函数：列表重建后胶囊每次从零开始"},
+		{"var BAND_CYCLE_MS = 39600", "相位周期不是两条胶囊周期的最小公倍数，长/短条不会同时接续"},
 		{"<div class=\"metric\">", "直播卡片缺少单行指标行（左「已录时长」右「片数」）"},
 		{"function liveTitle(t)", "缺少直播指标文案函数"},
 		{"function stageRow(t)", "stageText 可能返回空串，空行会留出多余间距"},
@@ -83,6 +104,12 @@ func TestLiveUIRendersNoFakeProgress(t *testing.T) {
 		{".rowstrip i.indet", "简略模式仍在用 42% 定宽的假进度条"},
 		{".indet{width:42%", "还有写死 42% 宽度的假进度条样式"},
 		{"keyframes indet", "indet 动画已无人使用（只让渐变跑、色块不动的假动效）"},
+		{"keyframes flowstripes", "旧的等距硬边流动纹回来了（10px 高的条上就是一排脏虚线）"},
+		{"background-size:16px 100%", "卡片活性带回退成等距重复纹"},
+		{"background-size:8px 100%", "简略行活性带回退成等距重复纹"},
+		// 简略行的贴底定位：一旦在这里覆写 position，细条会退回文档流、
+		// 变成行内 flex 项，把文件名整段挤掉（09-16 学徒截图抓到过）。
+		{".rowstrip.live{position:", "简略行活性带覆写了 position，会把文件名挤掉"},
 		{"录制直播中 · 已录 ", "直播录制中的状态行又把时长/片数说了一遍（指标行已经说过）"},
 		{"已录制 '+t.segDone+' 个分片", "旧的重复片数文案回来了"},
 	}

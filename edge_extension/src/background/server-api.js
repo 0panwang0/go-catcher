@@ -225,7 +225,15 @@ export async function queryDownload(msg) {
       exists: true,
       id: t.id,
       state: t.paused ? "paused" : "inProgress",
-      stage: t.queued ? "排队中" : (t.paused ? "已暂停" : (t.stage || "下载中")),
+      // 直播任务没有"暂停"语义：它的 paused 只可能来自"程序退出时还没录完"，
+      // 那是"中断待处理"而不是"可继续的暂停"。直说后端的 stage，别覆盖成
+      // "已暂停"——面板据此显示「停止」，用户才不会去找不存在的「继续」。
+      stage: t.queued
+        ? "排队中"
+        : (t.live ? (t.stage || "录制中") : (t.paused ? "已暂停" : (t.stage || "下载中"))),
+      // live 是控制按钮分流的判据（content.js 的 activeLive）：服务端说了算，
+      // 嗅探侧的 live 只是启发式。
+      live: !!t.live,
       pct: t.pct || 0,
       segDone: t.segDone || 0,
       segTot: t.segTot || 0,
@@ -239,11 +247,16 @@ export async function queryDownload(msg) {
   }
 }
 
-// 对 Go server 上某任务执行控制动作：pause / resume / cancel
+// 对 Go server 上某任务执行控制动作：pause / resume / stop / cancel
 // action 直接作为 URL 路径段，id 作为查询参数（与 server 路由一致）
+//
+// stop 与 pause 的分工由服务端把关（它才是唯一权威）：
+//   - /stop  只对直播有效（结束录制并把已录部分收尾成正式文件）
+//   - /pause 对直播返回 400，/resume 同理 —— 直播没有断点可续
+// 所以扩展侧不能凭"界面看起来该给暂停"就发 pause，得先看 taskState.live。
 export async function controlTask({ taskId, action } = {}) {
   if (!taskId) return { ok: false, error: "缺少 taskId" };
-  const actionMap = { pause: "pause", resume: "resume", cancel: "cancel" };
+  const actionMap = { pause: "pause", resume: "resume", stop: "stop", cancel: "cancel" };
   const path = actionMap[action];
   if (!path) return { ok: false, error: `未知动作: ${action}` };
 
