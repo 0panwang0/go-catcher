@@ -15,13 +15,17 @@ package fmp4
 
 import (
 	"encoding/binary"
-	"fmt"
 	"math"
 	"os"
 	"strconv"
 )
 
 // fmp4InitInfo init 段解析结果：电影/轨道 timescale 与 mehd/mvhd 可写位置。
+//
+// ⚠️ mehdOff / mvhdOff 的"无"哨兵是 **-1，不是零值**：0 是合法偏移（box 就在文件
+// 开头）。所以这个结构体**不能靠 var info fmp4InitInfo 得到可用零值**，必须经
+// prepareInit（或 restore）构造——它俩都显式写 -1。手工构造时漏给 -1 的后果不是
+// 编译错误，而是回填时对一个不存在的位置做校验并打一堆 WARN。
 type fmp4InitInfo struct {
 	movieTS    uint32            // mvhd timescale（mehd duration 的单位）
 	trackTS    map[uint32]uint32 // trackID -> mdhd timescale
@@ -518,9 +522,9 @@ func backfillDurations(path string, info *fmp4InitInfo, n *normState) error {
 	defer f.Close()
 	if info.mehdOff >= 0 {
 		if !boxTypeAt(f, info.mehdOff, "mehd") {
-			fmt.Printf("[disk] WARN: mehd 回填位置校验失败（偏移 %d），跳过\n", info.mehdOff)
+			n.logDiagnostic("[disk] WARN: mehd 回填位置校验失败（偏移 %d），跳过", info.mehdOff)
 		} else if sz, ok := boxDeclaredSize(f, info.mehdOff); !ok || !boxFitsWrite(sz, 12, durationWidth(info.mehdWide)) {
-			fmt.Printf("[disk] WARN: mehd 声明长度装不下 duration 字段（偏移 %d），跳过\n", info.mehdOff)
+			n.logDiagnostic("[disk] WARN: mehd 声明长度装不下 duration 字段（偏移 %d），跳过", info.mehdOff)
 		} else if err := writeDuration(f, info.mehdOff+12, dur, info.mehdWide); err != nil {
 			return err
 		}
@@ -534,9 +538,9 @@ func backfillDurations(path string, info *fmp4InitInfo, n *normState) error {
 			off += 16 // v0：verflags(4)+creation(4)+modification(4)+timescale(4)
 		}
 		if !boxTypeAt(f, info.mvhdOff, "mvhd") {
-			fmt.Printf("[disk] WARN: mvhd 回填位置校验失败（偏移 %d），跳过\n", info.mvhdOff)
+			n.logDiagnostic("[disk] WARN: mvhd 回填位置校验失败（偏移 %d），跳过", info.mvhdOff)
 		} else if sz, ok := boxDeclaredSize(f, info.mvhdOff); !ok || !boxFitsWrite(sz, off-info.mvhdOff, durationWidth(info.mvhdWide)) {
-			fmt.Printf("[disk] WARN: mvhd 声明长度装不下 duration 字段（偏移 %d），跳过\n", info.mvhdOff)
+			n.logDiagnostic("[disk] WARN: mvhd 声明长度装不下 duration 字段（偏移 %d），跳过", info.mvhdOff)
 		} else if err := writeDuration(f, off, dur, info.mvhdWide); err != nil {
 			return err
 		}

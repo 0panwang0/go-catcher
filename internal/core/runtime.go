@@ -17,6 +17,8 @@
 package core
 
 import (
+	"crypto/rand"
+	"io"
 	"net/http"
 	"sync"
 	"sync/atomic"
@@ -33,6 +35,11 @@ type Runtime struct {
 	// ---- 访问控制 ----
 	// embedKey 内嵌豁免键：构造时生成一次、此后只读，故不加锁（见 auth.go）。
 	embedKey string
+
+	// entropyErr 熵源（crypto/rand）不可用的原因，受 cfgMu 保护。
+	// 非 nil 时令牌与内嵌键都拿不到，引擎必须拒绝启动（见 Engine.Start）：
+	// 退化出来的"随机数"是可预测的，等于没有访问控制。
+	entropyErr error
 
 	// ---- 配置（原 config.go 包级变量）----
 	// cfg 由 cfgMu 保护；segConcurrency/retryLimit 是热路径原子读。
@@ -101,9 +108,13 @@ type Runtime struct {
 }
 
 // newRuntime 创建一份带默认值的运行时。Engine 与 CLI 各持一份，互不共享。
-func newRuntime() *Runtime {
+func newRuntime() *Runtime { return newRuntimeWithEntropy(rand.Reader) }
+
+// newRuntimeWithEntropy 用指定熵源创建运行时。
+// 生产恒走 crypto/rand（newRuntime）；注入失败 reader 的入口只给测试用——
+// 覆盖"熵源不可用必须拒绝启动"这条路径。
+func newRuntimeWithEntropy(rnd io.Reader) *Runtime {
 	r := &Runtime{
-		embedKey:          newEmbedKey(), // 每次运行新键：GUI 外壳的 iframe 豁免凭据
 		cfg:               defaultConfig(),
 		tasks:             map[string]*taskEntry{},
 		allowedDirs:       map[string]bool{},
@@ -115,6 +126,13 @@ func newRuntime() *Runtime {
 		livePollInterval:  3 * time.Second,
 		liveMaxEmptyPolls: 25,
 		chunkSizeBytes:    chunkSizeFixed,
+	}
+	// 内嵌豁免键：每次运行新键，GUI 外壳的 iframe 豁免凭据。熵源故障时留空
+	// 并记下原因——空键下 embedAccepted 一律拒绝（fail-closed），不静默放行。
+	if key, err := newEmbedKey(rnd); err != nil {
+		r.entropyErr = err
+	} else {
+		r.embedKey = key
 	}
 	r.systemProxyAddrFn = platform.RealSystemProxyAddr
 	// 原包级 init()：热路径原子变量的默认值

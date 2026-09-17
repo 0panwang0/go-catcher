@@ -12,6 +12,7 @@ import (
 	"os"
 
 	"github.com/0panwang0/go-catcher/internal/fmp4"
+	"github.com/0panwang0/go-catcher/internal/platform"
 )
 
 // InitPolicy 说明是否需要「初始化段」（fMP4 的 ftyp/moov 文件头）。
@@ -169,9 +170,11 @@ func containsBytes(p []byte, s string) bool {
 
 // ---- 注册表 ----
 
-// fmp4State 把 fmp4.NewState 包装为 NormState 接口工厂（注册表条目共用）。
+// fmp4State 把 fmp4.NewStateWithLogger 包装为 NormState 接口工厂（注册表条目共用）。
+// 注入 platform.Logf 而不是让库自己 fmt.Printf：库不该往进程 stdout 写东西
+// （原生消息宿主模式下那条流是协议通道），诊断要归口到统一日志出口。→ P3-7
 // 此处即编译期验证：*fmp4.normState 的方法集满足 NormState 接口。
-func fmp4State() NormState { return fmp4.NewState() }
+func fmp4State() NormState { return fmp4.NewStateWithLogger(platform.Logf) }
 
 // containerRegistry 按序探测（先命中的格式优先）。fmp4 有两个条目，用不同 ID
 // 区分（原先两条同 ID，逼得 findContainerByID 必须特判 Init 字段才能挑对）：

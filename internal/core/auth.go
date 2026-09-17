@@ -16,7 +16,7 @@
 //     opaque 响应，读不出内容；而带上令牌才有 CORS 头，扩展才能读到响应体。
 //
 // 为什么不做 Origin 白名单：扩展 content script 发出的请求带的是「页面 origin」
-// （例如 https://www.xmfyy.com），与恶意网页无法区分；真正区分两者的正是 token。
+// （例如某个第三方视频站点的播放页），与恶意网页无法区分；真正区分两者的正是 token。
 package core
 
 import (
@@ -24,10 +24,10 @@ import (
 	"crypto/subtle"
 	"encoding/hex"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"strings"
-	"time"
 )
 
 const (
@@ -60,14 +60,21 @@ const (
 // + Sec-Fetch-Site 两条独立信号）。判断放在服务端而非外壳侧，是因为
 // frame-ancestors 由被嵌页面自己声明，父窗口无法替它放宽。
 
+// tokenBytes 令牌与内嵌键的随机字节数（编码后 32 位十六进制）。
+const tokenBytes = 16
+
 // newAPIToken 生成 16 字节随机 token（32 位十六进制）。
-func newAPIToken() string {
-	b := make([]byte, 16)
-	if _, err := rand.Read(b); err != nil {
-		// crypto/rand 失败极罕见；退化到时间戳弱得多，但比「没有令牌」强。
-		return fmt.Sprintf("%016x", uint64(time.Now().UnixNano()))
+//
+// rnd 由调用方注入（生产传 crypto/rand.Reader）：熵源故障是必须被测到的分支，
+// 而"让 crypto/rand 失败"只能靠注入。**失败不退化** —— 旧实现在这里退化成
+// 纳秒时间戳（16 位十六进制、可预测），"有令牌"的假象把 fail-closed 变成
+// fail-open；现在只返回错误，由调用方拒绝启动（见 Engine.Start）。
+func newAPIToken(rnd io.Reader) (string, error) {
+	b := make([]byte, tokenBytes)
+	if _, err := io.ReadFull(rnd, b); err != nil {
+		return "", fmt.Errorf("熵源不可用（随机数读取失败）: %w", err)
 	}
-	return hex.EncodeToString(b)
+	return hex.EncodeToString(b), nil
 }
 
 // ensureAPIToken 保证配置里有一枚 token 并返回它（首次调用会落盘）。
@@ -75,11 +82,19 @@ func newAPIToken() string {
 // 之所以持久化而不是每次启动轮换：扩展是长期存在的客户端，token 一变就得重新握手，
 // 而任何一次握手失败在用户眼里都是「下载突然不能用了」。持久化并不降低防护效果——
 // 网页既读不到配置文件，也读不到未授权的响应体。
+//
+// 熵源故障时返回空串并记下原因：空令牌下 tokenAccepted 一律拒绝（fail-closed），
+// 真正拦住服务的是 Engine.Start 对 entropyFailure 的检查。
 func (r *Runtime) ensureAPIToken() string {
 	r.cfgMu.Lock()
 	defer r.cfgMu.Unlock()
 	if r.cfg.APIToken == "" {
-		r.cfg.APIToken = newAPIToken()
+		token, err := newAPIToken(rand.Reader)
+		if err != nil {
+			r.entropyErr = err
+			return ""
+		}
+		r.cfg.APIToken = token
 		if err := r.saveConfigLocked(); err != nil {
 			// 落盘失败不影响本次运行（token 已在内存里），但下次启动会换一枚，
 			// 扩展需要重新握手——这里至少留一条痕迹，不要把失败彻底吞掉。
@@ -89,10 +104,17 @@ func (r *Runtime) ensureAPIToken() string {
 	return r.cfg.APIToken
 }
 
+// entropyFailure 返回熵源故障原因（nil = 正常）。Engine.Start 据此拒绝启动。
+func (r *Runtime) entropyFailure() error {
+	r.cfgMu.Lock()
+	defer r.cfgMu.Unlock()
+	return r.entropyErr
+}
+
 // embedKey 生成本进程的内嵌豁免键。与 API 令牌同为 16 字节随机十六进制，
 // 但用途完全不同（令牌管"谁能调用"，它管"谁可以当父窗口"），且**不落盘**——
 // 只需在一个进程生命周期内保持稳定，重启即换新，无需跨启动一致。
-func newEmbedKey() string { return newAPIToken() }
+func newEmbedKey(rnd io.Reader) (string, error) { return newAPIToken(rnd) }
 
 // embedAccepted 报告请求是否携带本进程的内嵌豁免键（见 routeDef.frameGuard 的例外说明）。
 //

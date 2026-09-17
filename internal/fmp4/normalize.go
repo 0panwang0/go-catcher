@@ -36,17 +36,36 @@ type normState struct {
 	end        map[uint32]uint64 // trackID -> 该轨累计最大相对结束时间（track timescale 单位）
 	trackVideo map[uint32]bool   // trackID -> 是否视频轨（未知轨道默认按视频处理）
 	init       *fmp4InitInfo     // init 段解析结果（mehd/mvhd 回填位置；finish 收尾用）
+	// logf 诊断出口，由调用方注入（见 NewStateWithLogger）。库不碰进程 stdout：
+	// 那条流在原生消息宿主模式下是协议通道。nil = 丢弃诊断（纯库使用方不需要）。
+	logf func(format string, args ...any)
 }
 
-// NewState 创建 fMP4 规范化状态（core 容器注册表的状态工厂）。
+// NewState 创建 fMP4 规范化状态（core 容器注册表的状态工厂，不接日志出口）。
 // 返回具体类型：core 侧经 func() NormState 包装装配进注册表，
 // 编译期即验证方法集满足 core.NormState 接口。
-func NewState() *normState {
+func NewState() *normState { return NewStateWithLogger(nil) }
+
+// NewStateWithLogger 同上，但把诊断输出接到调用方给的出口。
+// 服务端传 platform.Logf（进统一日志文件）；测试传捕获函数即可断言诊断内容。
+func NewStateWithLogger(logf func(format string, args ...any)) *normState {
 	return &normState{
 		baseline:   make(map[uint32]uint64),
 		end:        make(map[uint32]uint64),
 		trackVideo: make(map[uint32]bool),
+		logf:       logf,
 	}
+}
+
+// logDiagnostic 输出一条诊断（nil 接收者与 nil 出口都安全）。
+//
+// nil 安全是必须的：normalizeFMP4Segment 的 recover 兜底里就要用它，而那时
+// n 可能本身就是 nil（调用方传了空状态）。
+func (n *normState) logDiagnostic(format string, args ...any) {
+	if n == nil || n.logf == nil {
+		return
+	}
+	n.logf(format, args...)
 }
 
 // normPersistVersion 快照格式版本。
@@ -780,7 +799,7 @@ func normalizeFMP4Segment(data []byte, n *normState) (out []byte, err error) {
 	// mehd 占位并让 n.init 记下对应偏移，漏掉占位会让收尾回填写到错误位置。
 	defer func() {
 		if r := recover(); r != nil {
-			fmt.Printf("[norm] 规范化内部错误（已拦截，原样放行）: %v\n", r)
+			n.logDiagnostic("[norm] 规范化内部错误（已拦截，原样放行）: %v", r)
 			out = data
 			err = nil
 		}
@@ -814,7 +833,7 @@ func normalizeFMP4Segment(data []byte, n *normState) (out []byte, err error) {
 				// 不归一化就原样放行：畸形结构不该拖垮管线，但必须留痕——
 				// 这个分片的时间轴不会被修正（播放端可能表现为跳变/黑屏），
 				// 静默吞掉错误正是本项目反复出现的头号缺陷形态。
-				fmt.Printf("[norm] 分片结构异常，原样放行（未做时间轴归一化）: %v\n", perr)
+				n.logDiagnostic("[norm] 分片结构异常，原样放行（未做时间轴归一化）: %v", perr)
 				out = append(out, data[pos:]...)
 				return out, nil
 			}

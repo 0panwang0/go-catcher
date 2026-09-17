@@ -162,6 +162,7 @@ const maxPathLen = 260
 
 // sanitizeFilename 把调用方给的文件名清洗成 Windows 上一定可写的名字：
 //   - 非法字符 < > : " / \ | ? * 与控制字符 → 下划线（删除）
+//   - bidi/嵌套控制符（不可见但会重排显示）→ 删除（见 isBidiControl）
 //   - 结尾的点与空格：Windows 会静默丢弃，自己先去掉，避免"以为叫 A. 实际叫 A"
 //   - 保留设备名（CON/PRN/NUL/COM1…）加前缀规避
 //
@@ -175,6 +176,12 @@ func sanitizeFilename(name string) string {
 		if r < 0x20 || r == 0x7f {
 			return -1
 		}
+		// 不可见却能改变显示顺序的字符必须删掉：名字是给用户看的，
+		// 显示与真实字符顺序不一致就是欺骗（扩展名白名单限制了危害，
+		// 但"看着叫 a.mp4 实际叫别的"这一半得在这里堵）。
+		if isBidiControl(r) {
+			return -1
+		}
 		return r
 	}, name)
 	name = strings.TrimRight(name, ". ")
@@ -185,6 +192,25 @@ func sanitizeFilename(name string) string {
 		name = "_" + name
 	}
 	return name
+}
+
+// isBidiControl 报告 r 是否会改变文本的显示方向或嵌套层级（Unicode 双向算法
+// 里的显式格式字符）。它们不可见，却能让同一串字符显示成完全不同的样子。
+//
+// 只删这一类，**不整体删 Cf（格式）类**：零宽连接符 U+200D 是 emoji 组合序列的
+// 组成部分（👨‍👩‍👧 靠它连成一个字），一刀切会把正常标题拆坏。
+func isBidiControl(r rune) bool {
+	switch {
+	case r >= 0x202A && r <= 0x202E: // LRE / RLE / PDF / LRO / RLO
+		return true
+	case r >= 0x2066 && r <= 0x2069: // LRI / RLI / FSI / PDI
+		return true
+	case r == 0x200E || r == 0x200F: // LRM / RLM：不可见的方向标记
+		return true
+	case r == 0x061C: // ALM（阿拉伯字母标记）
+		return true
+	}
+	return false
 }
 
 // isWindowsReservedName 判断名字（忽略扩展名）是否为 Windows 保留设备名。

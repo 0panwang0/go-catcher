@@ -4,9 +4,11 @@
 package platform
 
 import (
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -258,4 +260,58 @@ func TestCloseFileLoggingFlushesQueue(t *testing.T) {
 	CloseFileLogging()
 	// 关闭之后再有输出也不能 panic（ch 永不 close，落到 default 分支被丢弃）
 	w.enqueue([]byte("关闭之后的输出\n"))
+}
+
+// captureFile 把 *target 指向的进程流换成管道；返回值调一次给出期间写入的内容
+// （幂等：重复调用返回同一份，便于 t.Cleanup 兜底还原）。本包没有 t.Parallel。
+func captureFile(t *testing.T, target **os.File) func() string {
+	t.Helper()
+	old := *target
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("建管道失败: %v", err)
+	}
+	*target = w
+	done := make(chan string, 1)
+	go func() {
+		b, _ := io.ReadAll(r)
+		done <- string(b)
+	}()
+	var got string
+	var once sync.Once
+	take := func() string {
+		once.Do(func() {
+			*target = old
+			_ = w.Close() // 关掉写端，读端 Read 才会返回
+			got = <-done
+		})
+		return got
+	}
+	t.Cleanup(func() { take() })
+	return take
+}
+
+// TestLogfFallsBackToStderr 没有文件日志时必须退回 stderr，且绝不碰 stdout。
+//
+// 钉的是 P3-7 复核时发现的一个真回归：**CLI 模式（--url=）不调 SetupFileLogging**
+// （它有真控制台，走 AttachParentConsole），早期设计下库的诊断会被这个出口直接
+// 吞掉 —— 而它们以前是打在终端上的。诊断从"看得见"变成"看不见"，与本项目头号
+// 缺陷形态同源：该说的没说。
+//
+// 同时把"绝不写 stdout"钉死：原生消息宿主模式下那条流是二进制帧协议。
+func TestLogfFallsBackToStderr(t *testing.T) {
+	old := activeLog.Swap(nil) // 模拟 CLI 模式：进程里没有文件日志
+	t.Cleanup(func() { activeLog.Store(old) })
+
+	stdout := captureFile(t, &os.Stdout)
+	stderr := captureFile(t, &os.Stderr)
+
+	Logf("诊断 %s = %d", "[norm]", 7)
+
+	if got := stderr(); !strings.Contains(got, "[norm] = 7") {
+		t.Fatalf("无文件日志时诊断应进 stderr，实际 stderr=%q", got)
+	}
+	if got := stdout(); got != "" {
+		t.Fatalf("绝不写 stdout（宿主模式的协议通道），实际写了 %q", got)
+	}
 }

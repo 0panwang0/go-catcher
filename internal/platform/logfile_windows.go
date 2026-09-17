@@ -296,6 +296,35 @@ func CloseFileLogging() {
 	}
 }
 
+// Logf 库代码的统一日志出口：已启用文件日志就写进去，否则退回 stderr；**绝不写 os.Stdout**。
+//
+// 为什么单独开一个出口，而不是让库自己 fmt.Printf：
+//   - 纯库不该往进程 stdout 写东西 —— 那条流在原生消息宿主模式下是协议通道，
+//     往里面写诊断就是破坏协议；库也无从知道调用方把 stdout 接到哪里去了。
+//   - 也不能改用标准库 log：log 在包 init 时就把**当时的** os.Stderr 存进了
+//     writer，而 SetupFileLogging 换的是变量 os.Stderr，于是 log.Printf 会绕过
+//     日志文件直接写原始 stderr（GUI 模式下等于丢弃），比 fmt.Printf 更糟。
+//
+// 为什么无文件日志时退回 stderr、而不是像早期设计那样直接丢弃（P3-7 复核时发现）：
+// **CLI 模式（--url=）根本不调 SetupFileLogging**（它有真控制台，走 AttachParentConsole），
+// 于是那批诊断会被这里静默吞掉 —— 而它们以前是能打到终端上的。诊断从"看得见"
+// 变成"看不见"，正是本项目头号缺陷形态"产物坏了但日志正常"的另一半来源。
+// stderr 不是协议通道（宿主模式的协议通道是 stdout），写它是安全的。
+//
+// ⚠️ 必须**每次现读** os.Stderr，不能存包级变量：AttachParentConsole 会在启动时
+// 把 os.Stderr 换成 CONOUT$，init 期存下的值指向早已失效的原始句柄（标准库 log
+// 犯的正是这个错，见上）。
+//
+// 队列满时丢弃，与 printf 路径同款语义：少几条诊断只是排障线索少一点，
+// 反压下载热路径才是故障。
+func Logf(format string, args ...any) {
+	if w := activeLog.Load(); w != nil {
+		w.enqueue([]byte(fmt.Sprintf(format, args...) + "\n"))
+		return
+	}
+	fmt.Fprintf(os.Stderr, format+"\n", args...)
+}
+
 // LogTail 返回日志文件最后最多 n 行。/log 端点用它把日志送到前端。
 func LogTail(n int) (string, error) {
 	data, err := os.ReadFile(logFilePath())

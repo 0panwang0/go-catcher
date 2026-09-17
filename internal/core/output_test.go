@@ -87,3 +87,38 @@ func TestIsAllowedDownloadExt(t *testing.T) {
 		}
 	}
 }
+
+// TestSanitizeFilenameStripsBidiControls 显示欺骗类控制符必须被剔除。
+//
+// 形态：U+202E（RLO）之后的文本整段反向显示，于是 "video_4pm.mp4" 在界面上
+// 显示成 "video_mp4.exe" 之类；它们不可见，靠肉眼看名字发现不了。扩展名白名单
+// 限制了真正的危害，但"看着叫 A 实际叫 B"这一半得在名字里堵掉。
+// 扰动点：删掉 sanitizeFilename 里的 isBidiControl 分支，本条会红。
+func TestSanitizeFilenameStripsBidiControls(t *testing.T) {
+	for _, r := range []rune{
+		0x202A, 0x202B, 0x202C, 0x202D, 0x202E, // LRE/RLE/PDF/LRO/RLO
+		0x2066, 0x2067, 0x2068, 0x2069, // LRI/RLI/FSI/PDI
+		0x200E, 0x200F, 0x061C, // LRM/RLM/ALM
+	} {
+		in := "a" + string(r) + "b.mp4"
+		if got := sanitizeFilename(in); got != "ab.mp4" {
+			t.Errorf("U+%04X 应被剔除：sanitizeFilename(%q)=%q want %q", r, in, got, "ab.mp4")
+		}
+	}
+
+	// 对抗场景：反向覆盖让末尾看起来是 .mp4，真实扩展名被藏起来
+	spoofed := "video_4pm\u202Eexe.mp4"
+	if got := sanitizeFilename(spoofed); strings.ContainsAny(got, "\u202A\u202E") {
+		t.Fatalf("欺骗名未被清理: %q", got)
+	}
+}
+
+// TestSanitizeFilenameKeepsEmojiJoiners 不能一刀切删所有 Cf（格式）类字符：
+// 零宽连接符 U+200D 是 emoji 组合序列的一部分，剔掉会把正常标题拆坏
+// ——那属于"为了安全把正常功能也弄坏"。
+func TestSanitizeFilenameKeepsEmojiJoiners(t *testing.T) {
+	const family = "👨\u200d👩\u200d👧"
+	if got := sanitizeFilename(family + ".mp4"); got != family+".mp4" {
+		t.Fatalf("含零宽连接符的标题被改坏：got %q want %q", got, family+".mp4")
+	}
+}

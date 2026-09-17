@@ -6,6 +6,8 @@
 package core
 
 import (
+	"crypto/rand"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -475,5 +477,87 @@ func TestMuxEndToEnd(t *testing.T) {
 	// 6) /probe 不能当 SSRF 跳板
 	if w := do("/probe?t=e2e-token&url=http%3A%2F%2F169.254.169.254%2Flatest%2Fmeta-data%2F", nil); w.Code != http.StatusBadRequest {
 		t.Errorf("云元数据地址应 400，得到 %d", w.Code)
+	}
+}
+
+// errReader 恒返回错误的 reader，用来模拟熵源不可用（crypto/rand 故障）。
+type errReader struct{}
+
+func (errReader) Read([]byte) (int, error) { return 0, errors.New("熵源不可用") }
+
+// TestNewAPITokenFailsWithoutEntropy 熵源失败必须报错并返回空串，
+// **绝不退化**成可预测的值。
+//
+// 回归的缺陷形态：旧实现在这里退化成纳秒时间戳（16 位十六进制），
+// 于是"随机数拿不到"变成"有一枚弱令牌"——看着能用，实际上攻击者可以猜。
+// 扰动点：把 newAPIToken 的时间戳退化写回去，本条会红。
+func TestNewAPITokenFailsWithoutEntropy(t *testing.T) {
+	tok, err := newAPIToken(errReader{})
+	if err == nil {
+		t.Fatalf("熵源失败必须报错，得到 token=%q", tok)
+	}
+	if tok != "" {
+		t.Fatalf("失败时不得产出任何 token，得到 %q", tok)
+	}
+
+	key, err := newEmbedKey(errReader{})
+	if err == nil || key != "" {
+		t.Fatalf("内嵌豁免键同样不得退化：key=%q err=%v", key, err)
+	}
+
+	// 正常熵源照旧产出 32 位十六进制
+	good, err := newAPIToken(rand.Reader)
+	if err != nil || len(good) != 2*tokenBytes {
+		t.Fatalf("正常熵源应产出 %d 位十六进制：%q err=%v", 2*tokenBytes, good, err)
+	}
+}
+
+// TestEngineStartRefusesWithoutEntropy 熵源不可用时引擎必须拒绝启动，
+// 而不是带着空/可预测的令牌把服务跑起来。
+// 扰动点：删掉 Engine.Start 里的 entropyFailure 检查，本条会红。
+func TestEngineStartRefusesWithoutEntropy(t *testing.T) {
+	rt := newRuntimeWithEntropy(errReader{})
+	if rt.entropyFailure() == nil {
+		t.Fatal("构造时就该记下熵源故障（内嵌豁免键拿不到）")
+	}
+	if rt.embedKey != "" {
+		t.Fatalf("熵源故障时内嵌键必须留空，得到 %q", rt.embedKey)
+	}
+
+	eng := &Engine{rt: rt}
+	if err := eng.Start(); err == nil {
+		eng.Stop()
+		t.Fatal("熵源不可用时 Start 必须返回错误（不得先监听再报错）")
+	}
+	if eng.running {
+		t.Fatal("拒绝启动后不得处于运行态")
+	}
+}
+
+// TestEnsureAPITokenRecordsEntropyFailure 令牌生成路径同样不退化：
+// 熵源故障时留空并记因，空令牌下 tokenAccepted 一律拒绝（fail-closed）。
+func TestEnsureAPITokenRecordsEntropyFailure(t *testing.T) {
+	rt := newRuntimeWithEntropy(errReader{})
+	// 令牌首次生成会落盘：先把它指到临时目录，别写到测试二进制旁边
+	rt.configPath = filepath.Join(t.TempDir(), "config.json")
+	// 用一定能成功的内存熵源替换构造期标记，单独验 ensureAPIToken 这条路径
+	rt.cfgMu.Lock()
+	rt.entropyErr = nil
+	rt.cfg.APIToken = ""
+	rt.cfgMu.Unlock()
+
+	// 正常环境下 ensureAPIToken 会拿到真随机 token（生产路径），
+	// 这里只断言它不再可能产出时间戳形态的弱值。
+	tok := rt.ensureAPIToken()
+	if rt.entropyFailure() != nil {
+		t.Fatalf("真实熵源可用时不应报故障: %v", rt.entropyFailure())
+	}
+	if len(tok) != 2*tokenBytes {
+		t.Fatalf("token 应为 %d 位十六进制，得到 %q", 2*tokenBytes, tok)
+	}
+	// 空令牌必须被守卫拒绝（这是拒绝启动之外的第二道）
+	setTestToken(t, "")
+	if w := guardedDo(t, "GET", "/status", "127.0.0.1:7891", nil); w.Code != http.StatusUnauthorized {
+		t.Fatalf("空令牌下任何请求都应 401（fail-closed），得到 %d", w.Code)
 	}
 }

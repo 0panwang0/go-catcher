@@ -67,6 +67,12 @@ func (e *Engine) Start() error {
 		// "N 个任务同时敲磁盘"。
 		go e.rt.salvageInterruptedLive()
 	})
+	// 熵源不可用必须拒绝启动：访问令牌与内嵌豁免键都从 crypto/rand 来，
+	// 拿不到就只能退化，而退化出来的值是可预测的——服务照跑等于没有访问控制。
+	// 放在监听之前：绝不先开门再报错。
+	if err := e.rt.entropyFailure(); err != nil {
+		return fmt.Errorf("拒绝启动：%w", err)
+	}
 	// 端口解析：--port 覆盖 > 配置文件；端口只在本方法和 Port() 里读，改动即时生效于下次 Start
 	port := e.override
 	if port <= 0 {
