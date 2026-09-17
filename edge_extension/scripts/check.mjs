@@ -34,21 +34,26 @@ function fail(msg) {
 }
 
 // 1) 打包（顺带完成 manifest 版本注入）
-const bundleBefore = sha1("background.js");
+//    每个产物都要比：改了 src/ 却只重打了一部分，同样是"提交了与源码不符的产物"。
+//    content-shared.js 是 content script 侧的共享实现（F11：解析只有一份源码），
+//    它和 background.js 一样是生成物 + 提交进仓库。
+const BUILD_OUTPUTS = ["background.js", "content-shared.js"];
+const beforeHashes = new Map(BUILD_OUTPUTS.map((f) => [f, sha1(f)]));
 const mfBefore = sha1("manifest.json");
 if (run(["build.mjs"]) !== 0) fail("node build.mjs 未通过");
-const bundleAfter = sha1("background.js");
-const mfAfter = sha1("manifest.json");
-if (bundleBefore !== bundleAfter) {
-  fail("background.js 与 src/ 不一致（重新打包后内容有变），请提交更新后的 bundle");
+for (const f of BUILD_OUTPUTS) {
+  if (beforeHashes.get(f) !== sha1(f)) {
+    fail(`${f} 与 src/ 不一致（重新打包后内容有变），请提交更新后的产物`);
+  }
 }
+const mfAfter = sha1("manifest.json");
 if (mfBefore !== mfAfter) {
   fail("manifest.json 版本与 package.json 不一致，请提交 build.mjs 同步后的 manifest");
 }
 console.log("bundle / manifest 一致性 OK");
 
 // 2) 语法检查：content script（经典脚本无法 import）与打包产物一并校验
-const syntaxFiles = ["content.js", "background.js", "content-main.js", "downloader.js"];
+const syntaxFiles = ["content.js", "content-shared.js", "background.js", "content-main.js", "downloader.js"];
 for (const f of syntaxFiles) {
   if (run(["--check", f]) !== 0) fail(`node --check ${f} 未通过`);
 }

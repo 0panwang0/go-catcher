@@ -28,12 +28,75 @@ var __m3u8catcher = (() => {
   var MAX_SNIFF_AGE_MS = 7 * 24 * 60 * 60 * 1e3;
 
   // src/background/list-store.js
+  var LIST_KEYS = ["m3u8_list", "mp4_list"];
   var storageWriteChain = Promise.resolve();
+  var listCache = null;
+  var dirtyKeys = /* @__PURE__ */ new Set();
+  var flushing = false;
+  var queued = 0;
+  async function loadLists() {
+    if (!listCache) {
+      const got = await chrome.storage.local.get(LIST_KEYS);
+      listCache = {};
+      for (const k of LIST_KEYS) {
+        listCache[k] = Array.isArray(got[k]) ? got[k] : [];
+      }
+    }
+    return listCache;
+  }
+  async function readLists() {
+    const c = await loadLists();
+    return { m3u8_list: c.m3u8_list.slice(), mp4_list: c.mp4_list.slice() };
+  }
+  function resetListCache() {
+    listCache = null;
+    dirtyKeys.clear();
+  }
+  function updateBadge() {
+    if (!listCache) return;
+    const n = listCache.m3u8_list.length;
+    chrome.action.setBadgeText({ text: n ? String(n) : "" });
+    chrome.action.setBadgeBackgroundColor({ color: "#e74c3c" });
+  }
+  function flushDirty() {
+    if (flushing || !dirtyKeys.size) return Promise.resolve();
+    flushing = true;
+    const keys = [...dirtyKeys];
+    dirtyKeys.clear();
+    const patch = {};
+    for (const k of keys) patch[k] = listCache[k];
+    return chrome.storage.local.set(patch).then(
+      () => {
+        flushing = false;
+        if (keys.includes("m3u8_list")) updateBadge();
+        if (dirtyKeys.size) return flushDirty();
+      },
+      (e) => {
+        flushing = false;
+        for (const k of keys) dirtyKeys.add(k);
+        throw e;
+      }
+    );
+  }
   function withListLock(fn) {
+    queued++;
     const run = storageWriteChain.then(fn, fn);
     storageWriteChain = run.catch(() => {
     });
-    return run;
+    const settle = async (v) => {
+      queued--;
+      if (queued === 0) {
+        try {
+          await flushDirty();
+        } catch (e) {
+          console.error("[M3U8 Video Catcher] \u55C5\u63A2\u5217\u8868\u843D\u76D8\u5931\u8D25\uFF08\u5DF2\u4FDD\u7559\u5F85\u91CD\u8BD5\uFF09:", e);
+        }
+      }
+      return v;
+    };
+    return run.then(settle, (e) => settle(void 0).then(() => {
+      throw e;
+    }));
   }
   function pickEvictionIndex(list, currentTabId) {
     let pick = -1;
@@ -58,8 +121,8 @@ var __m3u8catcher = (() => {
   function recordMedia(url, pageUrl, frameUrl, title, type, size = 0, tabId = null) {
     const key = type === "mp4" ? "mp4_list" : "m3u8_list";
     return withListLock(async () => {
-      const { [key]: stored = [] } = await chrome.storage.local.get(key);
-      const list = pruneExpired(stored);
+      const cache = await loadLists();
+      const list = pruneExpired(cache[key]);
       const existing = list.find((it) => it.url === url);
       if (existing) {
         existing.pageUrl = pageUrl || existing.pageUrl;
@@ -86,25 +149,32 @@ var __m3u8catcher = (() => {
           list.splice(idx, 1);
         }
       }
-      await chrome.storage.local.set({ [key]: list });
-      if (type === "m3u8") {
-        chrome.action.setBadgeText({ text: String(list.length) });
-        chrome.action.setBadgeBackgroundColor({ color: "#e74c3c" });
-      }
+      cache[key] = list;
+      dirtyKeys.add(key);
     });
   }
   function updateMediaItem(key, url, patch) {
+    if (!LIST_KEYS.includes(key)) {
+      return Promise.resolve({ ok: false, error: `\u672A\u77E5\u5217\u8868 ${key}` });
+    }
     return withListLock(async () => {
-      const { [key]: list = [] } = await chrome.storage.local.get(key);
+      const cache = await loadLists();
+      const list = cache[key];
       const cur = list.find((it) => it.url === url);
       if (!cur) return { ok: false, error: "\u8BB0\u5F55\u5DF2\u4E0D\u5B58\u5728" };
       Object.assign(cur, patch || {});
-      await chrome.storage.local.set({ [key]: list });
+      dirtyKeys.add(key);
       return { ok: true };
     });
   }
   function clearLists() {
-    return withListLock(() => chrome.storage.local.set({ m3u8_list: [], mp4_list: [] }));
+    return withListLock(async () => {
+      const cache = await loadLists();
+      cache.m3u8_list = [];
+      cache.mp4_list = [];
+      dirtyKeys.add("m3u8_list");
+      dirtyKeys.add("mp4_list");
+    });
   }
 
   // src/background/sniff-probes.js
@@ -210,12 +280,14 @@ var __m3u8catcher = (() => {
 
   // src/background/m3u8-parse.js
   function qualityFromURL(u) {
+    if (!u) return "";
     try {
-      const m = decodeURIComponent(new URL(u).pathname).match(
+      const p = new URL(u);
+      const m = decodeURIComponent(p.pathname).match(
         /(2160p|1440p|1080p|720p|480p|360p|240p)/i
       );
       if (m) return m[1].toUpperCase();
-      const q = new URL(u).searchParams.get("quality");
+      const q = p.searchParams.get("quality");
       if (q) return q;
     } catch {
     }
@@ -267,10 +339,7 @@ var __m3u8catcher = (() => {
     }
   }
   async function hostCandidates(pageUrl) {
-    const { m3u8_list = [], mp4_list = [] } = await chrome.storage.local.get([
-      "m3u8_list",
-      "mp4_list"
-    ]);
+    const { m3u8_list, mp4_list } = await readLists();
     const hostM3U8 = m3u8_list.filter((it) => sameSite(it, pageUrl) && isCandidateURL(it.url));
     const hostMP4 = mp4_list.filter((it) => sameSite(it, pageUrl) && isCandidateURL(it.url));
     hostM3U8.sort(masterFirst);
@@ -302,10 +371,7 @@ var __m3u8catcher = (() => {
   }
   async function findSniffedByURL(target) {
     if (!target) return null;
-    const { m3u8_list = [], mp4_list = [] } = await chrome.storage.local.get([
-      "m3u8_list",
-      "mp4_list"
-    ]);
+    const { m3u8_list, mp4_list } = await readLists();
     const all = [...m3u8_list, ...mp4_list].filter((it) => isCandidateURL(it.url));
     const norm = (u) => {
       try {
@@ -836,11 +902,12 @@ var __m3u8catcher = (() => {
       sendResponse({ ok: true });
       return true;
     }
+    if (msg.type === "getList") {
+      readLists().then((all) => sendResponse({ ok: true, list: all[msg.key] || [] })).catch((e) => sendResponse({ ok: false, error: String(e) }));
+      return true;
+    }
     if (msg.type === "clearList") {
-      clearLists().then(() => {
-        chrome.action.setBadgeText({ text: "" });
-        sendResponse({ ok: true });
-      }).catch((e) => sendResponse({ ok: false, error: String(e) }));
+      clearLists().then(() => sendResponse({ ok: true })).catch((e) => sendResponse({ ok: false, error: String(e) }));
       return true;
     }
     if (msg.type === "updateMediaItem") {
@@ -879,6 +946,9 @@ var __m3u8catcher = (() => {
   var __test__ = {
     recordMedia,
     updateMediaItem,
+    readLists,
+    // 测试专用：丢弃内存权威副本（用例直接重置 storage 桩造场景时必须先调它）
+    resetListCache,
     pickEvictionIndex,
     pruneExpired,
     clearLists,

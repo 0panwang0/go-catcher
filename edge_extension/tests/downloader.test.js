@@ -20,18 +20,28 @@ const path = require("path");
 const DIR = path.join(__dirname, "..");
 const IMPORT_RE = /^import \{[^}]*\} from "\.\.?\/[^"]+";$/;
 const PARSE_MODULE = "./src/background/m3u8-parse.js";
+const CLI_MODULE = "./src/background/cli-args.js";
 const PAGE = "downloader.js";
 
 const src = fs.readFileSync(path.join(DIR, PAGE), "utf8");
 const importLines = src.split("\n").filter((l) => IMPORT_RE.test(l));
-if (importLines.length !== 1 || !importLines[0].includes(PARSE_MODULE)) {
-  console.error("downloader.js 必须且只能有一条单行 import，指向 " + PARSE_MODULE);
+const imported = importLines.map((l) => l.match(/from "([^"]+)";$/)[1]);
+if (!imported.includes(PARSE_MODULE)) {
+  console.error("downloader.js 必须 import 共享解析模块 " + PARSE_MODULE);
   console.error("实际匹配到:", importLines);
   process.exit(1);
 }
-const parseSrc = fs
-  .readFileSync(path.join(DIR, PARSE_MODULE), "utf8")
-  .replace(/^export /gm, "");
+for (const m of imported) {
+  if (!m.startsWith("./src/background/")) {
+    console.error("downloader.js 只允许 import src/background/ 下的共享模块，实际：" + m);
+    process.exit(1);
+  }
+}
+// 把被 import 的共享模块逐个前置展开（去掉 export 前缀——new Function 里
+// 不需要模块语法）。展开顺序与 import 行一致，模块之间无同名符号。
+const sharedSrc = imported
+  .map((m) => fs.readFileSync(path.join(DIR, m), "utf8").replace(/^export /gm, ""))
+  .join("\n");
 
 const fakeEl = () => ({
   style: {},
@@ -67,7 +77,7 @@ const chrome = {
 
 const api = new Function(
   "chrome", "document", "location", "history",
-  parseSrc +
+  sharedSrc +
     "\n" +
     src.replace(new RegExp(IMPORT_RE.source, "gm"), "").replace(/^export /gm, "") +
     "\nreturn __test__;"
@@ -95,8 +105,10 @@ check("无自带 parseSegments/parseDuration 定义", !/^function parseSegments|
 check("无自带的容器识别/加密守卫（已由服务端承担）",
   !/detectSegmentContainer|browserDownloadRejectReason|playlistKeyMethod/.test(src));
 check("走服务端：下载入口是 downloadViaServer 消息", /type: "downloadViaServer"/.test(src));
-check("解析只有一份源码：import 共享模块",
-  importLines[0].includes("parseSegments") && importLines[0].includes("parseVariants"));
+check("解析只有一份源码：import 共享解析模块",
+  importLines.some((l) => l.includes(PARSE_MODULE) && l.includes("parseSegments") && l.includes("parseVariants")));
+check("文本净化也只有一份源码：import 共享 cli-args 模块",
+  importLines.some((l) => l.includes(CLI_MODULE) && l.includes("quoteArg") && l.includes("sanitizeFileName")));
 
 console.log("import 接线（共享模块的函数确实可用）");
 const PLAIN = "#EXTM3U\n#EXT-X-VERSION:3\n#EXTINF:6.0,\nseg0.ts\n#EXTINF:6.0,\nseg1.ts\n#EXT-X-ENDLIST\n";
@@ -126,9 +138,12 @@ check("非法 URL → false（不抛）", api.isCandidateURL("not a url") === fa
 
 console.log("makeFilename：输出名");
 check("标题 + 画质", api.makeFilename("https://x.com/a/b.m3u8", "标题", "1080P") === "标题_1080P.ts");
-check("非法字符逐个替换为下划线",
-  api.makeFilename("https://x.com/a/b.m3u8", 'a/b:c*?"<>|d', "") === "a_b_c______d.ts",
+check("非法字符替换为下划线并归并连续下划线",
+  api.makeFilename("https://x.com/a/b.m3u8", 'a/b:c*?"<>|d', "") === "a_b_c_d.ts",
   api.makeFilename("https://x.com/a/b.m3u8", 'a/b:c*?"<>|d', ""));
+check("控制字符不进文件名（\\x07 \\x1b 不在 \\s 覆盖范围内）",
+  api.makeFilename("https://x.com/a/b.m3u8", "标\x07题\x1b", "") === "标题.ts",
+  JSON.stringify(api.makeFilename("https://x.com/a/b.m3u8", "标\x07题\x1b", "")));
 check("无标题 → 退回 URL 路径段（丢掉 .m3u8 与画质段）",
   api.makeFilename("https://x.com/v/abc-123/1080p/v.m3u8", "", "") === "v_abc-123.ts",
   api.makeFilename("https://x.com/v/abc-123/1080p/v.m3u8", "", ""));
@@ -147,6 +162,70 @@ check("用 ; 分隔（PowerShell 5.1 不认 &&）", !cmd.includes("&&"));
 const noRef = api.buildGoCommand("https://x.com/a/b.m3u8", "", "标题", "");
 check("默认 exe 名 + 无来源页时不带 --referer",
   noRef.includes('"go-catcher.exe"') && !noRef.includes("--referer"), noRef);
+
+// ------------------------------------------------------------
+// F9 / P2-8：参数值净化
+// ------------------------------------------------------------
+// 判据不用「逐字比对命令」（重构一下就全红），用「分词后的结构不变」：
+// 真实的坏形态是值里的引号把参数切碎、或控制字符把一条命令截成两条。
+// tokenize 粗略还原 shell 分词：连续空白分隔，双引号内不切。
+function tokenize(cmd) {
+  const out = [];
+  let cur = "";
+  let inQuote = false;
+  for (const ch of cmd) {
+    if (ch === '"') {
+      inQuote = !inQuote;
+      continue;
+    }
+    if (!inQuote && /\s/.test(ch)) {
+      if (cur) out.push(cur);
+      cur = "";
+      continue;
+    }
+    cur += ch;
+  }
+  if (cur) out.push(cur);
+  return out;
+}
+
+console.log("buildGoCommand：参数值净化（F9 / P2-8）");
+// 用户从资源管理器「复制文件地址」拿到的就是带双引号的路径。
+// 旧实现直接插值 → ""C:\Program Files\go-catcher.exe""，空引号对被解析成空串，
+// 真路径裸奔后被空白切成「C:\Program」「Files\go-catcher.exe」两个参数。
+const quotedExe = api.buildGoCommand(
+  "https://x.com/a/b.m3u8",
+  "https://x.com/watch/1",
+  "标题",
+  '"C:\\Program Files\\go-catcher.exe"'
+);
+check(
+  "带引号的 exe 路径被净化：命令结构仍是 chcp + exe + 3 个参数",
+  tokenize(quotedExe).join("|") ===
+    [
+      "chcp",
+      "65001",
+      ";",
+      "C:\\Program Files\\go-catcher.exe",
+      "--url=https://x.com/a/b.m3u8",
+      "--referer=https://x.com/watch/1",
+      "-o",
+      "标题.ts",
+    ].join("|"),
+  tokenize(quotedExe)
+);
+check("引号总数为偶数（配对不错位）", (quotedExe.match(/"/g) || []).length % 2 === 0, quotedExe);
+check("exe 路径里的换行被剔除（否则一条命令被截成两条）",
+  !/[\r\n]/.test(api.buildGoCommand("https://x.com/a/b.m3u8", "", "标题", "C:\\a\nb.exe")));
+check("URL 里的引号被剔除（浏览器真实形态是 %22，这里是纵深防御）",
+  api.buildGoCommand('https://x.com/a/"b".m3u8', "", "标题", "").includes(
+    '--url="https://x.com/a/b.m3u8"'
+  ));
+check("标题里的换行 / 控制字符不进命令",
+  (() => {
+    const c = api.buildGoCommand("https://x.com/a/b.m3u8", "", "标\n题\x07", "");
+    return !/[\n\x07]/.test(c) && c.includes('-o "标题.ts"');
+  })());
 
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);

@@ -9,12 +9,14 @@
 // （没有解密能力）和 fMP4（init 段不在分片列表里）必然产出打不开的文件，而日志
 // 照样打印"已保存"，是最隐蔽的一类损坏。那套实现连同它自带的 m3u8 解析已整体删除。
 //
-// 解析现在只有一份源码：src/background/m3u8-parse.js（service worker 打包时用的
-// 也是它）。本文件是 ES 模块，直接 import 同一份——不再有"改一处忘另一处"。
-// ⚠ 下面这行 import 必须保持**单行**：tests/downloader.test.js 在 node 里靠
-//   「去掉 import 行 + 前置展开 m3u8-parse.js」来加载本文件（node 无法直接 import
+// 解析与文本净化现在只有一份源码：src/background/m3u8-parse.js 与 cli-args.js
+// （service worker 打包时用的也是它们；content.js 经 content-shared.js 取同一份）。
+// 本文件是 ES 模块，直接 import——不再有"改一处忘另一处"。
+// ⚠ 下面这两行 import 必须各自保持**单行**：tests/downloader.test.js 在 node 里靠
+//   「去掉 import 行 + 逐个前置展开模块源码」来加载本文件（node 无法直接 import
 //   扩展页脚本，也不值得为它改 package.json 的 type）。
 import { fetchText, parseDuration, parseSegments, parseVariants, shortQuality, qualityFromURL } from "./src/background/m3u8-parse.js";
+import { sanitizeFileName, quoteArg } from "./src/background/cli-args.js";
 
 const ANALYZE_LIMIT = 12; // 最多分析的嗅探条数
 const MAIN_VIDEO_MIN = 60; // 时长 >= 60s 判定为主视频
@@ -119,10 +121,22 @@ document.addEventListener("DOMContentLoaded", async () => {
 // ============================================================
 // 嗅探列表 + 主视频识别
 // ============================================================
-async function refreshList() {
+// fetchList 取嗅探列表。必须走后台消息而不是直读 storage：list-store 持内存
+// 权威副本，合并落盘窗口内 storage 里可能还是旧值（评审 P2-6 / F10）。
+// 后台不可达时（SW 崩溃 / 正在重启）退回直读 storage —— 那种情况下内存副本
+// 也不存在，两边一致；宁可显示可能晚一拍的列表，也好过整页空白。
+async function fetchList() {
+  try {
+    const r = await chrome.runtime.sendMessage({ type: "getList", key: "m3u8_list" });
+    if (r && r.ok) return r.list || [];
+  } catch {}
   const { m3u8_list = [] } = await chrome.storage.local.get("m3u8_list");
+  return m3u8_list;
+}
+
+async function refreshList() {
   // 自愈过滤历史误录的解析页假链接
-  const list = m3u8_list.filter(isCandidateURL);
+  const list = (await fetchList()).filter(isCandidateURL);
   renderList(list);
   if (list.some((it) => !it.analyzed)) analyzeList(list);
 }
@@ -161,8 +175,7 @@ async function analyzeList(list) {
       });
     } catch {}
     if (!running) {
-      const { m3u8_list = [] } = await chrome.storage.local.get("m3u8_list");
-      renderList(m3u8_list);
+      renderList(await fetchList());
     }
   }
 }
@@ -467,12 +480,15 @@ function showProgress(pct, stage) {
 // 服务不可用时的兜底：把 CLI 直下命令交给用户复制
 // ============================================================
 // 生成跨 PowerShell / Git Bash / cmd 都能直接粘贴运行的命令。
-// 与 content.js 的 buildGoCommand 同一形态（那跑在页面世界，无法共享模块）：
-// 用 ; 作语句分隔符（PowerShell 5.1 不支持 &&），路径加双引号（bash 会按空白切片）。
+// 与 content.js 的 buildGoCommand 同一形态（那跑在页面世界，靠 content-shared.js
+// 拿到同一份 quoteArg）：用 ; 作语句分隔符（PowerShell 5.1 不支持 &&），
+// 路径加双引号（bash 会按空白切片），值里的引号与控制字符必须先剔除
+// ——见 src/background/cli-args.js 的 quoteArg 注释。
 function buildGoCommand(m3u8URL, pageURL, videoName, exePath) {
-  const args = [`"${exePath || "go-catcher.exe"}"`];
-  if (m3u8URL) args.push(`--url="${m3u8URL}"`);
-  if (pageURL) args.push(`--referer="${pageURL}"`);
+  const exe = quoteArg(exePath) || "go-catcher.exe";
+  const args = [`"${exe}"`];
+  if (m3u8URL) args.push(`--url="${quoteArg(m3u8URL)}"`);
+  if (pageURL) args.push(`--referer="${quoteArg(pageURL)}"`);
   const outName = makeFilename(m3u8URL, videoName, qualityFromURL(m3u8URL));
   if (outName) args.push(`-o "${outName}"`);
   return ["chcp 65001", args.join(" ")].join(" ; ");
@@ -506,29 +522,28 @@ function hideFallback() {
 // makeFilename 优先 "视频名称_画质.扩展名"，拿不到名称就退回 URL 路径段。
 // 扩展名只是个初值——服务端会按实际探测到的容器改名（fMP4 → .mp4），
 // 所以这里不必也不能猜容器。
+// 名称清洗走共享的 sanitizeFileName（含控制字符过滤与碎屑归并），
+// 与 content.js 的 buildOutputName 同一套规则。
 function makeFilename(m3u8URL, videoName, quality, ext = "ts") {
-  const suffix = quality ? `_${quality}` : "";
-  if (videoName) {
-    const clean = videoName
-      .replace(/[\\/:*?"<>|]/g, "_")
-      .replace(/\s+/g, " ")
-      .trim()
-      .slice(0, 80);
-    if (clean) return clean + suffix + `.${ext}`;
+  const suffix = sanitizeFileName(quality || "");
+  let base = String(videoName || "").trim();
+  if (!base) {
+    try {
+      const parts = new URL(m3u8URL).pathname
+        .split("/")
+        .filter(
+          (p) =>
+            p &&
+            !p.endsWith(".m3u8") &&
+            // 跳过画质段，否则会拼出 "abc-123_1080p_1080P" 这种重复后缀
+            !/^(2160p|1440p|1080p|720p|480p|360p|240p)$/i.test(p)
+        );
+      if (parts.length) base = parts.join("_");
+    } catch {}
   }
-  try {
-    const parts = new URL(m3u8URL).pathname
-      .split("/")
-      .filter(
-        (p) =>
-          p &&
-          !p.endsWith(".m3u8") &&
-          // 跳过画质段，否则会拼出 "abc-123_1080p_1080P" 这种重复后缀
-          !/^(2160p|1440p|1080p|720p|480p|360p|240p)$/i.test(p)
-      );
-    if (parts.length) return parts.join("_") + suffix + `.${ext}`;
-  } catch {}
-  return `video_${Date.now()}${suffix}.${ext}`;
+  base = sanitizeFileName(base).slice(0, 80);
+  if (!base) base = `video_${Date.now()}`;
+  return base + (suffix ? `_${suffix}` : "") + `.${ext}`;
 }
 
 // ============================================================
@@ -581,4 +596,6 @@ export const __test__ = {
   parseVariants,
   shortQuality,
   qualityFromURL,
+  sanitizeFileName,
+  quoteArg,
 };

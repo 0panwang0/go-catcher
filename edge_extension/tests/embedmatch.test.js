@@ -61,6 +61,8 @@ function check(name, cond, extra) {
     ],
     mp4_list: [],
   };
+  // list-store 持内存权威副本：直接改了桩就必须丢弃副本，否则读到上一个场景
+  api.resetListCache();
 
   console.log("findSniffedByURL：");
   const hit = await api.findSniffedByURL(M3U8);
@@ -73,6 +75,7 @@ function check(name, cond, extra) {
   store.m3u8_list = [
     { url: "https://cdn.example.com/play/e0RLJ1Vb/1080p/index.m3u8", pageUrl: TOP, frameUrl: "https://player.other-host.com/x/", type: "m3u8" },
   ];
+  api.resetListCache();
   const dirHit = await api.findSniffedByURL(M3U8);
   check("同目录变体 → 命中", dirHit && dirHit.url.includes("1080p"), dirHit);
 
@@ -80,6 +83,7 @@ function check(name, cond, extra) {
   store.m3u8_list = [
     { url: M3U8, pageUrl: TOP, frameUrl: "https://player.other-host.com/x/", title: "异种污染", type: "m3u8" },
   ];
+  api.resetListCache();
   const s = await api.getVideoSource({ src: "", pageUrl: PARSE_IFRAME, embedUrl: M3U8, title: "异种污染" });
   check("embedUrl 命中并返回 ts 源", s && s.type === "ts" && s.url === M3U8, s);
   const sNoAnchor = await api

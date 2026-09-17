@@ -1,5 +1,6 @@
 // 页面归属判定与候选筛选：从嗅探列表里挑出「属于当前页面 / 这个视频」的记录。
 import { isMasterCandidateM3U8, masterFirst } from "./m3u8-parse.js";
+import { readLists } from "./list-store.js";
 
 // hostOf 提取 hostname（非法 URL 返回空串；旧记录无该字段时安全）。
 export function hostOf(u) {
@@ -35,11 +36,10 @@ export function isCandidateURL(u) {
 
 // hostCandidates 取与 pageUrl 同站的全部嗅探记录（顶层页或发起 frame 任一
 // 命中），master 候选排前。
+// 列表从 list-store 的内存权威副本取（readLists），不直读 storage：
+// 合并落盘窗口内 storage 里可能还是旧值（评审 P2-6 / F10）。
 export async function hostCandidates(pageUrl) {
-  const { m3u8_list = [], mp4_list = [] } = await chrome.storage.local.get([
-    "m3u8_list",
-    "mp4_list",
-  ]);
+  const { m3u8_list, mp4_list } = await readLists();
   const hostM3U8 = m3u8_list.filter((it) => sameSite(it, pageUrl) && isCandidateURL(it.url));
   const hostMP4 = mp4_list.filter((it) => sameSite(it, pageUrl) && isCandidateURL(it.url));
   // master candidate 永远在前：避免播放器先请求 240p 变体导致我们误中预览片
@@ -82,10 +82,7 @@ export async function pageCandidates(pageUrl) {
 // 与分片同目录）。忽略 query，避免签名/时间戳参数造成假不匹配。
 export async function findSniffedByURL(target) {
   if (!target) return null;
-  const { m3u8_list = [], mp4_list = [] } = await chrome.storage.local.get([
-    "m3u8_list",
-    "mp4_list",
-  ]);
+  const { m3u8_list, mp4_list } = await readLists();
   const all = [...m3u8_list, ...mp4_list].filter((it) => isCandidateURL(it.url));
   const norm = (u) => {
     try {

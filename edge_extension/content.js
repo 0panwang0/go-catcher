@@ -1,10 +1,20 @@
 // M3U8 Video Catcher - 悬停单视频下载按钮
 // 鼠标悬停在某个 video 上时显示"下载该视频"按钮，点击后在页面内完成下载。
 // 所有真实网络请求通过 MAIN world fetch 代理发出，Origin/Referer/Cookie 与页面一致，绕过 CDN 403。
+//
+// m3u8 解析、画质推断、文件名清洗、命令参数净化**不在本文件里实现**：本文件是
+// 经典 content script（非模块，不能 import ESM），manifest 里由 content-shared.js
+// 先注入同一 isolated world，唯一实现见 src/background/m3u8-parse.js 与 cli-args.js
+// （构建期生成，见 build.mjs 与 scripts/check.mjs 的一致性校验）。
 
 (function () {
   if (window.__m3u8_catcher_injected__) return;
   window.__m3u8_catcher_injected__ = true;
+
+  // 唯一实现的取用口。取不到时**不降级成第二份实现**——调用点会立刻抛错、
+  // 被上层 catch 成"分析失败"。显式失败好过用一份漂移过的拷贝静默算出
+  // 不同结果（评审 P2-7 的教训：同名不同序的 variantLabel 会静默算错画质）。
+  const P = globalThis.__m3u8Shared || {};
 
   const MIN_W = 200;
   const MIN_H = 120;
@@ -507,88 +517,12 @@
   }
 
   // ============================================================
-  // 解析工具
+  // 画质排序
   //
-  // ⚠ 这里是全项目**唯一一份解析拷贝**：content script 是经典脚本（非 ES 模块），
-  //   无法 import src/background/m3u8-parse.js，只能自留一份。其余两处（service
-  //   worker 与 downloader 页面）共用 m3u8-parse.js。改动这里的语义时必须同步
-  //   改 m3u8-parse.js，否则出现"同一份播放列表，两个地方算出不同的档位"。
+  // 解析（parseSegments / parseVariants / parseDuration / variantLabel /
+  // qualityFromURL）已收敛到 src/background/m3u8-parse.js，经 content-shared.js
+  // 注入为全局 P。这里只留页面侧的排序权重。
   // ============================================================
-  function resolveURL(base, rel) {
-    try {
-      return new URL(rel, base).href;
-    } catch {
-      return rel;
-    }
-  }
-
-  function parseSegments(text, baseURL) {
-    const list = [];
-    for (const raw of text.split("\n")) {
-      const line = raw.trim();
-      if (!line || line.startsWith("#")) continue;
-      list.push(resolveURL(baseURL, line));
-    }
-    return list;
-  }
-
-  function parseDuration(text) {
-    let total = 0;
-    for (const m of text.matchAll(/#EXTINF:([\d.]+)/g)) {
-      total += parseFloat(m[1]);
-    }
-    return total;
-  }
-
-  function parseVariants(text, baseURL) {
-    const lines = text.split("\n");
-    const list = [];
-    for (let i = 0; i < lines.length; i++) {
-      if (!lines[i].startsWith("#EXT-X-STREAM-INF")) continue;
-      const info = lines[i];
-      const next = (lines[i + 1] || "").trim();
-      if (!next || next.startsWith("#")) continue;
-      const bw = parseInt((info.match(/BANDWIDTH=(\d+)/) || [])[1] || "0", 10);
-      const res = (info.match(/RESOLUTION=(\d+x\d+)/) || [])[1] || "";
-      const codec = (info.match(/CODECS="([^"]+)"/) || [])[1] || "";
-      list.push({
-        url: resolveURL(baseURL, next),
-        bandwidth: bw,
-        resolution: res,
-        codec,
-        quality: variantQuality(next, res, bw),
-        label: variantLabel(next, res, bw),
-      });
-    }
-    list.sort((a, b) => b.bandwidth - a.bandwidth);
-    return list;
-  }
-
-  function variantQuality(uri, resolution, bandwidth) {
-    const m = String(uri).match(/(2160p|1440p|1080p|720p|480p|360p|240p)/i);
-    if (m) return m[1].toUpperCase();
-    if (resolution) {
-      const h = parseInt(resolution.split("x")[1], 10);
-      const map = { 2160: "4K", 1440: "2K", 1080: "1080P", 720: "720P", 480: "480P", 360: "360P", 240: "240P" };
-      if (map[h]) return map[h];
-    }
-    if (bandwidth) return `${(bandwidth / 1e6).toFixed(1)} Mbps`;
-    return "";
-  }
-
-  function variantLabel(uri, resolution, bandwidth) {
-    const q = variantQuality(uri, resolution, bandwidth);
-    const parts = [q || "未知画质"];
-    if (resolution) parts.push(resolution);
-    if (bandwidth) parts.push(`${(bandwidth / 1000).toFixed(0)} kbps`);
-    return parts.join(" · ");
-  }
-
-  function qualityFromURL(url) {
-    const m = String(url).match(/(2160p|1440p|1080p|720p|480p|360p|240p)/i);
-    return m ? m[1].toUpperCase() : "";
-  }
-
   function qualityRank(q) {
     return (
       {
@@ -675,7 +609,7 @@
             url: c.url,
             title: c.title || fallbackTitle,
             pageUrl: c.pageUrl || pageUrl,
-            quality: qualityFromURL(c.url),
+            quality: P.qualityFromURL(c.url),
             size: c.size || 0,
             group: c.url,
             fromSrc: !!c.fromSrc,
@@ -689,7 +623,7 @@
           url: c.url,
           title: c.title || fallbackTitle,
           pageUrl: c.pageUrl || pageUrl,
-          quality: qualityFromURL(c.url),
+          quality: P.qualityFromURL(c.url),
           resolution: "",
           bandwidth: 0,
           group: c.url,
@@ -702,7 +636,7 @@
       [...tsMeta.entries()].map(async ([url, meta]) => {
         const text = await fetchPlaylist(url);
         if (!text || !text.includes("#EXT-X-STREAM-INF")) return;
-        const variants = parseVariants(text, url);
+        const variants = P.parseVariants(text, url);
         if (!variants.length) return;
         for (const v of variants) {
           const existing = tsMeta.get(v.url);
@@ -748,8 +682,8 @@
         let segments = 0;
         let live = false;
         if (!text.includes("#EXT-X-STREAM-INF")) {
-          duration = parseDuration(text);
-          segments = parseSegments(text, m.url).length;
+          duration = P.parseDuration(text);
+          segments = P.parseSegments(text, m.url).length;
           live = !text.includes("#EXT-X-ENDLIST");
         }
         return { ...m, duration, segments, live };
@@ -1457,11 +1391,16 @@
   // 生成跨 PowerShell / Git Bash / CMD 可直接粘贴运行的下载命令
   // 用 ; 而非 && 分隔：Windows PowerShell 5.1 不支持 && 作语句分隔符
   // 路径加双引号：bash 下不加引号会把位置参数按空白切片
+  //
+  // 每个值都要过 P.quoteArg：用户把「复制文件地址」拿到的带引号路径粘进设置页时，
+  // 值里的引号会把路径切到引号外、按空白裂成两个参数（评审 P2-8 / F9）。
+  // 净化放在这里而不是命令行拼装处——拼装处管引号，值里绝不能再出现引号。
   function buildGoCommand(m3u8Url, pageUrl, title, exePath) {
     // 直接调用单文件 exe（三种模式之一：--url= 直下，无需先起服务）
-    const goArgs = [`"${exePath || "go-catcher.exe"}"`];
-    if (m3u8Url) goArgs.push(`--url="${m3u8Url}"`);
-    if (pageUrl) goArgs.push(`--referer="${pageUrl}"`);
+    const exe = P.quoteArg(exePath) || "go-catcher.exe";
+    const goArgs = [`"${exe}"`];
+    if (m3u8Url) goArgs.push(`--url="${P.quoteArg(m3u8Url)}"`);
+    if (pageUrl) goArgs.push(`--referer="${P.quoteArg(pageUrl)}"`);
 
     // -o 输出文件名：视频标题 + 画质（由 buildOutputName 统一构造）
     const outName = buildOutputName(m3u8Url, title);
@@ -1502,41 +1441,23 @@
     }
     if (!name) return "";
 
-    // 清掉 Windows 文件名非法字符，并把替换留下的碎屑归并干净
-    // （例："Bad/Name: with* x" → "Bad_Name_with_x"，而不是 "Bad_Name_ with_ x"）
-    name = name
-      .replace(/[\\/:*?"<>|]/g, "_")
-      .replace(/_{2,}/g, "_")
-      .replace(/\s*_\s*/g, "_")
-      .replace(/\s+/g, " ")
-      .replace(/^[_\s]+|[_\s]+$/g, "")
-      .trim()
-      .slice(0, 80);
+    // 清掉 Windows 文件名非法字符与控制字符（\x07 \x1b 之类会原样进文件名），
+    // 并把替换留下的碎屑归并干净：共享实现，见 src/background/cli-args.js
+    name = P.sanitizeFileName(name).slice(0, 80);
     if (!name) return "";
 
     // 画质后缀（输出 .ts：HLS 原始流直接落盘，Go 侧不做封装，主流播放器可播）
-    const q = qualityFromUrl(m3u8Url);
+    // 画质由共享的 qualityFromURL 决定——与 downloader 页面的文件名同源，
+    // 否则同一个视频从浮层下载与从扩展页下载会得到不同的文件名后缀（P2-7）。
+    const q = P.qualityFromURL(m3u8Url);
     return name + (q ? `_${q}` : "") + ".ts";
   }
 
-  // 从 URL 里抠画质档位：优先路径里的 /1080p/，其次 xxx_720p.m3u8
-  function qualityFromUrl(u) {
-    if (!u) return "";
-    try {
-      const path = decodeURIComponent(new URL(u).pathname);
-      const m =
-        path.match(/\/(2160p|1440p|1080p|720p|480p|360p|240p)\//i) ||
-        path.match(/[_-](2160p|1440p|1080p|720p|480p|360p|240p)\.m3u8/i);
-      if (m) return m[1].toUpperCase();
-    } catch {}
-    return "";
-  }
-
   // 测试钩子：node 环境下（有 module、无扩展 API）把纯函数挂出去，供
-  // tests/livecontrols.test.js 直接调用。content script 里没有 module，
-  // 整段不执行 —— 对线上行为零影响（不加模块化改造是怕动坏这个 1400 行的闭包）。
+  // tests/livecontrols.test.js 与 tests/contentparse.test.js 直接调用。
+  // content script 里没有 module，整段不执行 —— 对线上行为零影响。
   if (typeof module !== "undefined" && module.exports) {
-    module.exports.__ui = { controlButtons, CTL_STYLE };
+    module.exports.__ui = { controlButtons, CTL_STYLE, buildGoCommand, buildOutputName };
   }
 
   if (document.readyState === "loading") {

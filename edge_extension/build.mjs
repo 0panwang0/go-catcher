@@ -1,9 +1,10 @@
 // 扩展打包脚本：把 src/background/ 下的 ESM 模块打包成单文件 background.js
-// （MV3 经典 service worker 不支持 ESM，必须打成 IIFE）。
+// （MV3 经典 service worker 不支持 ESM，必须打成 IIFE）；另打一份
+// content-shared.js 供经典 content script 取用同一份解析实现（见 F11）。
 //
 // 用法：npm run build（即 node build.mjs）
-// 产物 background.js 提交进仓库：用户"下载即可加载"的体验不变，CI 会校验
-// 产物与源码同步（build 后 git diff --exit-code -- background.js）。
+// 两个产物都提交进仓库：用户"下载即可加载"的体验不变，CI 会校验产物与源码
+// 同步（check.mjs 比对打包前后 sha1，改了 src/ 忘打包就红灯）。
 import { build } from "esbuild";
 import { existsSync, statSync, readFileSync, writeFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
@@ -47,30 +48,50 @@ function syncManifestVersion() {
 
 syncManifestVersion();
 
-const outfile = "background.js";
-const before = safeMtime(outfile);
+// ============================================================
+// 产物清单
+// ------------------------------------------------------------
+// 两个产物都是「源码改了就必须重新生成并提交」的生成物，
+// scripts/check.mjs 逐个比对打包前后的 sha1 来卡这件事。
+// ============================================================
+const TARGETS = [
+  { entryPoints: ["src/background/main.js"], outfile: "background.js" },
+  {
+    entryPoints: ["src/content-shared-entry.js"],
+    outfile: "content-shared.js",
+    banner:
+      "// 自动生成，请勿手改。\n" +
+      "// 源：src/background/m3u8-parse.js + src/background/cli-args.js（经 src/content-shared-entry.js 汇总）\n" +
+      "// 重新生成：node build.mjs —— scripts/check.mjs 会校验本文件与源码是否同步",
+  },
+];
 
-await build({
-  entryPoints: ["src/background/main.js"],
-  outfile,
-  bundle: true,
-  format: "iife",
-  globalName: "__m3u8catcher",
-  target: ["es2020"],
-  platform: "browser",
-  // MV3 禁止远程代码：不设 external，全部内联；不允许任何网络求值
-  minify: false,
-  sourcemap: false,
-  legalComments: "none",
-  logLevel: "info",
-});
-
-const after = safeMtime(outfile);
-console.log(
-  before === after
-    ? `警告：${outfile} 未被更新？`
-    : `构建完成：${outfile}（${statSync(outfile).size} 字节）`
-);
+for (const { entryPoints, outfile, banner } of TARGETS) {
+  const before = safeMtime(outfile);
+  await build({
+    entryPoints,
+    outfile,
+    bundle: true,
+    format: "iife",
+    // background.js 有全局名（tests 从 __m3u8catcher.__test__ 取测试面）；
+    // content-shared.js 靠入口里的 globalThis 赋值，不需要 globalName。
+    globalName: outfile === "background.js" ? "__m3u8catcher" : undefined,
+    banner: banner ? { js: banner } : undefined,
+    target: ["es2020"],
+    platform: "browser",
+    // MV3 禁止远程代码：不设 external，全部内联；不允许任何网络求值
+    minify: false,
+    sourcemap: false,
+    legalComments: "none",
+    logLevel: "info",
+  });
+  const after = safeMtime(outfile);
+  console.log(
+    before === after
+      ? `警告：${outfile} 未被更新？`
+      : `构建完成：${outfile}（${statSync(outfile).size} 字节）`
+  );
+}
 
 function safeMtime(p) {
   try {

@@ -16,6 +16,8 @@ import {
   pickEvictionIndex,
   pruneExpired,
   clearLists,
+  readLists,
+  resetListCache,
 } from "./list-store.js";
 import { installSniffProbes, contentTypeMediaType, isLikelyFullFile } from "./sniff-probes.js";
 import { sameSite, isCandidateURL, findSniffedByURL } from "./page-match.js";
@@ -64,12 +66,18 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     sendResponse({ ok: true });
     return true;
   }
+  if (msg.type === "getList") {
+    // 下载器页面读嗅探列表。必须走这里而不是让页面直读 storage：list-store
+    // 持内存权威副本，合并落盘窗口内 storage 里可能还是旧值（评审 P2-6 / F10）。
+    readLists()
+      .then((all) => sendResponse({ ok: true, list: all[msg.key] || [] }))
+      .catch((e) => sendResponse({ ok: false, error: String(e) }));
+    return true;
+  }
   if (msg.type === "clearList") {
+    // 徽标归零由 list-store 落盘后统一处理（updateBadge），这里不再手设
     clearLists()
-      .then(() => {
-        chrome.action.setBadgeText({ text: "" });
-        sendResponse({ ok: true });
-      })
+      .then(() => sendResponse({ ok: true }))
       .catch((e) => sendResponse({ ok: false, error: String(e) }));
     return true;
   }
@@ -142,6 +150,9 @@ sweepStaleRules().catch(() => {});
 export const __test__ = {
   recordMedia,
   updateMediaItem,
+  readLists,
+  // 测试专用：丢弃内存权威副本（用例直接重置 storage 桩造场景时必须先调它）
+  resetListCache,
   pickEvictionIndex,
   pruneExpired,
   clearLists,
