@@ -51,13 +51,14 @@ function check(name, cond, extra) {
 
 (async () => {
   const M3U8 = "https://cdn.example.com/play/e0RLJ1Vb/index.m3u8";
-  const PARSE_IFRAME = "https://jisuzyjiexi.com/play/?url=" + M3U8;
-  const TOP = "https://www.xmfyy.com/index.php/vod/play/id/290898/sid/1/nid/1.html";
+  // 第三方解析页 iframe：src 的 ?url= 参数编码了目标地址（域名一律用中性示例）
+  const PARSE_IFRAME = "https://parser.example.com/play/?url=" + M3U8;
+  const TOP = "https://site.example.com/play/id/290898";
 
   store = {
     m3u8_list: [
       // 真实场景：解析页跳到别的域播放，frameUrl 与 iframe.src 不同站
-      { url: M3U8, pageUrl: TOP, frameUrl: "https://player.other-host.com/x/", title: "异种污染", type: "m3u8", time: 1 },
+      { url: M3U8, pageUrl: TOP, frameUrl: "https://player.other-host.com/x/", title: "示例片", type: "m3u8", time: 1 },
     ],
     mp4_list: [],
   };
@@ -81,19 +82,90 @@ function check(name, cond, extra) {
 
   console.log("getVideoSource（embedUrl 锚点，同站匹配必然落空的场景）：");
   store.m3u8_list = [
-    { url: M3U8, pageUrl: TOP, frameUrl: "https://player.other-host.com/x/", title: "异种污染", type: "m3u8" },
+    { url: M3U8, pageUrl: TOP, frameUrl: "https://player.other-host.com/x/", title: "示例片", type: "m3u8" },
   ];
   api.resetListCache();
-  const s = await api.getVideoSource({ src: "", pageUrl: PARSE_IFRAME, embedUrl: M3U8, title: "异种污染" });
+  const s = await api.getVideoSource({ src: "", pageUrl: PARSE_IFRAME, embedUrl: M3U8, title: "示例片" });
   check("embedUrl 命中并返回 ts 源", s && s.type === "ts" && s.url === M3U8, s);
   const sNoAnchor = await api
-    .getVideoSource({ src: "", pageUrl: PARSE_IFRAME, title: "异种污染" })
+    .getVideoSource({ src: "", pageUrl: PARSE_IFRAME, title: "示例片" })
     .then((r) => r, (e) => null);
-  check("不带 embedUrl（旧逻辑）→ 无候选（复现按钮消失根因）", !sNoAnchor, sNoAnchor);
+  check("不带 embedUrl（旧逻辑）→ 无候选（别页记录不再放宽）", !sNoAnchor, sNoAnchor);
 
   console.log("getVideoSources（列表面板）：");
   const list = await api.getVideoSources({ src: "", pageUrl: PARSE_IFRAME, embedUrl: M3U8 });
   check("列表含锚点源", Array.isArray(list) && list.some((x) => x.url === M3U8), list);
+
+  // ------------------------------------------------------------
+  // 跨页面污染（2026-09-17 修）：同站 ≠ 同视频
+  //
+  // 站点首页/栏目页会加载整文件 mp4（品牌动画、卡片预览之类），它们在嗅探侧
+  // 与主视频无法区分（同站、video/mp4、非 206 分段、体积过 MB），只有「归属哪个
+  // 页面」能区分。候选必须来自同一个 frame 文档或同 host+path 的页面。
+  // ------------------------------------------------------------
+  console.log("跨页面污染（同站其它页面的记录）：");
+  const HOME = "https://www.video.example.com/";
+  const WATCH = "https://www.video.example.com/watch/12345";
+  const CARD_MP4 = "https://static.example.com/media/brand-loop.mp4";
+  const blobSrc = "blob:https://www.video.example.com/0f1e2d3c";
+
+  store = {
+    m3u8_list: [],
+    mp4_list: [
+      // 首页加载的整文件 mp4：会被嗅探录进列表，但它属于首页，不是这个视频页的
+      { url: CARD_MP4, pageUrl: HOME, frameUrl: "", title: "首页", type: "mp4", size: 1678189, time: 1 },
+    ],
+  };
+  api.resetListCache();
+  const polluted = await api
+    .getVideoSource({ src: blobSrc, pageUrl: WATCH, segmentDir: "", title: "某视频" })
+    .then((r) => r, () => null);
+  check("别页记录（blob 主视频）→ 按钮判定失败，不误报", polluted === null, polluted);
+  const pollutedList = await api.getVideoSources({ src: blobSrc, pageUrl: WATCH });
+  check("别页记录 → 候选列表不含它", !pollutedList.some((x) => x.url === CARD_MP4), pollutedList);
+
+  console.log("同页记录仍然认（别把按钮一关了之）：");
+  store.mp4_list = [
+    { url: CARD_MP4, pageUrl: WATCH, frameUrl: "", title: "某视频", type: "mp4", size: 1678189, time: 1 },
+  ];
+  api.resetListCache();
+  const samePage = await api
+    .getVideoSource({ src: blobSrc, pageUrl: WATCH, segmentDir: "", title: "某视频" })
+    .then((r) => r, () => null);
+  check("同页记录 + 无活跃信号 → 认（回退体积启发式）", samePage && samePage.url === CARD_MP4, samePage);
+
+  const sameDir = await api
+    .getVideoSource({ src: blobSrc, pageUrl: WATCH, segmentDir: "https://static.example.com/media/", title: "某视频" })
+    .then((r) => r, () => null);
+  check("同页记录 + 活跃目录命中 → 认", sameDir && sameDir.url === CARD_MP4, sameDir);
+
+  const otherStream = await api
+    .getVideoSource({ src: blobSrc, pageUrl: WATCH, segmentDir: "https://cdn.example.com/other/", title: "某视频" })
+    .then((r) => r, () => null);
+  check("同页记录 + 页面正在拉别的流 → 判失败", otherStream === null, otherStream);
+
+  store.mp4_list = [
+    { url: CARD_MP4, pageUrl: WATCH + "/", frameUrl: "", title: "某视频", type: "mp4", size: 1678189, time: 1 },
+  ];
+  api.resetListCache();
+  const slashHit = await api
+    .getVideoSource({ src: blobSrc, pageUrl: WATCH, segmentDir: "", title: "某视频" })
+    .then((r) => r, () => null);
+  check("同页（路径末尾斜杠差异）→ 认", slashHit && slashHit.url === CARD_MP4, slashHit);
+
+  console.log("frame 文档完全相等仍然认（iframe 播放器）：");
+  const FRAME_URL = "https://player.example.com/embed/1";
+  store = {
+    m3u8_list: [
+      { url: M3U8, pageUrl: "https://site.example.com/watch/999", frameUrl: FRAME_URL, title: "示例片", type: "m3u8", time: 1 },
+    ],
+    mp4_list: [],
+  };
+  api.resetListCache();
+  const frameHit = await api
+    .getVideoSource({ src: "", pageUrl: FRAME_URL, title: "示例片" })
+    .then((r) => r, () => null);
+  check("frameUrl 相等 → 认", frameHit && frameHit.url === M3U8, frameHit);
 
   console.log("isCandidateURL：");
   check("解析页假链接被过滤", api.isCandidateURL(PARSE_IFRAME) === false);

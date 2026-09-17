@@ -24,7 +24,7 @@ export function sameSite(it, pageUrl) {
 
 // isCandidateURL 嗅探记录读出自愈：过滤历史上被误录的解析页 URL（路径无媒体
 // 扩展名、靠 ?url= 跳转参数尾部伪装 .m3u8）。路径带扩展名、或不含 ?url=
-// 参数的记录才作为候选（?url= 是苹果CMS 系解析页的通用签名）。
+// 参数的记录才作为候选（?url= 是第三方解析页的通用签名）。
 export function isCandidateURL(u) {
   try {
     const p = new URL(u);
@@ -48,11 +48,19 @@ export async function hostCandidates(pageUrl) {
   return { hostM3U8, hostMP4 };
 }
 
-// pageCandidates 在同站基础上进一步限定「同一视频页」，逐级收窄、宁多勿漏：
+// pageCandidates 在「同站」之上再限定「同一视频页」，只认两类硬证据：
 //   1. frameUrl 完全相等——iframe 播放器场景最准（解析页 URL 的 ?url= 参数
 //      编码了目标 m3u8，同站不同视频的 frameUrl 各不相同，可精确隔离）
-//   2. 顶层页 hostname+pathname 相同——常规站内页（房间号/视频 ID 在路径里可隔离）
-//   3. 都为空（SPA 路由变化等）回退同站全集
+//   2. 顶层页 hostname + pathname 相同——常规站内页（视频 ID / 房间号在路径里，
+//      可隔离同站的不同视频；路径末尾斜杠差异忽略，站点常做归一化跳转）
+//
+// ⚠ 这里**故意不设「同站全集」这一级**（2026-09-17 修）：
+//   同站只能证明「同一个站点」，不能证明「同一个视频」。站点在首页、栏目页、
+//   推荐位也会加载视频资源（品牌动画、卡片预览等），它们是 video/mp4 整文件、
+//   体积过 MB，与主视频一样能通过嗅探与大小过滤；一旦把它们放进候选，
+//   悬浮按钮会亮起来，点下去下载到的是别的东西 —— 正是「产物坏了但日志正常」
+//   这一类缺陷。证据不足时宁可给空集让按钮不出现（用户仍可在扩展页的嗅探
+//   列表里自行取用），也不给一个看起来正常、实际是错的结果。
 export async function pageCandidates(pageUrl) {
   const { hostM3U8, hostMP4 } = await hostCandidates(pageUrl);
   const byFrame = (it) => !!it.frameUrl && it.frameUrl === pageUrl;
@@ -61,20 +69,26 @@ export async function pageCandidates(pageUrl) {
   if (frameM3U8.length || frameMP4.length) {
     return { hostM3U8: frameM3U8, hostMP4: frameMP4 };
   }
-  const samePath = (it) => {
-    if (!it.pageUrl || !pageUrl) return false;
-    try {
-      return new URL(it.pageUrl).pathname === new URL(pageUrl).pathname;
-    } catch {
-      return false;
-    }
-  };
-  const pageM3U8 = hostM3U8.filter(samePath);
-  const pageMP4 = hostMP4.filter(samePath);
-  if (pageM3U8.length || pageMP4.length) {
-    return { hostM3U8: pageM3U8, hostMP4: pageMP4 };
+  const samePath = (it) => isSamePageURL(it.pageUrl, pageUrl);
+  return { hostM3U8: hostM3U8.filter(samePath), hostMP4: hostMP4.filter(samePath) };
+}
+
+// isSamePageURL 两个页面 URL 是否指向同一页：hostname 相同且 pathname 相同
+// （末尾斜杠归一化后比较；任一不可解析返回 false）。
+function isSamePageURL(a, b) {
+  if (!a || !b) return false;
+  try {
+    const ua = new URL(a);
+    const ub = new URL(b);
+    return ua.hostname === ub.hostname && normalizePath(ua.pathname) === normalizePath(ub.pathname);
+  } catch {
+    return false;
   }
-  return { hostM3U8, hostMP4 };
+}
+
+// normalizePath 去掉末尾斜杠（根路径保留 "/"），容忍站点对同一页的两种写法。
+function normalizePath(p) {
+  return p.replace(/\/+$/, "") || "/";
 }
 
 // findSniffedByURL 解析页 iframe 的 ?url= 目标地址 → 嗅探记录。

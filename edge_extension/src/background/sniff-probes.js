@@ -5,7 +5,7 @@
 // 这里追加一条，不必动记录逻辑。
 //
 // frameUrl 记录发起请求的 frame 文档 URL（details.documentUrl）：跨域 iframe
-// 播放器（苹果CMS 第三方解析页等）里 video 所在 frame 的 location.href 与顶层
+// 播放器（第三方解析页等）里 video 所在 frame 的 location.href 与顶层
 // 页 pageUrl 不同域，没有它匹配时候选会全部落空（悬停按钮永不出现）。
 //
 // 探测通道全景（G3）：

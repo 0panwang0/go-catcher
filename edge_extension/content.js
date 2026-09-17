@@ -270,7 +270,7 @@
 
   // extractEmbedUrl 解析页 iframe 的 src 常形如
   //   https://parser.example/play/?url=<目标地址>
-  // 取出 ?url= 里的目标地址（常见的苹果CMS 解析页签名）。解析页往往会跳到
+  // 取出 ?url= 里的目标地址（第三方解析页的通用签名）。解析页往往会跳到
   // 另一个主机去播放，后台按 frameUrl 同站匹配就会落空，这个参数是最可靠的锚点。
   function extractEmbedUrl(target) {
     if (!target || target.src || !target.pageUrl) return "";

@@ -96,13 +96,20 @@ export async function getVideoSource({ src = "", pageUrl = "", embedUrl = "", se
     return makeM3U8Source(hostM3U8[0], title, pageUrl);
   }
 
-  // 4.  fallback：当前页最大的 MP4 直链（过滤掉广告小片段）
+  // 4.  fallback：当前页最大的 MP4 直链（过滤掉广告小片段）。
+  //    候选只是「同页记录」，同一页仍可能同时挂着别的整文件 mp4（卡片预览、
+  //    页面背景循环动画），它们与主视频在请求形态上完全一样（同站、整文件、
+  //    体积过 MB），只按体积挑最大的会把装饰资源当成视频。
+  //    因此这一步要求「正在拉」的正面证据：页面最近一条媒体请求的目录
+  //    （segmentDir，由 content.js 从 resource timing 取）如果不包含这些候选，
+  //    就说明页面此刻在播的是别的东西 ⇒ 直接判失败，不给一个错的链接。
+  //    没有活跃信号（暂停 / 页面刚打开）时不擅自判定，回退到体积启发式。
   const realMP4 = hostMP4
     .filter((it) => (it.size || 0) > 1024 * 1024) // > 1MB
     .sort((a, b) => (b.size || 0) - (a.size || 0));
-
-  if (realMP4.length) {
-    return makeMP4Source(realMP4[0], title, pageUrl);
+  const playingMP4 = segmentDir ? realMP4.filter((it) => it.url.startsWith(segmentDir)) : realMP4;
+  if (playingMP4.length) {
+    return makeMP4Source(playingMP4[0], title, pageUrl);
   }
 
   throw new Error("暂未嗅探到该视频，请先播放几秒再试。");

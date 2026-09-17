@@ -354,20 +354,21 @@ var __m3u8catcher = (() => {
     if (frameM3U8.length || frameMP4.length) {
       return { hostM3U8: frameM3U8, hostMP4: frameMP4 };
     }
-    const samePath = (it) => {
-      if (!it.pageUrl || !pageUrl) return false;
-      try {
-        return new URL(it.pageUrl).pathname === new URL(pageUrl).pathname;
-      } catch {
-        return false;
-      }
-    };
-    const pageM3U8 = hostM3U8.filter(samePath);
-    const pageMP4 = hostMP4.filter(samePath);
-    if (pageM3U8.length || pageMP4.length) {
-      return { hostM3U8: pageM3U8, hostMP4: pageMP4 };
+    const samePath = (it) => isSamePageURL(it.pageUrl, pageUrl);
+    return { hostM3U8: hostM3U8.filter(samePath), hostMP4: hostMP4.filter(samePath) };
+  }
+  function isSamePageURL(a, b) {
+    if (!a || !b) return false;
+    try {
+      const ua = new URL(a);
+      const ub = new URL(b);
+      return ua.hostname === ub.hostname && normalizePath(ua.pathname) === normalizePath(ub.pathname);
+    } catch {
+      return false;
     }
-    return { hostM3U8, hostMP4 };
+  }
+  function normalizePath(p) {
+    return p.replace(/\/+$/, "") || "/";
   }
   async function findSniffedByURL(target) {
     if (!target) return null;
@@ -468,8 +469,9 @@ var __m3u8catcher = (() => {
       return makeM3U8Source(hostM3U8[0], title, pageUrl);
     }
     const realMP4 = hostMP4.filter((it) => (it.size || 0) > 1024 * 1024).sort((a, b) => (b.size || 0) - (a.size || 0));
-    if (realMP4.length) {
-      return makeMP4Source(realMP4[0], title, pageUrl);
+    const playingMP4 = segmentDir ? realMP4.filter((it) => it.url.startsWith(segmentDir)) : realMP4;
+    if (playingMP4.length) {
+      return makeMP4Source(playingMP4[0], title, pageUrl);
     }
     throw new Error("\u6682\u672A\u55C5\u63A2\u5230\u8BE5\u89C6\u9891\uFF0C\u8BF7\u5148\u64AD\u653E\u51E0\u79D2\u518D\u8BD5\u3002");
   }

@@ -82,14 +82,14 @@ function fresh(seed = {}) {
   api.resetListCache();
 }
 
-const TOP = "https://www.xmfyy.com/index.php/vod/play/id/290898/sid/1/nid/1.html";
+const TOP = "https://site.example.com/play/id/290898";
 // i 越大越新；基准取「刚刚」，避免被 TTL 当成过期记录清掉。
 const NOW = Date.now();
 const rec = (i, extra = {}) => ({
   url: `https://cdn.example.com/play/e0RLJ1Vb/v${i}/index.m3u8`,
   pageUrl: TOP,
   frameUrl: "",
-  title: "异种污染",
+  title: "示例片",
   type: "m3u8",
   time: NOW - (30 - i) * 1000,
   tabId: 1,
@@ -102,7 +102,7 @@ const rec = (i, extra = {}) => ({
   const N = 20;
   await Promise.all(
     Array.from({ length: N }, (_, i) =>
-      api.recordMedia(rec(i).url, TOP, "", "异种污染", "m3u8", 0, 1)
+      api.recordMedia(rec(i).url, TOP, "", "示例片", "m3u8", 0, 1)
     )
   );
   check(`20 个并发 recordMedia 全部落库`, store.m3u8_list.length === N, {
@@ -197,7 +197,7 @@ const rec = (i, extra = {}) => ({
   const M = 50;
   await Promise.all(
     Array.from({ length: M }, (_, i) =>
-      api.recordMedia(rec(i).url, TOP, "", "异种污染", "m3u8", 0, 1)
+      api.recordMedia(rec(i).url, TOP, "", "示例片", "m3u8", 0, 1)
     )
   );
   check(`${M} 次并发 recordMedia 的 storage.set 次数 < 5（旧实现 = ${M}）`,
