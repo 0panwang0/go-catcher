@@ -106,7 +106,6 @@ func (te *taskEntry) jobRef() *dlJob {
 }
 
 // snapshot 返回某任务当前对外状态（segDone 实时从 job 原子取，stage/error 从缓存取）
-
 func snapshot(te *taskEntry) taskState {
 	te.mu.Lock()
 	s := te.st
@@ -122,6 +121,13 @@ func snapshot(te *taskEntry) taskState {
 	// openPath：当前真实可打开的文件。done 用成品；paused/失败 用 .part 半成品（失败保留 .part 供重试）；其余空。
 	// .part 要求非空：uniquePath 会为刚创建的任务留下一个 0 字节占位（认领文件名），
 	// 那不是"可打开的半成品"。
+	//
+	// 这里**故意不缓存**探测结果（P3-3 量过后否掉的方案）：/status 每 900ms 轮询
+	// 一次、每次要探 1~2 处文件，看着像浪费，实测单任务每次轮询只省 13µs
+	// （10 任务一轮共 0.13ms），而缓存会引入约 1 秒的陈旧窗口——"0 字节占位刚被
+	// 写入内容"和"成品刚出现"都发生在同一条路径上，晚 1 秒才给「打开」入口是
+	// 用户能感知的，用 13µs 换它不划算。探针数据见
+	// `.workbuddy/tmp/probe_snapshot_stat.go.txt`。
 	if s.done && s.finalPath != "" && fileExists(s.finalPath) {
 		s.openPath = s.finalPath
 	} else if s.finalPath != "" && nonEmptyFile(s.finalPath+".part") {

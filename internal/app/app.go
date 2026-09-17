@@ -19,6 +19,7 @@ import (
 	"golang.org/x/sys/windows"
 
 	"github.com/0panwang0/go-catcher/internal/core"
+	"github.com/0panwang0/go-catcher/internal/platform"
 )
 
 // monitorBase 监控页地址前缀（端口跟随引擎/配置，运行时动态取）。
@@ -79,6 +80,10 @@ func Run(trayOnly bool) {
 		title, _ := windows.UTF16PtrFromString("GoCatcher")
 		text, _ := windows.UTF16PtrFromString("无法创建窗口（需要 Edge/WebView2 运行时）")
 		windows.MessageBox(0, text, title, windows.MB_ICONERROR)
+		// 与 cmd/go-catcher/main.go 的同类退出路径一致：os.Exit 不跑 defer，
+		// 日志是异步写盘的，不显式排空就会把最后那几行诊断一起带走——
+		// 而"窗口都建不出来"恰恰是最需要留痕的时刻。
+		platform.CloseFileLogging()
 		os.Exit(1)
 	}
 	defer w.Destroy()

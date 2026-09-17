@@ -212,7 +212,12 @@ func (r *Runtime) loadConfig() {
 	r.applyConfigLocked() // 无论默认还是读盘，都写入限制器与运行时变量
 }
 
-// clamp 把 v 约束到 [lo,hi]，越界返回 true（表示需采用默认）
+// clamp 把 v 夹取到 [lo,hi]，并报告原值是否本来就合法：
+// 返回 true = 原值落在区间内（v 未被改动）；false = 越界、已夹到边界。
+//
+// 调用方一律按 !clamp(...) 识别"给的值越界了"（见 /config 的 clamped 提示）。
+// 返回值**与"是否采用默认值"无关**：两条调用路径都是夹取而非回退默认
+// （读盘见 loadConfig，端口/uiView 那两处才是回退默认，故不走本函数）。
 func clamp(v *int, lo, hi int) bool {
 	ok := true
 	if *v < lo {

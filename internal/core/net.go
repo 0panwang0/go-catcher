@@ -34,6 +34,14 @@ func (c *bufferedConn) Read(b []byte) (int, error) {
 // proxyAddr / sharedClient / netMu 均为 Runtime 字段（见 runtime.go），
 // 访问入口是方法 getProxyAddr / setProxyAddr / getClient。
 
+// proxyConnectTimeout 读取 CONNECT 响应的兜底超时。
+//
+// 为什么必须自己设：调用方的 ctx 只在 TCP Dial 那一步起作用，隧道一旦建立，
+// 卡住的就是 http.ReadResponse 那次读。代理 accept 之后不回响应（半死代理、
+// 假代理、被防火墙吞掉响应的链路）时，这次读会永久阻塞——任务永远停在
+// "连接中"，且不响应暂停/取消。
+const proxyConnectTimeout = 15 * time.Second
+
 // dialProxyTunnel 连上配置的代理并向 addr 建立 CONNECT 隧道。
 // 返回的 *bufferedConn 复用读取 CONNECT 响应时用的 bufio.Reader —— 响应之后
 // 代理可能已经把目标数据一起发过来了，新建 Reader 会把这部分丢掉。
@@ -56,12 +64,30 @@ func (r *Runtime) dialProxyTunnel(ctx context.Context, addr string) (*bufferedCo
 		return nil, fmt.Errorf("发送 CONNECT 失败: %w", err)
 	}
 
-	// 3. 读取 CONNECT 响应
+	// 3. 读取 CONNECT 响应：先设读超时，再读完清掉（见 proxyConnectTimeout）
+	readDeadline := time.Now().Add(proxyConnectTimeout)
+	if d, ok := ctx.Deadline(); ok && d.Before(readDeadline) {
+		readDeadline = d // 调用方给了更紧的期限就依它
+	}
+	if err := conn.SetReadDeadline(readDeadline); err != nil {
+		conn.Close()
+		return nil, fmt.Errorf("设置 CONNECT 读超时失败: %w", err)
+	}
 	br := bufio.NewReader(conn)
 	resp, err := http.ReadResponse(br, &http.Request{Method: "CONNECT"})
 	if err != nil {
 		conn.Close()
+		var ne net.Error
+		if errors.As(err, &ne) && ne.Timeout() {
+			return nil, fmt.Errorf("代理未在 %s 内回应 CONNECT: %w", proxyConnectTimeout, err)
+		}
 		return nil, fmt.Errorf("读取 CONNECT 响应失败: %w", err)
+	}
+	// 隧道已建立：必须清掉读超时。这条连接接着要承载 TLS 握手与整个下载，
+	// 留着 deadline 会在长时间无数据的传输中途由我们自己把连接掐断。
+	if err := conn.SetReadDeadline(time.Time{}); err != nil {
+		conn.Close()
+		return nil, fmt.Errorf("清除 CONNECT 读超时失败: %w", err)
 	}
 	if resp.StatusCode != http.StatusOK {
 		conn.Close()

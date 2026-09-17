@@ -1,10 +1,13 @@
-// 网络层测试：带重试的 HTTP GET（成功/gzip 兜底解压/HTTP 状态失败）
-// 与 m3u8 格式校验（HTML 网页拒绝/BOM 容忍/直链媒体放行）。
+// 网络层测试：带重试的 HTTP GET（成功/gzip 兜底解压/HTTP 状态失败）、
+// m3u8 格式校验（HTML 网页拒绝/BOM 容忍/直链媒体放行），
+// 以及代理隧道 CONNECT 的读超时与超时清除。
 package core
 
 import (
 	"compress/gzip"
 	"context"
+	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -246,5 +249,122 @@ func TestSleepCtx(t *testing.T) {
 	}
 	if !sleepCtx(context.Background(), 5*time.Millisecond) {
 		t.Fatal("ctx 未取消时应睡满并返回 true")
+	}
+}
+
+// silentProxy 起一个"只 accept、不回话"的假代理，返回它的地址与收尾函数。
+// 用来复现"代理接受 TCP 但永不回应 CONNECT"这一类半死代理。
+func silentProxy(t *testing.T) string {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("起假代理失败: %v", err)
+	}
+	t.Cleanup(func() { ln.Close() })
+	conn := make(chan net.Conn, 1)
+	go func() {
+		c, aerr := ln.Accept()
+		if aerr != nil {
+			return
+		}
+		c.Read(make([]byte, 512)) // 收下 CONNECT 请求，然后什么都不回
+		conn <- c
+	}()
+	t.Cleanup(func() {
+		select {
+		case c := <-conn:
+			c.Close()
+		default:
+		}
+	})
+	return ln.Addr().String()
+}
+
+// useProxy 把共享运行时临时指向给定代理，测试结束恢复。
+func useProxy(t *testing.T, addr string) {
+	t.Helper()
+	old := testStd.getProxyAddr()
+	testStd.setProxyAddr("http://" + addr)
+	t.Cleanup(func() { testStd.setProxyAddr(old) })
+}
+
+// TestDialProxyTunnelConnectReadTimeout 代理 accept 后不回 CONNECT 响应时，
+// dialProxyTunnel 必须及时失败。
+//
+// 回归的缺陷形态：这次读原先没有任何读超时（调用方的 ctx 只作用于 Dial），
+// 半死代理会让任务永久停在"连接中"，且不响应暂停/取消。
+// 扰动点：删掉 conn.SetReadDeadline 那几行，本条会以"没有返回"失败。
+func TestDialProxyTunnelConnectReadTimeout(t *testing.T) {
+	useProxy(t, silentProxy(t))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancel()
+
+	type outcome struct {
+		err   error
+		spent time.Duration
+	}
+	done := make(chan outcome, 1)
+	go func() {
+		start := time.Now()
+		_, derr := testStd.dialProxyTunnel(ctx, "example.com:443")
+		done <- outcome{err: derr, spent: time.Since(start)}
+	}()
+
+	select {
+	case got := <-done:
+		if got.err == nil {
+			t.Fatal("代理不回 CONNECT 响应时应返回错误")
+		}
+		if !strings.Contains(got.err.Error(), "CONNECT") {
+			t.Fatalf("err=%v want 说明 CONNECT 阶段失败", got.err)
+		}
+		if got.spent > 3*time.Second {
+			t.Fatalf("应在 300ms 的 ctx 期限附近失败，实际耗时 %s", got.spent)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("dialProxyTunnel 未返回：读 CONNECT 响应缺少超时（旧实现永久阻塞在这条读上）")
+	}
+}
+
+// TestDialProxyTunnelClearsReadDeadline 隧道建立后读超时必须被清掉。
+//
+// 这条连接接着要承载 TLS 握手与整个下载，分片之间长时间无数据是常态；
+// 把 CONNECT 那一次的期限留给它，等于给所有传输埋了一个中途自断的雷。
+// 扰动点：删掉建立隧道后那次 SetReadDeadline(time.Time{})，本条会读到超时错误。
+func TestDialProxyTunnelClearsReadDeadline(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("起假代理失败: %v", err)
+	}
+	t.Cleanup(func() { ln.Close() })
+	const payload = "TUNNEL-DATA"
+	go func() {
+		c, aerr := ln.Accept()
+		if aerr != nil {
+			return
+		}
+		defer c.Close()
+		c.Read(make([]byte, 512))
+		c.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n"))
+		// 建隧道后静默超过调用方给的期限，再发数据
+		time.Sleep(600 * time.Millisecond)
+		c.Write([]byte(payload))
+	}()
+	useProxy(t, ln.Addr().String())
+
+	ctx, cancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
+	defer cancel()
+
+	bc, err := testStd.dialProxyTunnel(ctx, "example.com:443")
+	if err != nil {
+		t.Fatalf("隧道应当建立成功: %v", err)
+	}
+	defer bc.Close()
+
+	// 不自己设 deadline：要验的正是"CONNECT 那一次的期限有没有留在连接上"
+	got := make([]byte, len(payload))
+	if _, err := io.ReadFull(bc, got); err != nil || string(got) != payload {
+		t.Fatalf("隧道建立后读超时应已清除：got=%q err=%v", got, err)
 	}
 }
