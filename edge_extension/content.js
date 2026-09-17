@@ -805,14 +805,7 @@
     return options;
   }
 
-  function fmtDur(sec) {
-    const h = Math.floor(sec / 3600);
-    const m = Math.floor((sec % 3600) / 60);
-    const s = Math.round(sec % 60);
-    return h > 0
-      ? `${h}:${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}`
-      : `${m}:${String(s).padStart(2, "0")}`;
-  }
+  // 时长格式化由共享的 P.fmtDur 提供（与下载器页面同一份，评审 P3-6）。
 
   // ============================================================
   // 单视频选择面板
@@ -844,7 +837,7 @@
     return `
       <div style="max-width:720px;width:90%;max-height:85vh;background:#fff;border-radius:8px;box-shadow:0 8px 32px rgba(0,0,0,0.35);display:flex;flex-direction:column;overflow:hidden;">
         <div style="display:flex;align-items:center;justify-content:space-between;padding:14px 18px;border-bottom:1px solid #e5e7eb;background:#f8f9fb;">
-          <div style="font-size:16px;font-weight:700;color:#111;">${escapeHtml(title)}</div>
+          <div style="font-size:16px;font-weight:700;color:#111;">${P.escapeHtml(title)}</div>
           <button id="m3u8-catcher-close" style="border:none;background:transparent;font-size:20px;color:#6b7280;cursor:pointer;line-height:1;">×</button>
         </div>
         ${bodyHTML}
@@ -887,12 +880,12 @@
         "下载该视频",
         `<div style="padding:24px 28px 0;">
           ${serverDownBanner}
-          <div style="color:#d32f2f;margin-bottom:12px;font-size:14px;line-height:1.5;word-break:break-all;overflow-wrap:anywhere;">下载失败: ${escapeHtml(errMsg)}</div>
+          <div style="color:#d32f2f;margin-bottom:12px;font-size:14px;line-height:1.5;word-break:break-all;overflow-wrap:anywhere;">下载失败: ${P.escapeHtml(errMsg)}</div>
           <div style="color:#374151;font-size:13px;margin-bottom:8px;">也可以手动复制下面的命令到终端运行（不需要服务）：</div>
-          ${outName ? `<div style="color:#374151;font-size:13px;margin-bottom:6px;">输出文件：<code style="background:#f3f4f6;padding:1px 5px;border-radius:3px;">${escapeHtml(outName)}</code></div>` : ""}
+          ${outName ? `<div style="color:#374151;font-size:13px;margin-bottom:6px;">输出文件：<code style="background:#f3f4f6;padding:1px 5px;border-radius:3px;">${P.escapeHtml(outName)}</code></div>` : ""}
         </div>
          <div style="padding:0 28px 20px;">
-           <div style="background:#1f2937;color:#e5e7eb;padding:12px;border-radius:6px;font-family:Menlo,Consolas,monospace;font-size:12px;line-height:1.6;word-break:break-all;white-space:pre-wrap;" id="go-cmd-text">${escapeHtml(goCmd)}</div>
+           <div style="background:#1f2937;color:#e5e7eb;padding:12px;border-radius:6px;font-family:Menlo,Consolas,monospace;font-size:12px;line-height:1.6;word-break:break-all;white-space:pre-wrap;" id="go-cmd-text">${P.escapeHtml(goCmd)}</div>
            <div style="margin-top:6px;color:#9ca3af;font-size:11.5px;line-height:1.5;">exe 路径由本地服务运行时自动检测；显示为裸文件名时，先打开一次 GoCatcher 客户端即可，或在扩展设置里手动配置。</div>
            <div style="margin-top:10px;display:flex;gap:8px;align-items:center;">
              <button id="copy-go-cmd" style="padding:6px 14px;font-size:13px;border:none;background:#3b82f6;color:#fff;border-radius:4px;cursor:pointer;font-weight:600;">复制命令</button>
@@ -934,9 +927,9 @@
         "下载该视频",
         `<div style="padding:22px 28px;">
           <div style="color:#22c55e;font-weight:600;font-size:14px;margin-bottom:10px;">✓ 已开始下载，由本地 Go 服务保存到所选文件夹</div>
-          ${dir ? `<div style="font-size:12px;color:#6b7280;margin-bottom:12px;word-break:break-all;">保存位置：${escapeHtml(dir)}</div>` : ""}
+          ${dir ? `<div style="font-size:12px;color:#6b7280;margin-bottom:12px;word-break:break-all;">保存位置：${P.escapeHtml(dir)}</div>` : ""}
           <div style="background:#f3f4f6;padding:8px 10px;border-radius:4px;font-size:12px;color:#374151;margin-bottom:14px;">
-            文件：<code style="font-family:Menlo,Consolas,monospace;">${escapeHtml(fn)}</code>
+            文件：<code style="font-family:Menlo,Consolas,monospace;">${P.escapeHtml(fn)}</code>
           </div>
           <div id="initiated-progress-text" style="margin-bottom:10px;color:#374151;font-size:13px;">正在连接本地 Go 服务…</div>
           <div style="width:100%;height:8px;background:#e5e7eb;border-radius:4px;overflow:hidden;">
@@ -953,8 +946,8 @@
         `<div style="padding:32px 28px;text-align:center;">
           <div style="font-size:32px;margin-bottom:10px;">🎉</div>
           <div style="color:#22c55e;font-weight:600;font-size:16px;margin-bottom:8px;">下载完成</div>
-          <div style="font-size:13px;color:#374151;margin-bottom:6px;">文件名：<code style="background:#f3f4f6;padding:2px 6px;border-radius:3px;font-family:Menlo,Consolas,monospace;">${escapeHtml(fn)}</code></div>
-          ${payload && payload.finalPath ? `<div style="font-size:12px;color:#6b7280;margin-bottom:14px;word-break:break-all;">位置：${escapeHtml(payload.finalPath)}</div>` : ""}
+          <div style="font-size:13px;color:#374151;margin-bottom:6px;">文件名：<code style="background:#f3f4f6;padding:2px 6px;border-radius:3px;font-family:Menlo,Consolas,monospace;">${P.escapeHtml(fn)}</code></div>
+          ${payload && payload.finalPath ? `<div style="font-size:12px;color:#6b7280;margin-bottom:14px;word-break:break-all;">位置：${P.escapeHtml(payload.finalPath)}</div>` : ""}
           <button id="completed-close" style="margin-top:10px;padding:8px 20px;font-size:13px;border:none;background:#3b82f6;color:#fff;border-radius:5px;cursor:pointer;">完成</button>
         </div>`
       );
@@ -984,7 +977,7 @@
     if (o.quality) parts.push(o.quality);
     if (o.resolution) parts.push(o.resolution);
     if (o.bandwidth) parts.push(`${(o.bandwidth / 1000).toFixed(0)} kbps`);
-    if (o.duration) parts.push(`时长 ${fmtDur(o.duration)}`);
+    if (o.duration) parts.push(`时长 ${P.fmtDur(o.duration)}`);
     else if (o.type === "ts" && o.segments) parts.push(`${o.segments} 分片`);
     if (o.size) {
       parts.push(`${(o.size / 1024 / 1024).toFixed(1)} MB`);
@@ -1021,9 +1014,9 @@
         <div class="m3u8-catcher-row" data-idx="${idx}" style="display:flex;align-items:center;padding:10px 14px;border-bottom:1px solid #f3f4f6;cursor:pointer;${o.unchecked ? "opacity:0.55;" : ""}">
           <div style="flex:none;width:44px;margin-right:12px;padding:3px 0;text-align:center;border-radius:4px;font-size:11px;font-weight:700;color:#fff;background:${o.type === "ts" ? "#3b82f6" : "#64748b"};">${o.type === "ts" ? "TS" : "MP4"}</div>
           <div style="flex:1;min-width:0;">
-            <div style="font-size:13.5px;color:#111;font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${escapeHtml(o.title || "(无标题)")}</div>
-            <div style="font-size:11px;color:#9ca3af;margin-top:2px;">${escapeHtml(optionMeta(o))}</div>
-            <div style="font-size:10.5px;color:#c3cad4;margin-top:1px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${escapeHtml(optionURLLabel(o.url))}</div>
+            <div style="font-size:13.5px;color:#111;font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${P.escapeHtml(o.title || "(无标题)")}</div>
+            <div style="font-size:11px;color:#9ca3af;margin-top:2px;">${P.escapeHtml(optionMeta(o))}</div>
+            <div style="font-size:10.5px;color:#c3cad4;margin-top:1px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${P.escapeHtml(optionURLLabel(o.url))}</div>
           </div>
           <div style="margin-left:10px;padding:4px 10px;background:#3b82f6;color:#fff;font-size:12px;border-radius:4px;font-weight:600;">下载</div>
         </div>`
@@ -1031,7 +1024,7 @@
       .join("");
 
     panel.innerHTML = panelShell(
-      `下载该视频 - ${escapeHtml(options[0].title || document.title || "")}`,
+      `下载该视频 - ${P.escapeHtml(options[0].title || document.title || "")}`,
       `<div style="overflow-y:auto;max-height:60vh;">${rows}</div>
        <div style="padding:12px 18px;border-top:1px solid #e5e7eb;background:#f8f9fb;color:#6b7280;font-size:12px;">共 ${options.length} 个链接，点击任一行选择该画质下载。</div>`
     );
@@ -1066,24 +1059,24 @@
       `<div style="padding:20px 24px;">
         <div style="margin-bottom:14px;">
           <div style="font-size:12px;color:#6b7280;margin-bottom:3px;">视频名称</div>
-          <div style="font-weight:600;color:#111;">${escapeHtml(title || "(无标题)")}</div>
+          <div style="font-weight:600;color:#111;">${P.escapeHtml(title || "(无标题)")}</div>
         </div>
 
         ${quality ? `<div style="margin-bottom:14px;">
           <div style="font-size:12px;color:#6b7280;margin-bottom:3px;">画质</div>
-          <div style="font-weight:600;color:#111;">${escapeHtml(quality)}</div>
+          <div style="font-weight:600;color:#111;">${P.escapeHtml(quality)}</div>
         </div>` : ""}
 
         <div style="margin-bottom:14px;">
           <div style="font-size:12px;color:#6b7280;margin-bottom:3px;">资源链接</div>
-          <div style="background:#f3f4f6;padding:10px;border-radius:4px;font-family:Menlo,Consolas,monospace;font-size:11px;line-height:1.5;word-break:break-all;max-height:90px;overflow-y:auto;color:#1f2937;">${escapeHtml(url)}</div>
+          <div style="background:#f3f4f6;padding:10px;border-radius:4px;font-family:Menlo,Consolas,monospace;font-size:11px;line-height:1.5;word-break:break-all;max-height:90px;overflow-y:auto;color:#1f2937;">${P.escapeHtml(url)}</div>
           <button id="confirm-copy-url" style="margin-top:6px;padding:5px 12px;font-size:12px;border:1px solid #d1d5db;background:#fff;border-radius:4px;cursor:pointer;color:#374151;">📋 复制链接</button>
           <span id="confirm-copy-feedback" style="margin-left:8px;color:#22c55e;font-size:12px;display:none;">✓ 已复制</span>
         </div>
 
         <div style="margin-bottom:18px;">
           <div style="font-size:12px;color:#6b7280;margin-bottom:3px;">保存文件名</div>
-          <div style="background:#fef3c7;padding:8px 10px;border-radius:4px;font-family:Menlo,Consolas,monospace;font-size:12px;color:#78350f;">${escapeHtml(filename)}</div>
+          <div style="background:#fef3c7;padding:8px 10px;border-radius:4px;font-family:Menlo,Consolas,monospace;font-size:12px;color:#78350f;">${P.escapeHtml(filename)}</div>
           <div style="margin-top:4px;font-size:11px;color:#9ca3af;">下载时可改名字 / 改位置</div>
         </div>
 
@@ -1362,14 +1355,13 @@
     }
   }
 
-  function escapeHtml(s) {
-    return String(s).replace(/[&<>"']/g, (c) => ({"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"}[c]));
-  }
-
   // 兜底命令的 exe 路径解析（优先级从高到低）：
   //   1. 设置里显式配置的路径（≠ 默认值才算"显式"）
   //   2. 服务自报的路径（/svc/info 自动探测缓存；没有缓存时让 background 实时问一次）
   //   3. 裸文件名 go-catcher.exe（依赖 PATH；服务从未运行过时才会走到这）
+  // ⚠ 与 downloader.js 的 getExePath 是同一套优先级，措辞也刻意保持相同；本函数多
+  //   第 2 步那后半跳（页面世界直发本机请求会被 CORS 挡，只能让 background 代问）。
+  //   两份有意保留（评审 P3-6 留档）：改这条优先级时两处必须一起改。
   async function getExePath() {
     let detected = "";
     try {
@@ -1388,32 +1380,38 @@
     return "go-catcher.exe";
   }
 
-  // 生成跨 PowerShell / Git Bash / CMD 可直接粘贴运行的下载命令
-  // 用 ; 而非 && 分隔：Windows PowerShell 5.1 不支持 && 作语句分隔符
-  // 路径加双引号：bash 下不加引号会把位置参数按空白切片
-  //
-  // 每个值都要过 P.quoteArg：用户把「复制文件地址」拿到的带引号路径粘进设置页时，
-  // 值里的引号会把路径切到引号外、按空白裂成两个参数（评审 P2-8 / F9）。
-  // 净化放在这里而不是命令行拼装处——拼装处管引号，值里绝不能再出现引号。
+  // 生成跨 PowerShell / Git Bash / CMD 可直接粘贴运行的下载命令。
+  // 拼装本身（chcp 前缀 / 引号 / ; 分隔 / 逐值净化走 P.quoteArg）全部交给共享的
+  // P.assembleGoCommand——唯一实现（评审 P3-6：这里曾与下载器页面各写一份同形实现）。
+  // 本函数只剩一件事：把「输出文件名怎么算」翻译成它的入参，见下面 buildOutputName
+  // 的对照表。用户把「复制文件地址」拿到的带引号路径粘进设置页时，值里的引号会把
+  // 路径切到引号外、按空白裂成两个参数（评审 P2-8 / F9），净化在拼装那层做。
   function buildGoCommand(m3u8Url, pageUrl, title, exePath) {
-    // 直接调用单文件 exe（三种模式之一：--url= 直下，无需先起服务）
-    const exe = P.quoteArg(exePath) || "go-catcher.exe";
-    const goArgs = [`"${exe}"`];
-    if (m3u8Url) goArgs.push(`--url="${P.quoteArg(m3u8Url)}"`);
-    if (pageUrl) goArgs.push(`--referer="${P.quoteArg(pageUrl)}"`);
-
-    // -o 输出文件名：视频标题 + 画质（由 buildOutputName 统一构造）
-    const outName = buildOutputName(m3u8Url, title);
-    if (outName) goArgs.push(`-o "${outName}"`);
-
-    return [
-      "chcp 65001",
-      goArgs.join(" "),
-    ].join(" ; ");
+    return P.assembleGoCommand(m3u8Url, pageUrl, buildOutputName(m3u8Url, title), exePath);
   }
 
-  // 拼输出文件名：<标题>_<画质>.ts
-  // 画质从 m3u8 URL 里推断（.../1080p/video.m3u8 或 xxx_720p.m3u8）
+  // ============================================================
+  // 文件名的构造：buildOutputName —— 与 downloader.js 的 makeFilename 对照
+  // ------------------------------------------------------------
+  // 这一对**不合并**（评审 P3-6）：两者的输入不同，强行统一会让一侧失真。但凡是
+  // 两侧应当一致的部分，都由共享函数决定，并由 tests/filename-consistency.test.js
+  // 逐条钉住（有标题时必须逐字节相同）。对照表如下：
+  //
+  //   维度           本函数 buildOutputName        本页/下载器 makeFilename
+  //   -------------  ---------------------------  ---------------------------
+  //   画质来源       从 URL 推断 qualityFromURL   调用方传入（用户手选的档位）
+  //   无标题兜底     取倒数第一个非画质段          路径段用 _ 连起来
+  //   名字仍为空     返回空串（命令里不出现 -o）    video_<毫秒时间戳>
+  //   扩展名         固定 .ts                      可传参（默认 .ts）
+  //   -------------  ---------------------------  ---------------------------
+  //   名称清洗       sanitizeFileName             sanitizeFileName
+  //   画质段剔除     跳过 2160p…240p              跳过 2160p…240p
+  //   长度上限       80 字符                     80 字符
+  //
+  // 「画质来源」的差异是有意的：下载器页面能弹档位选择框，学到的画质是 CDN 自报的，
+  // 比从 URL 猜准。但两侧**默认路径**下画质都出自共享的 qualityFromURL，所以同一个
+  // 视频从浮层下载与从扩展页下载，文件名后缀一致（评审 P2-7）。
+  // ============================================================
   function buildOutputName(m3u8Url, title) {
     let name = String(title || "").trim();
 

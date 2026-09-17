@@ -34,6 +34,9 @@ function check(name, cond, extra) {
 // 1) 结构性守卫：解析实现不许回到 content.js
 // ============================================================
 console.log("结构性守卫：解析与净化不再有第二份实现");
+// escapeHtml / fmtDur 是 P3-6 收走的两个 UI 工具：它们原先在 content.js 与
+// downloader.js 各有一份**逐字相同**的拷贝——转义漏一处的后果，是把用户可控
+// 文本原样塞进 innerHTML。
 const BANNED_DEFS = [
   "parseSegments",
   "parseDuration",
@@ -45,6 +48,8 @@ const BANNED_DEFS = [
   "resolveURL",
   "sanitizeFileName",
   "quoteArg",
+  "escapeHtml",
+  "fmtDur",
 ];
 for (const fn of BANNED_DEFS) {
   check(`content.js 不再定义 ${fn}`, !new RegExp(`function\\s+${fn}\\s*\\(`).test(src));
@@ -138,7 +143,14 @@ check("标题里的非法字符与控制字符被清掉",
   ui.buildOutputName("https://cdn.x/a/index.m3u8", 'a/b:c*?"<>|d') === "a_b_c_d.ts" &&
   ui.buildOutputName("https://cdn.x/a/index.m3u8", "标\x07题") === "标题.ts");
 
-console.log("兜底命令：与 downloader 页面同一套净化");
+console.log("兜底命令：拼装走共享实现，本页面只决定输出文件名");
+check("buildGoCommand 委托给共享 P.assembleGoCommand（P3-6）",
+  /P\.assembleGoCommand\(/.test(src), "未找到 P.assembleGoCommand(");
+{
+  const body = (src.match(/function buildGoCommand[\s\S]*?\n  \}/) || [""])[0];
+  check("buildGoCommand 里不再自己拼 chcp / 自己净化引号",
+    !/chcp/.test(body) && !/quoteArg/.test(body), body);
+}
 const cmd = ui.buildGoCommand("https://x.com/a/b.m3u8", "https://x.com/watch/1", "标题", '"C:\\Program Files\\go-catcher.exe"');
 const tokens = [];
 {

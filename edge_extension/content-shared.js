@@ -1,5 +1,5 @@
 // 自动生成，请勿手改。
-// 源：src/background/m3u8-parse.js + src/background/cli-args.js（经 src/content-shared-entry.js 汇总）
+// 源：src/background/ 下的共享模块（清单见 src/content-shared-entry.js 的 import）
 // 重新生成：node build.mjs —— scripts/check.mjs 会校验本文件与源码是否同步
 (() => {
   var __defProp = Object.defineProperty;
@@ -12,6 +12,7 @@
   var m3u8_parse_exports = {};
   __export(m3u8_parse_exports, {
     fetchText: () => fetchText,
+    fmtDur: () => fmtDur,
     isMasterCandidateM3U8: () => isMasterCandidateM3U8,
     masterFirst: () => masterFirst,
     parseDuration: () => parseDuration,
@@ -52,6 +53,12 @@
       total += parseFloat(m[1]);
     }
     return total;
+  }
+  function fmtDur(sec) {
+    const h = Math.floor(sec / 3600);
+    const m = Math.floor(sec % 3600 / 60);
+    const s = Math.round(sec % 60);
+    return h > 0 ? `${h}:${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}` : `${m}:${String(s).padStart(2, "0")}`;
   }
   function parseSegments(text, baseURL) {
     const list = [];
@@ -154,6 +161,7 @@
   // src/background/cli-args.js
   var cli_args_exports = {};
   __export(cli_args_exports, {
+    assembleGoCommand: () => assembleGoCommand,
     quoteArg: () => quoteArg,
     sanitizeFileName: () => sanitizeFileName
   });
@@ -164,7 +172,52 @@
   function quoteArg(v) {
     return String(v == null ? "" : v).replace(CONTROL_CHARS, "").replace(/"/g, "").trim();
   }
+  function assembleGoCommand(m3u8URL, pageURL, outName, exePath) {
+    const exe = quoteArg(exePath) || "go-catcher.exe";
+    const args = [`"${exe}"`];
+    if (m3u8URL) args.push(`--url="${quoteArg(m3u8URL)}"`);
+    if (pageURL) args.push(`--referer="${quoteArg(pageURL)}"`);
+    if (outName) args.push(`-o "${outName}"`);
+    return ["chcp 65001", args.join(" ")].join(" ; ");
+  }
+
+  // src/background/media-url.js
+  var media_url_exports = {};
+  __export(media_url_exports, {
+    isCandidateURL: () => isCandidateURL,
+    isPlaylistURL: () => isPlaylistURL
+  });
+  function isCandidateURL(u) {
+    try {
+      const p = new URL(u);
+      return /\.(m3u8|mp4)$/i.test(p.pathname) || !p.searchParams.has("url");
+    } catch {
+      return false;
+    }
+  }
+  function isPlaylistURL(u) {
+    try {
+      return /\.m3u8$/i.test(new URL(u).pathname);
+    } catch {
+      return false;
+    }
+  }
+
+  // src/background/html-escape.js
+  var html_escape_exports = {};
+  __export(html_escape_exports, {
+    escapeHtml: () => escapeHtml
+  });
+  function escapeHtml(s) {
+    return String(s).replace(/[&<>"']/g, (c) => ({
+      "&": "&amp;",
+      "<": "&lt;",
+      ">": "&gt;",
+      '"': "&quot;",
+      "'": "&#39;"
+    })[c]);
+  }
 
   // src/content-shared-entry.js
-  globalThis.__m3u8Shared = { ...m3u8_parse_exports, ...cli_args_exports };
+  globalThis.__m3u8Shared = { ...m3u8_parse_exports, ...cli_args_exports, ...media_url_exports, ...html_escape_exports };
 })();

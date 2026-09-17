@@ -42,6 +42,20 @@ export function parseDuration(text) {
   return total;
 }
 
+// fmtDur 是 parseDuration 的反向：把秒数写成给人看的时长（"3:07" / "1:02:03"）。
+// 唯一实现（评审 P3-6）：浮层（content.js）与下载器页面（downloader.js）此前
+// 各有一份**逐字相同**的拷贝——同一份播放列表解析出来的时长，却在两处各写一次
+// 格式化，改动只落一处就会出现"浮层显示 3:07、扩展页显示 3:07.0"这类不一致。
+// 放在解析模块里是因为它和 parseDuration 是一对（前者的输出正是后者的输入）。
+export function fmtDur(sec) {
+  const h = Math.floor(sec / 3600);
+  const m = Math.floor((sec % 3600) / 60);
+  const s = Math.round(sec % 60);
+  return h > 0
+    ? `${h}:${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}`
+    : `${m}:${String(s).padStart(2, "0")}`;
+}
+
 export function parseSegments(text, baseURL) {
   const list = [];
   for (const raw of text.split("\n")) {

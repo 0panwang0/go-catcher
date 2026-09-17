@@ -1,6 +1,8 @@
 // 页面归属判定与候选筛选：从嗅探列表里挑出「属于当前页面 / 这个视频」的记录。
 import { isMasterCandidateM3U8, masterFirst } from "./m3u8-parse.js";
 import { readLists } from "./list-store.js";
+// isCandidateURL 的唯一实现在 media-url.js：下载器页面用的是同一份（评审 P3-6）。
+import { isCandidateURL } from "./media-url.js";
 
 // hostOf 提取 hostname（非法 URL 返回空串；旧记录无该字段时安全）。
 export function hostOf(u) {
@@ -25,14 +27,7 @@ export function sameSite(it, pageUrl) {
 // isCandidateURL 嗅探记录读出自愈：过滤历史上被误录的解析页 URL（路径无媒体
 // 扩展名、靠 ?url= 跳转参数尾部伪装 .m3u8）。路径带扩展名、或不含 ?url=
 // 参数的记录才作为候选（?url= 是第三方解析页的通用签名）。
-export function isCandidateURL(u) {
-  try {
-    const p = new URL(u);
-    return /\.(m3u8|mp4)$/i.test(p.pathname) || !p.searchParams.has("url");
-  } catch {
-    return false;
-  }
-}
+// 实现见 media-url.js（与下载器页面共用一份）。
 
 // hostCandidates 取与 pageUrl 同站的全部嗅探记录（顶层页或发起 frame 任一
 // 命中），master 候选排前。

@@ -21,6 +21,8 @@ const DIR = path.join(__dirname, "..");
 const IMPORT_RE = /^import \{[^}]*\} from "\.\.?\/[^"]+";$/;
 const PARSE_MODULE = "./src/background/m3u8-parse.js";
 const CLI_MODULE = "./src/background/cli-args.js";
+const MEDIA_URL_MODULE = "./src/background/media-url.js";
+const HTML_ESCAPE_MODULE = "./src/background/html-escape.js";
 const PAGE = "downloader.js";
 
 const src = fs.readFileSync(path.join(DIR, PAGE), "utf8");
@@ -107,8 +109,30 @@ check("无自带的容器识别/加密守卫（已由服务端承担）",
 check("走服务端：下载入口是 downloadViaServer 消息", /type: "downloadViaServer"/.test(src));
 check("解析只有一份源码：import 共享解析模块",
   importLines.some((l) => l.includes(PARSE_MODULE) && l.includes("parseSegments") && l.includes("parseVariants")));
-check("文本净化也只有一份源码：import 共享 cli-args 模块",
-  importLines.some((l) => l.includes(CLI_MODULE) && l.includes("quoteArg") && l.includes("sanitizeFileName")));
+check("文本净化 / 命令拼装只有一份源码：import 共享 cli-args 模块",
+  importLines.some((l) => l.includes(CLI_MODULE) && l.includes("sanitizeFileName") && l.includes("assembleGoCommand")));
+
+// ------------------------------------------------------------
+// P3-6：四份"两边都有、靠注释保持一致"的拷贝已收进共享模块。
+// 症状分别是：候选判定漂移（浮层能下的链接扩展页下不了）、转义漂移（用户可控
+// 文本原样进 innerHTML）、时长显示漂移。判据是"本文件不许再定义它们"——
+// 定义一回来，就又是一份会各自漂移的拷贝。
+// ------------------------------------------------------------
+console.log("结构性守卫：共享实现不再各留一份拷贝（P3-6）");
+for (const fn of ["isCandidateURL", "isPlaylistURL", "escapeHtml", "fmtDur"]) {
+  check(`downloader.js 不再定义 ${fn}（改用共享模块）`,
+    !new RegExp(`function\\s+${fn}\\s*\\(`).test(src));
+}
+check("import 共享 media-url 模块（候选判定与播放列表判定）",
+  importLines.some((l) => l.includes(MEDIA_URL_MODULE) && l.includes("isCandidateURL") && l.includes("isPlaylistURL")));
+check("import 共享 html-escape 模块",
+  importLines.some((l) => l.includes(HTML_ESCAPE_MODULE) && l.includes("escapeHtml")));
+
+// buildGoCommand 收缩成"薄适配层"：只决定输出文件名怎么算，拼装交给共享实现。
+const bgcBody = (src.match(/function buildGoCommand[\s\S]*?\n\}/) || [""])[0];
+check("buildGoCommand 委托给共享 assembleGoCommand", /assembleGoCommand\(/.test(bgcBody), bgcBody);
+check("buildGoCommand 里不再自己拼 chcp / 自己净化引号",
+  !/chcp/.test(bgcBody) && !/quoteArg/.test(bgcBody), bgcBody);
 
 console.log("import 接线（共享模块的函数确实可用）");
 const PLAIN = "#EXTM3U\n#EXT-X-VERSION:3\n#EXTINF:6.0,\nseg0.ts\n#EXTINF:6.0,\nseg1.ts\n#EXT-X-ENDLIST\n";
@@ -123,6 +147,10 @@ const variants = api.parseVariants(MASTER, "https://cdn.example.com/a/index.m3u8
 check("parseVariants 按码率降序", variants.length === 2 && variants[0].bandwidth === 3000000, variants);
 check("shortQuality 取标签首段", api.shortQuality(variants[0]) === "1080P", api.shortQuality(variants[0]));
 check("qualityFromURL 从路径取画质", api.qualityFromURL("https://x.com/a/1080p/v.m3u8") === "1080P");
+check("fmtDur 秒 → 时长（转出的是共享实现，不是本文件的拷贝）",
+  api.fmtDur(187) === "3:07" && api.fmtDur(3723) === "1:02:03", [api.fmtDur(187), api.fmtDur(3723)]);
+check("escapeHtml 五个有语义的字符都转（含单引号：属性值可能用单引号包裹）",
+  api.escapeHtml("&<>\"'") === "&amp;&lt;&gt;&quot;&#39;", api.escapeHtml("&<>\"'"));
 
 console.log("isPlaylistURL：区分播放列表与 MP4 直链");
 check(".m3u8 → true", api.isPlaylistURL("https://x.com/a/b.m3u8") === true);

@@ -20,7 +20,9 @@ import {
   resetListCache,
 } from "./list-store.js";
 import { installSniffProbes, contentTypeMediaType, isLikelyFullFile } from "./sniff-probes.js";
-import { sameSite, isCandidateURL, findSniffedByURL } from "./page-match.js";
+import { sameSite, findSniffedByURL } from "./page-match.js";
+// isCandidateURL 的唯一实现在 media-url.js（下载器页面共用同一份，评审 P3-6）
+import { isCandidateURL } from "./media-url.js";
 import { getVideoSources, getVideoSource, openDownloader } from "./video-source.js";
 import {
   getSettings,

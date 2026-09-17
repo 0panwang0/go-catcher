@@ -54,3 +54,23 @@ export function quoteArg(v) {
     .replace(/"/g, "")
     .trim();
 }
+
+// assembleGoCommand 拼装「单文件 exe 直下」的兜底命令（服务没起来时用户唯一的手段）。
+// 三条形态约束（评审 P2-8 / F9）：
+//   · 用 ; 而不是 && —— PowerShell 5.1 不认 && 作语句分隔符；
+//   · 每个值先过 quoteArg 再包双引号 —— bash 会按空白切位置参数，
+//     而值里的引号必须在这里就被剔掉（见上面那条注释）；
+//   · 前缀 chcp 65001 —— 否则中文标题在 cmd 里是乱码。
+//
+// 输出文件名由**调用方算好传入**：这是两个调用方唯一有意不同的一处（浮层用
+// content.js 的 buildOutputName，扩展页用 downloader.js 的 makeFilename，
+// 两个函数的头部各有一张对照表）。把差异挡在参数外，拼装逻辑就只剩这一份
+// （评审 P3-6：此前两侧各有一份同形实现，靠注释提醒"保持一致"）。
+export function assembleGoCommand(m3u8URL, pageURL, outName, exePath) {
+  const exe = quoteArg(exePath) || "go-catcher.exe";
+  const args = [`"${exe}"`];
+  if (m3u8URL) args.push(`--url="${quoteArg(m3u8URL)}"`);
+  if (pageURL) args.push(`--referer="${quoteArg(pageURL)}"`);
+  if (outName) args.push(`-o "${outName}"`);
+  return ["chcp 65001", args.join(" ")].join(" ; ");
+}

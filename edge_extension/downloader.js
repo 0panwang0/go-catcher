@@ -9,14 +9,17 @@
 // （没有解密能力）和 fMP4（init 段不在分片列表里）必然产出打不开的文件，而日志
 // 照样打印"已保存"，是最隐蔽的一类损坏。那套实现连同它自带的 m3u8 解析已整体删除。
 //
-// 解析与文本净化现在只有一份源码：src/background/m3u8-parse.js 与 cli-args.js
+// 解析、文本净化、媒体 URL 判定、HTML 转义现在都只有一份源码：
+// src/background/{m3u8-parse,cli-args,media-url,html-escape}.js
 // （service worker 打包时用的也是它们；content.js 经 content-shared.js 取同一份）。
 // 本文件是 ES 模块，直接 import——不再有"改一处忘另一处"。
-// ⚠ 下面这两行 import 必须各自保持**单行**：tests/downloader.test.js 在 node 里靠
+// ⚠ 下面这几行 import 必须各自保持**单行**：tests/downloader.test.js 在 node 里靠
 //   「去掉 import 行 + 逐个前置展开模块源码」来加载本文件（node 无法直接 import
 //   扩展页脚本，也不值得为它改 package.json 的 type）。
-import { fetchText, parseDuration, parseSegments, parseVariants, shortQuality, qualityFromURL } from "./src/background/m3u8-parse.js";
-import { sanitizeFileName, quoteArg } from "./src/background/cli-args.js";
+import { fetchText, parseDuration, parseSegments, parseVariants, shortQuality, qualityFromURL, fmtDur } from "./src/background/m3u8-parse.js";
+import { sanitizeFileName, assembleGoCommand } from "./src/background/cli-args.js";
+import { isCandidateURL, isPlaylistURL } from "./src/background/media-url.js";
+import { escapeHtml } from "./src/background/html-escape.js";
 
 const ANALYZE_LIMIT = 12; // 最多分析的嗅探条数
 const MAIN_VIDEO_MIN = 60; // 时长 >= 60s 判定为主视频
@@ -25,27 +28,9 @@ const POLL_MAX_MISSES = 15; // 连续查不到任务多少次后放弃（≈10s�
 
 const $ = (sel) => document.querySelector(sel);
 
-// isCandidateURL 与 background 侧同名实现保持一致（两个 JS 上下文隔离，无法共享）：
-// 过滤路径无媒体扩展名、靠 ?url= 参数尾部伪装 .m3u8 的解析页假链接——点它下载
-// 拉回的是 HTML 网页，任务必然失败。
-function isCandidateURL(u) {
-  try {
-    const p = new URL(u);
-    return /\.(m3u8|mp4)$/i.test(p.pathname) || !p.searchParams.has("url");
-  } catch {
-    return false;
-  }
-}
-
-// isPlaylistURL 是否是 m3u8 播放列表地址。用它把"要不要先解析档位"和"直接下 MP4
-// 直链"分开：对 MP4 直链去 fetchText 会把整个视频当文本读进内存，纯粹是浪费。
-function isPlaylistURL(u) {
-  try {
-    return /\.m3u8$/i.test(new URL(u).pathname);
-  } catch {
-    return false;
-  }
-}
+// isCandidateURL / isPlaylistURL 由 media-url.js 提供（import 在文件头）：
+// 这两条判定此前本文件与 background 侧各写一份、靠注释互相提醒"保持一致"，
+// 而漂移的症状是「浮层能下的链接，扩展页下不了」（评审 P3-6）。
 
 let running = false;
 let lastCommand = ""; // 最近一次失败时生成的终端兜底命令
@@ -274,20 +259,9 @@ function renderList(list) {
   }
 }
 
-function escapeHtml(s) {
-  return String(s).replace(/[&<>"']/g, (c) => ({
-    "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;",
-  }[c]));
-}
-
-function fmtDur(sec) {
-  const h = Math.floor(sec / 3600);
-  const m = Math.floor((sec % 3600) / 60);
-  const s = Math.round(sec % 60);
-  return h > 0
-    ? `${h}:${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}`
-    : `${m}:${String(s).padStart(2, "0")}`;
-}
+// escapeHtml / fmtDur 也搬到了共享模块（html-escape.js / m3u8-parse.js）：
+// 这两份此前与 content.js 侧的拷贝**逐字相同**，即"两边都能跑，改一处只对一边生效"
+// —— escapeHtml 漏一处的后果是把用户可控文本原样塞进 innerHTML（评审 P3-6）。
 
 // ============================================================
 // 下载主流程（本页不下载，只调服务 + 报进度）
@@ -480,22 +454,20 @@ function showProgress(pct, stage) {
 // 服务不可用时的兜底：把 CLI 直下命令交给用户复制
 // ============================================================
 // 生成跨 PowerShell / Git Bash / cmd 都能直接粘贴运行的命令。
-// 与 content.js 的 buildGoCommand 同一形态（那跑在页面世界，靠 content-shared.js
-// 拿到同一份 quoteArg）：用 ; 作语句分隔符（PowerShell 5.1 不支持 &&），
-// 路径加双引号（bash 会按空白切片），值里的引号与控制字符必须先剔除
-// ——见 src/background/cli-args.js 的 quoteArg 注释。
+// 拼装本身（chcp 前缀 / 引号 / ; 分隔 / 逐值净化）走共享的 assembleGoCommand——唯一实现；
+// 本函数只剩一件事：把「输出文件名怎么算」翻译成它的入参，见下面 makeFilename 对照表。
+// 这里与 content.js 的 buildGoCommand **有意**不同：本页的档位是用户从 master 里手选的，
+// 画质直接来自被选中的变体；浮层没有选择面，只能从 URL 里猜（qualityFromURL）。
 function buildGoCommand(m3u8URL, pageURL, videoName, exePath) {
-  const exe = quoteArg(exePath) || "go-catcher.exe";
-  const args = [`"${exe}"`];
-  if (m3u8URL) args.push(`--url="${quoteArg(m3u8URL)}"`);
-  if (pageURL) args.push(`--referer="${quoteArg(pageURL)}"`);
   const outName = makeFilename(m3u8URL, videoName, qualityFromURL(m3u8URL));
-  if (outName) args.push(`-o "${outName}"`);
-  return ["chcp 65001", args.join(" ")].join(" ; ");
+  return assembleGoCommand(m3u8URL, pageURL, outName, exePath);
 }
 
 // exe 路径优先级：设置里显式填的（等于默认值 go-catcher.exe 视为未填）→
 // 服务自报的路径（refreshSvcStatus 顺带缓存）→ 裸文件名（依赖 PATH）。
+// ⚠ 与 content.js 的 getExePath 是同一套优先级，措辞也刻意保持相同；那边多一跳
+//   （缓存为空时让 background 代问 /svc/info——页面世界直发本机请求会被 CORS 挡）。
+//   两份有意保留（评审 P3-6 留档）：改这条优先级时两处必须一起改。
 async function getExePath() {
   const s = await chrome.storage.local.get({ exePath: "", detectedExePath: "" });
   const custom = String(s.exePath || "").trim();
@@ -517,13 +489,31 @@ function hideFallback() {
 }
 
 // ============================================================
-// 文件名
+// 文件名：makeFilename —— 与 content.js 的 buildOutputName 的对照
+// ------------------------------------------------------------
+// 优先 "视频名称_画质.扩展名"，拿不到名称就退回 URL 路径段。扩展名只是个初值——
+// 服务端会按实际探测到的容器改名（fMP4 → .mp4），所以这里不必也不能猜容器。
+//
+// 这一对**不合并**（评审 P3-6 明说了"受 content script 限制的先留档"）：
+// 两者的输入不同，强行统一会让一侧失真。但凡是两侧应当一致的部分，都由共享
+// 函数决定，并由 tests/filename-consistency.test.js 逐条钉住（有标题时必须
+// 逐字节相同）。对照表如下：
+//
+//   维度           本页 makeFilename            浮层 buildOutputName
+//   -------------  ---------------------------  ---------------------------
+//   画质来源       调用方传入（用户手选的档位）  从 URL 推断 qualityFromURL
+//   无标题兜底     路径段用 _ 连起来            取倒数第一个非画质段
+//   名字仍为空     video_<毫秒时间戳>          返回空串（不传 -o）
+//   扩展名         可传参（默认 .ts）           固定 .ts
+//   -------------  ---------------------------  ---------------------------
+//   名称清洗       sanitizeFileName             sanitizeFileName
+//   画质段剔除     跳过 2160p…240p              跳过 2160p…240p
+//   长度上限       80 字符                     80 字符
+//
+// 「画质来源」这一行的差异是有意的：本页能弹档位选择框，学到的画质是 CDN 自报的，
+// 比从 URL 猜准；浮层没有选择面。但两侧**默认路径**下画质都出自共享的
+// qualityFromURL，所以同一个视频从哪进去下载，文件名后缀都一样（评审 P2-7）。
 // ============================================================
-// makeFilename 优先 "视频名称_画质.扩展名"，拿不到名称就退回 URL 路径段。
-// 扩展名只是个初值——服务端会按实际探测到的容器改名（fMP4 → .mp4），
-// 所以这里不必也不能猜容器。
-// 名称清洗走共享的 sanitizeFileName（含控制字符过滤与碎屑归并），
-// 与 content.js 的 buildOutputName 同一套规则。
 function makeFilename(m3u8URL, videoName, quality, ext = "ts") {
   const suffix = sanitizeFileName(quality || "");
   let base = String(videoName || "").trim();
@@ -571,6 +561,11 @@ async function refreshSvcStatus() {
 }
 
 // 扩展页面直连 /svc/info 缓存服务自报的 exe 路径（本页面有 host 权限，fetch 不受限）
+// ⚠ 与 src/background/server-api.js 的 detectExePath 是**同一个目的、两条通道**，
+//   有意不合并（评审 P3-6）：那边跑在 service worker 里、借 getApiToken 的握手
+//   顺带写令牌，本页不需要令牌（下载一律经消息交给 service worker），直连更短。
+//   两处写的是同一个 storage 键 detectedExePath，值同源（/svc/info 的 exe 字段），
+//   谁先跑谁生效——所以这里改字段名时必须连那边一起改。
 async function detectExePath(port) {
   try {
     const resp = await fetch(`http://127.0.0.1:${port}/svc/info`, { cache: "no-store" });
@@ -597,5 +592,7 @@ export const __test__ = {
   shortQuality,
   qualityFromURL,
   sanitizeFileName,
-  quoteArg,
+  assembleGoCommand,
+  fmtDur,
+  escapeHtml,
 };

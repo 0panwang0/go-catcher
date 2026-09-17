@@ -316,6 +316,16 @@ var __m3u8catcher = (() => {
     return (b.time || 0) - (a.time || 0);
   }
 
+  // src/background/media-url.js
+  function isCandidateURL(u) {
+    try {
+      const p = new URL(u);
+      return /\.(m3u8|mp4)$/i.test(p.pathname) || !p.searchParams.has("url");
+    } catch {
+      return false;
+    }
+  }
+
   // src/background/page-match.js
   function hostOf(u) {
     try {
@@ -329,14 +339,6 @@ var __m3u8catcher = (() => {
     const h = hostOf(pageUrl);
     if (!h) return false;
     return hostOf(it.pageUrl) === h || hostOf(it.frameUrl) === h;
-  }
-  function isCandidateURL(u) {
-    try {
-      const p = new URL(u);
-      return /\.(m3u8|mp4)$/i.test(p.pathname) || !p.searchParams.has("url");
-    } catch {
-      return false;
-    }
   }
   async function hostCandidates(pageUrl) {
     const { m3u8_list, mp4_list } = await readLists();

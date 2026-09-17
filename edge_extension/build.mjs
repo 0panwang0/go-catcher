@@ -61,7 +61,7 @@ const TARGETS = [
     outfile: "content-shared.js",
     banner:
       "// 自动生成，请勿手改。\n" +
-      "// 源：src/background/m3u8-parse.js + src/background/cli-args.js（经 src/content-shared-entry.js 汇总）\n" +
+      "// 源：src/background/ 下的共享模块（清单见 src/content-shared-entry.js 的 import）\n" +
       "// 重新生成：node build.mjs —— scripts/check.mjs 会校验本文件与源码是否同步",
   },
 ];
