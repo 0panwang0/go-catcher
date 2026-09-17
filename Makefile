@@ -65,14 +65,16 @@ check:
 
 # ============================================================
 # Edge 扩展（与 CI 的 extension job 同一套判定）
-# 源码是 src/background/ 下的 ES 模块，esbuild 打包成单文件 background.js；
-# bundle 提交进仓库（用户"解压即加载"无需构建），所以改了 src/ 必须重新打包。
+# 源码是 src/background/ 下的 ES 模块，esbuild 打包成两个产物：
+#   background.js      —— service worker（src/background/main.js）
+#   content-shared.js  —— content script 侧的共享实现（src/content-shared-entry.js）
+# 两者都提交进仓库（用户"解压即加载"无需构建），所以改了 src/ 必须重新打包。
 # 需要 Node 22+：downloader.js 是 ES 模块（import 共享解析源码），
 # `node --check` 对 .js 的模块语法探测要 22.7+，Node 18 会误报语法错误。
 # 首次会自动 npm install。
 # ============================================================
 
-# 打包：src/background/*.js → edge_extension/background.js
+# 打包：src/background/*.js → edge_extension/background.js + edge_extension/content-shared.js
 # 依赖自举在 build.mjs 里（node_modules 缺失才 npm install），这里不写任何
 # sh 专属语法（`{ ... }` / `$$(...)`），cmd 与 sh 都能跑（&& 两种 shell 通用）。
 ext:
