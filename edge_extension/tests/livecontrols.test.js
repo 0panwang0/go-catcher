@@ -40,6 +40,10 @@ const document = {
 };
 const mod = { exports: {} };
 
+// content.js 顶层要求共享对象已注入（缺失立即抛——评审自审 #11 的显式失败口径，
+// 不再降级成空对象）。本文件只测纯函数，给个最小桩让顶层通过即可。
+globalThis.__m3u8Shared = { sanitizeFileName: (s) => s, qualityFromURL: () => "" };
+
 new Function(
   "window",
   "document",
@@ -118,7 +122,16 @@ check("trackDownload 按服务端 live 字段更新本地态",
 check("activeLive 有初值（首帧不至于先画成点播）", /let activeLive\s*=/.test(src));
 check("sendControl 未把 stop 排除在外", /"stop"|'stop'/.test(src));
 const apiSrc = fs.readFileSync(path.join(DIR, "src", "background", "server-api.js"), "utf8");
-check("server-api actionMap 含 stop → /stop", /stop:\s*"stop"/.test(apiSrc));
+check("server-api actionMap 含 stop → /stop 且走 POST",
+  /stop:\s*\{\s*path:\s*"stop",\s*method:\s*"POST"\s*\}/.test(apiSrc));
+check("server-api actionMap resume 走 POST（与 Go 侧 routeDefs 同步）",
+  /resume:\s*\{\s*path:\s*"resume",\s*method:\s*"POST"\s*\}/.test(apiSrc));
+check("server-api actionMap pause/cancel 维持历史 GET 契约",
+  /pause:\s*\{\s*path:\s*"pause",\s*method:\s*"GET"\s*\}/.test(apiSrc) &&
+  /cancel:\s*\{\s*path:\s*"cancel",\s*method:\s*"GET"\s*\}/.test(apiSrc));
+check("controlTask 把动作的方法带给 apiFetch", /method:\s*act\.method/.test(apiSrc));
+check("triggerDownload 按本任务重算 activeLive（清上一任务的直播残留）",
+  /activeLive = !!\(source && source\.live\)/.test(src));
 check("queryDownload 把 live 透出给 content.js", /live:\s*!!t\.live/.test(apiSrc));
 
 console.log("反向断言：直播不再被承诺\"可暂停/继续\"");

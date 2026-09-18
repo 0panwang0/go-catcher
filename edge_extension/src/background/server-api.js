@@ -248,17 +248,25 @@ export async function queryDownload(msg) {
 }
 
 // 对 Go server 上某任务执行控制动作：pause / resume / stop / cancel
-// action 直接作为 URL 路径段，id 作为查询参数（与 server 路由一致）
+// id 作为查询参数（与 server 路由一致）；方法按动作分：/stop · /resume 有副作用，
+// 服务端按"新端点勿模仿"口径只收 POST；/pause · /cancel 是与 /download 同批的
+// 历史 GET 契约，维持不动（见 server.go 路由表注释）。
 //
 // stop 与 pause 的分工由服务端把关（它才是唯一权威）：
 //   - /stop  只对直播有效（结束录制并把已录部分收尾成正式文件）
 //   - /pause 对直播返回 400，/resume 同理 —— 直播没有断点可续
 // 所以扩展侧不能凭"界面看起来该给暂停"就发 pause，得先看 taskState.live。
+const actionMap = {
+  pause: { path: "pause", method: "GET" },
+  resume: { path: "resume", method: "POST" },
+  stop: { path: "stop", method: "POST" },
+  cancel: { path: "cancel", method: "GET" },
+};
+
 export async function controlTask({ taskId, action } = {}) {
   if (!taskId) return { ok: false, error: "缺少 taskId" };
-  const actionMap = { pause: "pause", resume: "resume", stop: "stop", cancel: "cancel" };
-  const path = actionMap[action];
-  if (!path) return { ok: false, error: `未知动作: ${action}` };
+  const act = actionMap[action];
+  if (!act) return { ok: false, error: `未知动作: ${action}` };
 
   const healthy = await pingServer();
   if (!healthy) {
@@ -266,8 +274,8 @@ export async function controlTask({ taskId, action } = {}) {
   }
   try {
     const resp = await apiFetch(
-      `/${path}?id=${encodeURIComponent(taskId)}`,
-      { cache: "no-store" }
+      `/${act.path}?id=${encodeURIComponent(taskId)}`,
+      { method: act.method, cache: "no-store" }
     );
     const body = await resp.json().catch(() => ({}));
     if (!resp.ok) {

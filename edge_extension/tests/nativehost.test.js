@@ -171,10 +171,19 @@ function fakePort() {
   }
 
   console.log("常量一致性：");
+  // 与 Go 侧常量真身逐字对照，而不是测试内的硬编码字面量 —— 那样只证明
+  // "JS 侧没改"，防不了两侧漂移（评审自审 #15）。两处漂移的症状是
+  // "唤起永远失败且无任何报错"，这正是本文件要防的头号故障。
+  const goSrc = fs.readFileSync(
+    path.join(__dirname, "..", "..", "internal", "platform", "nativehost_windows.go"),
+    "utf8"
+  );
+  const goMatch = goSrc.match(/NativeHostName\s*=\s*"([^"]+)"/);
+  check("Go 侧 NativeHostName 常量存在且可提取", !!goMatch, goMatch && goMatch[1]);
   check(
     "宿主名与 Go 侧登记的 NATIVE_HOST_NAME 一致",
-    api.NATIVE_HOST_NAME === "com.gocatcher.browser_host",
-    api.NATIVE_HOST_NAME
+    !!goMatch && api.NATIVE_HOST_NAME === goMatch[1],
+    { js: api.NATIVE_HOST_NAME, go: goMatch && goMatch[1] }
   );
 
   console.log(`\n${pass} passed, ${fail} failed`);

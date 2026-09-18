@@ -10,7 +10,8 @@ export function openDownloader(item) {
   params.set("title", item.title || "");
   params.set("pageUrl", item.pageUrl || "");
   params.set("quality", item.quality || "");
-  params.set("format", item.type || "ts");
+  // 不带 format：downloader 页从不读它（全扩展无 get("format") 消费者，
+  // 是历史残留的死参数，评审自审 #15）。
   chrome.tabs.create({
     url: chrome.runtime.getURL("downloader.html?" + params.toString()),
   });

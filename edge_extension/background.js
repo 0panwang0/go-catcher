@@ -414,7 +414,6 @@ var __m3u8catcher = (() => {
     params.set("title", item.title || "");
     params.set("pageUrl", item.pageUrl || "");
     params.set("quality", item.quality || "");
-    params.set("format", item.type || "ts");
     chrome.tabs.create({
       url: chrome.runtime.getURL("downloader.html?" + params.toString())
     });
@@ -779,19 +778,24 @@ var __m3u8catcher = (() => {
       return { exists: false, error: String(e) };
     }
   }
+  var actionMap = {
+    pause: { path: "pause", method: "GET" },
+    resume: { path: "resume", method: "POST" },
+    stop: { path: "stop", method: "POST" },
+    cancel: { path: "cancel", method: "GET" }
+  };
   async function controlTask({ taskId, action } = {}) {
     if (!taskId) return { ok: false, error: "\u7F3A\u5C11 taskId" };
-    const actionMap = { pause: "pause", resume: "resume", stop: "stop", cancel: "cancel" };
-    const path = actionMap[action];
-    if (!path) return { ok: false, error: `\u672A\u77E5\u52A8\u4F5C: ${action}` };
+    const act = actionMap[action];
+    if (!act) return { ok: false, error: `\u672A\u77E5\u52A8\u4F5C: ${action}` };
     const healthy = await pingServer();
     if (!healthy) {
       return { ok: false, error: "\u672C\u5730 Go \u4E0B\u8F7D\u670D\u52A1\u672A\u542F\u52A8", code: "SERVER_DOWN" };
     }
     try {
       const resp = await apiFetch(
-        `/${path}?id=${encodeURIComponent(taskId)}`,
-        { cache: "no-store" }
+        `/${act.path}?id=${encodeURIComponent(taskId)}`,
+        { method: act.method, cache: "no-store" }
       );
       const body = await resp.json().catch(() => ({}));
       if (!resp.ok) {

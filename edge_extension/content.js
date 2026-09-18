@@ -11,10 +11,14 @@
   if (window.__m3u8_catcher_injected__) return;
   window.__m3u8_catcher_injected__ = true;
 
-  // 唯一实现的取用口。取不到时**不降级成第二份实现**——调用点会立刻抛错、
-  // 被上层 catch 成"分析失败"。显式失败好过用一份漂移过的拷贝静默算出
-  // 不同结果（评审 P2-7 的教训：同名不同序的 variantLabel 会静默算错画质）。
-  const P = globalThis.__m3u8Shared || {};
+  // 唯一实现的取用口。取不到是**装配错误**（content-shared.js 缺失、或 manifest
+  // 里没排在 content.js 之前），不是运行时可降级的环境差异：降级成空对象只会把
+  // 故障推迟到第一次 P.fn() 才以 TypeError 暴露，报错点离根因很远（评审自审
+  // #11）。装配错了就立刻死、死得可读——上层 catch 会把它呈现成"分析失败"。
+  const P = globalThis.__m3u8Shared;
+  if (!P) {
+    throw new Error("__m3u8Shared 未注入：content-shared.js 缺失或未先于 content.js 执行");
+  }
 
   const MIN_W = 200;
   const MIN_H = 120;
@@ -1147,6 +1151,11 @@
       // 目录已选好，Go 已开始落盘 → 进入进度面板
       // 多任务并发：记录本次任务 id，供后续轮询精确定位（多个标签页各下各的互不串扰）
       activeTaskId = resp.taskId || null;
+      // live 标记按本任务重算：上个任务若是直播，残留的 true 会让点播任务首帧
+      // 画出「停止（保存已录）」（评审自审 #13）。嗅探的 live 是启发式——false
+      // 不代表点播，误判由第一次轮询以服务端字段纠正；这里重算只为清掉上一个
+      // 任务的残留、并让本任务 sniff 到的 true 即刻生效。
+      activeLive = !!(source && source.live);
       activePaused = false;
       showPanel("initiated", {
         ...source,
@@ -1169,10 +1178,8 @@
 
   // 追踪 Go server 下载进度（轮询 /status），把阶段/百分比回写到面板，并按暂停态切换控制按钮
   function trackDownload(source) {
-    // 首帧先用嗅探结果占位（服务端的 live 标记要等第一次轮询才到），否则会先
-    // 闪一下点播的「暂停」按钮 —— 而直播点它就是一条 400。只做单向置位：
-    // 嗅探的 live 是启发式，false 不代表点播，不能反向覆盖。
-    if (source && source.live) activeLive = true;
+    // 首帧的 live 标记由 triggerDownload 在进面板前按本任务重算（嗅探启发式），
+    // 服务端的权威标记要等第一次轮询才到；任一状态变化都会重画控件。
     const interval = setInterval(async () => {
       try {
         const resp = await chrome.runtime.sendMessage({ type: "queryDownload", taskId: activeTaskId });
