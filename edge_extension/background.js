@@ -90,6 +90,7 @@ var __m3u8catcher = (() => {
           await flushDirty();
         } catch (e) {
           console.error("[M3U8 Video Catcher] \u55C5\u63A2\u5217\u8868\u843D\u76D8\u5931\u8D25\uFF08\u5DF2\u4FDD\u7559\u5F85\u91CD\u8BD5\uFF09:", e);
+          throw e;
         }
       }
       return v;
@@ -151,6 +152,7 @@ var __m3u8catcher = (() => {
       }
       cache[key] = list;
       dirtyKeys.add(key);
+    }).catch(() => {
     });
   }
   function updateMediaItem(key, url, patch) {
@@ -359,6 +361,16 @@ var __m3u8catcher = (() => {
     const samePath = (it) => isSamePageURL(it.pageUrl, pageUrl);
     return { hostM3U8: hostM3U8.filter(samePath), hostMP4: hostMP4.filter(samePath) };
   }
+  async function listCandidates(pageUrl) {
+    const { hostM3U8, hostMP4 } = await hostCandidates(pageUrl);
+    const h = hostOf(pageUrl);
+    const keep = (it) => {
+      if (it.frameUrl && it.frameUrl === pageUrl) return true;
+      if (h && it.frameUrl && hostOf(it.frameUrl) === h) return true;
+      return isSamePageURL(it.pageUrl, pageUrl);
+    };
+    return { hostM3U8: hostM3U8.filter(keep), hostMP4: hostMP4.filter(keep) };
+  }
   function isSamePageURL(a, b) {
     if (!a || !b) return false;
     try {
@@ -408,7 +420,7 @@ var __m3u8catcher = (() => {
     });
   }
   async function getVideoSources({ src = "", pageUrl = "", embedUrl = "" }) {
-    const { hostM3U8, hostMP4 } = await pageCandidates(pageUrl);
+    const { hostM3U8, hostMP4 } = await listCandidates(pageUrl);
     const sources = [];
     if (/^https?:/i.test(src)) {
       sources.push({ type: "mp4", url: src, title: "", pageUrl, fromSrc: true });

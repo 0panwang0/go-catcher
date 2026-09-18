@@ -167,6 +167,31 @@ function check(name, cond, extra) {
     .then((r) => r, () => null);
   check("frameUrl 相等 → 认", frameHit && frameHit.url === M3U8, frameHit);
 
+  // ------------------------------------------------------------
+  // iframe URL 带一次性查询参数（时间戳 / 播放令牌）：列表宽、按钮严（P1-6）
+  //
+  // 页面世界拿到的 iframe URL 常带一次性参数，与嗅探记录里存的 frameUrl 不会
+  // 逐字符相等，但 hostname 稳定。两套语义必须分开：按钮宁缺勿假（证据不足就
+  // 不出按钮），列表宁多勿漏（用户在列表里看得到标题与体积，自己判断）。
+  // 收窄 button 口径时把列表一起收窄，症状就是"明明嗅到了却列不出来"。
+  // ------------------------------------------------------------
+  console.log("iframe URL 带一次性查询参数（列表宽 / 按钮严）：");
+  const FRAME_BASE = "https://player.example.com/embed/1";
+  store = {
+    m3u8_list: [
+      { url: M3U8, pageUrl: "https://site.example.com/watch/999", frameUrl: FRAME_BASE, title: "示例片", type: "m3u8", time: 1 },
+    ],
+    mp4_list: [],
+  };
+  api.resetListCache();
+  const withToken = FRAME_BASE + "?t=1712345678";
+  const listWithToken = await api.getVideoSources({ src: "", pageUrl: withToken });
+  check("列表：frame 同 host（查询参数不同）仍然列出", listWithToken.some((x) => x.url === M3U8), listWithToken);
+  const btnWithToken = await api
+    .getVideoSource({ src: "", pageUrl: withToken, title: "示例片" })
+    .then((r) => r, () => null);
+  check("按钮：同一场景仍然不出现（证据不足不给承诺）", btnWithToken === null, btnWithToken);
+
   console.log("isCandidateURL：");
   check("解析页假链接被过滤", api.isCandidateURL(PARSE_IFRAME) === false);
   check("真 m3u8 保留", api.isCandidateURL(M3U8) === true);

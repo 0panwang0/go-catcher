@@ -246,6 +246,22 @@ const rec = (i, extra = {}) => ({
   await api.recordMedia(rec(2).url, TOP, "", "乙", "m3u8", 0, 1);
   check("下次事务把上一次的脏数据一并写下去（重试生效）",
     store.m3u8_list.length === 2, store.m3u8_list.length);
+
+  // P1-5：有回执的入口必须把落盘失败报给调用方。此前 settle 只 console.error
+  // 再 return v，于是界面报「已保存 / 已清空」、磁盘上却没有（重启后列表回来），
+  // 与本文件自述的不变量 2/3 直接冲突。
+  failNext = true;
+  const updRes = await api
+    .updateMediaItem("m3u8_list", rec(1).url, { analyzed: true })
+    .then((r) => r, (e) => ({ rejected: String((e && e.message) || e) }));
+  check("落盘失败时 updateMediaItem 不得回 ok:true", !(updRes && updRes.ok === true), updRes);
+
+  failNext = true;
+  const clearRes = await api
+    .clearLists()
+    .then(() => ({ ok: true }), (e) => ({ rejected: String((e && e.message) || e) }));
+  check("落盘失败时 clearLists 不得假装清空成功", !(clearRes && clearRes.ok === true), clearRes);
+
   chrome.storage.local.set = realSet;
   console.error = realError;
 

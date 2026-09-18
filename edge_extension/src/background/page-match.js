@@ -68,6 +68,31 @@ export async function pageCandidates(pageUrl) {
   return { hostM3U8: hostM3U8.filter(samePath), hostMP4: hostMP4.filter(samePath) };
 }
 
+// listCandidates 供**候选列表**用（浮层的链接列表 / 用户自选）：宁多勿漏。
+//
+// 与 pageCandidates（按钮门控，宁缺勿假）只差一处：iframe 场景下，frameUrl 允许
+// 「同 host」而不要求「完全相同」。页面世界里的 content script 拿到的 iframe URL
+// 常带一次性查询参数（时间戳、播放令牌），与嗅探记录里存的 frameUrl 不会逐字符
+// 相等；而 hostname 稳定。按钮不吃这一档（证据不足就不出按钮），列表要给出来 ——
+// 用户在列表里看得到标题与体积，自己判断。
+//
+// 两套语义必须分开：把它们并成一套，要么按钮误报（同站就亮，点下去下到别的
+// 东西），要么列表静默变空（明明嗅到了却列不出来）。评审 P1-6 点的就是这个。
+//
+// 仍然**不含**「同站全集」那一级：同站 ≠ 同视频（首页的品牌动画、卡片预览都是
+// 同站整文件 mp4），加回来就是按钮误报的成因，列表同样不该认 —— 见
+// tests/embedmatch.test.js 的跨页面污染用例。
+export async function listCandidates(pageUrl) {
+  const { hostM3U8, hostMP4 } = await hostCandidates(pageUrl);
+  const h = hostOf(pageUrl);
+  const keep = (it) => {
+    if (it.frameUrl && it.frameUrl === pageUrl) return true;
+    if (h && it.frameUrl && hostOf(it.frameUrl) === h) return true;
+    return isSamePageURL(it.pageUrl, pageUrl);
+  };
+  return { hostM3U8: hostM3U8.filter(keep), hostMP4: hostMP4.filter(keep) };
+}
+
 // isSamePageURL 两个页面 URL 是否指向同一页：hostname 相同且 pathname 相同
 // （末尾斜杠归一化后比较；任一不可解析返回 false）。
 function isSamePageURL(a, b) {

@@ -274,13 +274,16 @@ async function startDownload(m3u8URL, pageURL, videoName, forcedPlaylistURL = ""
   hideFallback();
   const log = openLog();
 
+  // 定下要下载的播放列表。声明在 try 之外：catch 里的兜底命令必须用**用户实际
+  // 选中的那一档**（下面 catch 与 buildGoCommand 的注释说明了为什么），异常路径
+  // 也得能拿到它 —— 放 try 里一旦在任何一步之前抛错，catch 引用它就成 TDZ 错误。
+  let playlistURL = forcedPlaylistURL || m3u8URL;
+  let quality = forcedQuality || qualityFromURL(m3u8URL);
+
   try {
-    // 1. 定下要下载的播放列表。
-    //    forcedPlaylistURL 有值 = 调用方已指定具体档位，直接用；否则若还是 master
-    //    playlist，先让用户选一档。这一步是**可选增强**，CDN 拒绝/网络不通都只降级
-    //    为"不选档位"，照样把原 URL 交给服务端（它会自己取最高码率）。
-    let playlistURL = forcedPlaylistURL || m3u8URL;
-    let quality = forcedQuality || qualityFromURL(m3u8URL);
+    // 1. 若是 master playlist 且调用方没指定档位，先让用户选一档。
+    //    这一步是**可选增强**，CDN 拒绝/网络不通都只降级为"不选档位"，
+    //    照样把原 URL 交给服务端（它会自己取最高码率）。
     if (!forcedPlaylistURL && isPlaylistURL(m3u8URL)) {
       await injectReferer(m3u8URL, pageURL);
       const variants = await fetchMasterVariants(m3u8URL);
@@ -321,7 +324,10 @@ async function startDownload(m3u8URL, pageURL, videoName, forcedPlaylistURL = ""
   } catch (e) {
     log(`失败: ${e.message}`, "err");
     log("若本地服务未启动，请先打开 go-catcher.exe；也可用下方「复制命令」在终端直接下载。", "err");
-    await offerFallback(m3u8URL, pageURL, videoName);
+    // 兜底命令必须下**用户刚选中的那一档**：传原始 master 时 qualityFromURL 推不出
+    // 画质（master 的 URL 里没有档位标记），用户以为在下 720p，实际拿到的是服务端
+    // 自己选的最高码率、文件名也没有 _720P 后缀 —— 与界面上的选择对不上（评审 P1-2）。
+    await offerFallback(playlistURL, pageURL, videoName, quality);
     console.error(e);
   } finally {
     running = false;
@@ -456,10 +462,11 @@ function showProgress(pct, stage) {
 // 生成跨 PowerShell / Git Bash / cmd 都能直接粘贴运行的命令。
 // 拼装本身（chcp 前缀 / 引号 / ; 分隔 / 逐值净化）走共享的 assembleGoCommand——唯一实现；
 // 本函数只剩一件事：把「输出文件名怎么算」翻译成它的入参，见下面 makeFilename 对照表。
-// 这里与 content.js 的 buildGoCommand **有意**不同：本页的档位是用户从 master 里手选的，
-// 画质直接来自被选中的变体；浮层没有选择面，只能从 URL 里猜（qualityFromURL）。
-function buildGoCommand(m3u8URL, pageURL, videoName, exePath) {
-  const outName = makeFilename(m3u8URL, videoName, qualityFromURL(m3u8URL));
+// 这里与 content.js 的 buildGoCommand **有意**不同：本页的档位是用户从 master 里手选的
+// （quality 由调用方传入；它可能取自档位标签，URL 路径里不一定带画质标记），
+// 浮层没有选择面，只能从 URL 里猜（qualityFromURL）。
+function buildGoCommand(m3u8URL, pageURL, videoName, exePath, quality = "") {
+  const outName = makeFilename(m3u8URL, videoName, quality || qualityFromURL(m3u8URL));
   return assembleGoCommand(m3u8URL, pageURL, outName, exePath);
 }
 
@@ -475,8 +482,8 @@ async function getExePath() {
   return s.detectedExePath || "go-catcher.exe";
 }
 
-async function offerFallback(m3u8URL, pageURL, videoName) {
-  lastCommand = buildGoCommand(m3u8URL, pageURL, videoName, await getExePath());
+async function offerFallback(m3u8URL, pageURL, videoName, quality = "") {
+  lastCommand = buildGoCommand(m3u8URL, pageURL, videoName, await getExePath(), quality);
   const box = $("#fallback");
   if (!box) return;
   $("#fallbackCmd").textContent = lastCommand;

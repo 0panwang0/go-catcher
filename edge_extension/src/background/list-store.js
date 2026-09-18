@@ -114,9 +114,12 @@ export function withListLock(fn) {
       try {
         await flushDirty();
       } catch (e) {
-        // 脏标记已保留，下次事务或下次唤醒会重试。这里必须让调用方看得见：
-        // 列表没落盘，页面读到的会是旧值。
+        // 脏标记已保留、下次事务会重试，但**必须让调用方看得见**：列表没落盘，
+        // 页面读到的会是旧值，重启后列表回到原样。吞掉它就成了"界面报已保存/
+        // 已清空，实际没存"——本文件不变量 2/3 点名禁止的形式。
+        // 调用方（main.js 的消息路由）已经把 rejection 转成 {ok:false} 回执。
         console.error("[M3U8 Video Catcher] 嗅探列表落盘失败（已保留待重试）:", e);
+        throw e;
       }
     }
     return v;
@@ -191,6 +194,10 @@ export function recordMedia(url, pageUrl, frameUrl, title, type, size = 0, tabId
     }
     cache[key] = list;
     dirtyKeys.add(key);
+  }).catch(() => {
+    // 嗅探事件是"尽力记录"：调用方是 webRequest 回调，没有回执渠道可告知。
+    // 落盘失败已由 withListLock 的 settle 记进控制台，这里只是把 rejection 收住
+    // —— 不 catch 就会变成未处理的 rejection（MV3 里只留一行难定位的报错）。
   });
 }
 

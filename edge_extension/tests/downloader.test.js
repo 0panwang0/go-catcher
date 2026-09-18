@@ -191,6 +191,31 @@ const noRef = api.buildGoCommand("https://x.com/a/b.m3u8", "", "标题", "");
 check("默认 exe 名 + 无来源页时不带 --referer",
   noRef.includes('"go-catcher.exe"') && !noRef.includes("--referer"), noRef);
 
+// P1-2：用户从 master 手选了档位后，兜底命令必须下那一档。画质由调用方传入 ——
+// master 的 URL 里没有档位标记，qualityFromURL 推不出来；旧实现丢了这个入参，
+// 于是用户以为在下 720p、实际拿到的是最高码率、文件名也没有 _720P 后缀。
+const picked = api.buildGoCommand("https://x.com/a/master.m3u8", "", "标题", "", "720P");
+check("用户手选的画质进输出名（master URL 推不出画质也要带）",
+  picked.includes('-o "标题_720P.ts"'), picked);
+// 有区分力：同一个 master URL 不传画质就只有无后缀的名字 —— 上一条真的靠传入值
+check("（该断言有区分力：同一 URL 不传画质则无后缀）",
+  api.buildGoCommand("https://x.com/a/master.m3u8", "", "标题", "").includes('-o "标题.ts"'));
+check("--url 指向被选中的档位而不是原始 master",
+  api.buildGoCommand("https://x.com/a/720p/index.m3u8", "", "标题", "", "720P")
+    .includes('--url="https://x.com/a/720p/index.m3u8"'));
+
+// P1-2 的调用点：光有"buildGoCommand 支持 quality"不够 —— 缺陷发生在 startDownload
+// 的 catch 里用了原始 m3u8URL。这条钉住"选中后的档位真的被传下去"。
+const catchBlock = (src.match(/} catch \(e\) \{[\s\S]*?\n {2}\}/) || [""])[0];
+check("兜底调用点在 catch 块里（提取得到，否则下面两条形同虚设）",
+  catchBlock.includes("offerFallback"), catchBlock);
+check("兜底命令用选中后的 playlistURL（不是原始 m3u8URL）",
+  /offerFallback\(\s*playlistURL\s*,/.test(catchBlock) && !/offerFallback\(\s*m3u8URL\s*,/.test(catchBlock),
+  catchBlock);
+check("兜底命令带上用户选的 quality（否则档位在后缀上又丢一次）",
+  /offerFallback\(\s*playlistURL\s*,\s*pageURL\s*,\s*videoName\s*,\s*quality\s*\)/.test(catchBlock),
+  catchBlock);
+
 // ------------------------------------------------------------
 // F9 / P2-8：参数值净化
 // ------------------------------------------------------------

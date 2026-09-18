@@ -1,7 +1,7 @@
 // 「这个视频」的候选与选项解析：
 //   getVideoSources —— 全部候选链接（不解析，供 content.js 做链接列表）
 //   getVideoSource  —— 悬停门控的单选命中（按钮显隐用）
-import { pageCandidates, findSniffedByURL } from "./page-match.js";
+import { pageCandidates, listCandidates, findSniffedByURL } from "./page-match.js";
 import { qualityFromURL, isMasterCandidateM3U8 } from "./m3u8-parse.js";
 
 export function openDownloader(item) {
@@ -18,8 +18,12 @@ export function openDownloader(item) {
 
 // getVideoSources 返回"该视频"的全部候选链接（不挑选、不解析），
 // 供 content.js 做链接列表（解析放页面主世界，避免扩展 Origin 403）。
+//
+// 用 listCandidates（宽）而不是 getVideoSource 用的 pageCandidates（严）：
+// 列表是"给用户挑"的，宁多勿漏；按钮是"替用户承诺"的，宁缺勿假。两套语义见
+// page-match.js 里两个函数的注释。
 export async function getVideoSources({ src = "", pageUrl = "", embedUrl = "" }) {
-  const { hostM3U8, hostMP4 } = await pageCandidates(pageUrl);
+  const { hostM3U8, hostMP4 } = await listCandidates(pageUrl);
   const sources = [];
   if (/^https?:/i.test(src)) {
     sources.push({ type: "mp4", url: src, title: "", pageUrl, fromSrc: true });
