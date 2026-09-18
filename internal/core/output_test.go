@@ -122,3 +122,30 @@ func TestSanitizeFilenameKeepsEmojiJoiners(t *testing.T) {
 		t.Fatalf("含零宽连接符的标题被改坏：got %q want %q", got, family+".mp4")
 	}
 }
+
+// TestNormalizeOutputStripsBidiControls CLI 的 -o 路径也要滤 bidi 控制符。
+//
+// sanitizeFilename 只有 server 一个调用点，CLI 的 -o 走 normalizeOutput —— 若这层
+// 不滤，浮层兜底命令（-o 由页面标题派生、站点可控）的 U+202E 能一路进到文件名。
+// 但只滤 bidi、**不做** sanitizeFilename 的整套清洗：带目录的 -o 会被毁掉。
+// 扰动点：删掉 normalizeOutput 里的 isBidiControl 分支，本条会红。
+func TestNormalizeOutputStripsBidiControls(t *testing.T) {
+	rt := &Runtime{outputFile: "out/vid\u202Eeo.ts"}
+	if got := rt.normalizeOutput(); got != "out/video.ts" {
+		t.Fatalf("路径里的 bidi 控制符未被剔除: %q want %q", got, "out/video.ts")
+	}
+	rt = &Runtime{outputFile: "a\u202Ab.mp4"}
+	if got := rt.normalizeOutput(); got != "ab.mp4" {
+		t.Fatalf("U+202A 应被剔除: %q want %q", got, "ab.mp4")
+	}
+	// 零宽连接符不是 bidi 控制符，必须保留（防"顺手改成整体删 Cf"）
+	rt = &Runtime{outputFile: "a\u200Db.mp4"}
+	if got := rt.normalizeOutput(); got != "a\u200Db.mp4" {
+		t.Fatalf("非 bidi 的 Cf 字符不应被删: %q", got)
+	}
+	// 无扩展名的原行为不回归
+	rt = &Runtime{outputFile: "out/video"}
+	if got := rt.normalizeOutput(); got != "out/video.ts" {
+		t.Fatalf("无扩展名应补 .ts: %q", got)
+	}
+}

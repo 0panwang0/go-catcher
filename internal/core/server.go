@@ -47,9 +47,10 @@ var routeDefs = []routeDef{
 	{"/probe", []string{http.MethodGet}, true, false, func(e *Engine) http.HandlerFunc { return e.handleProbe }},
 	{"/pause", []string{http.MethodGet}, true, false, func(e *Engine) http.HandlerFunc { return e.handlePause }},
 	// /stop 只对直播任务有效（点播的"停"是可续的暂停，走 /pause）：
-	// 结束录制并把已录部分收尾成正式文件。
-	{"/stop", []string{http.MethodGet}, true, false, func(e *Engine) http.HandlerFunc { return e.handleStop }},
-	{"/resume", []string{http.MethodGet}, true, false, func(e *Engine) http.HandlerFunc { return e.handleResume }},
+	// 结束录制并把已录部分收尾成正式文件。stop/resume 都是后加的端点，
+	// 按上面"新端点勿模仿"的口径走 POST（扩展与内置界面已同步）。
+	{"/stop", []string{http.MethodPost}, true, false, func(e *Engine) http.HandlerFunc { return e.handleStop }},
+	{"/resume", []string{http.MethodPost}, true, false, func(e *Engine) http.HandlerFunc { return e.handleResume }},
 	{"/cancel", []string{http.MethodGet}, true, false, func(e *Engine) http.HandlerFunc { return e.handleCancel }},
 	{"/remove", []string{http.MethodGet}, true, false, func(e *Engine) http.HandlerFunc { return e.handleRemove }},
 	{"/openfolder", []string{http.MethodGet}, true, false, func(e *Engine) http.HandlerFunc { return e.handleOpenFolder }},

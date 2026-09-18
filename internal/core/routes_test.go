@@ -81,6 +81,8 @@ func TestMethodGuardRejects(t *testing.T) {
 		{"POST /status", http.MethodPost, "/status?t=mg-token", http.MethodGet},
 		{"DELETE /status", http.MethodDelete, "/status?t=mg-token", http.MethodGet},
 		{"GET /svc/stop（只认 POST）", http.MethodGet, "/svc/stop?t=mg-token", http.MethodPost},
+		{"GET /stop（只认 POST）", http.MethodGet, "/stop?t=mg-token", http.MethodPost},
+		{"GET /resume（只认 POST）", http.MethodGet, "/resume?t=mg-token", http.MethodPost},
 		{"PUT /config（只认 GET/POST）", http.MethodPut, "/config?t=mg-token", "GET, POST"},
 		{"DELETE /health", http.MethodDelete, "/health", http.MethodGet},
 	}
@@ -97,6 +99,14 @@ func TestMethodGuardRejects(t *testing.T) {
 	// 免令牌端点照样受方法约束：POST /health 不会因为免令牌就放行
 	if w := do(http.MethodPost, "/health"); w.Code != http.StatusMethodNotAllowed {
 		t.Errorf("POST /health 应 405（免令牌 ≠ 免方法约束），得到 %d", w.Code)
+	}
+
+	// POST 的 /stop · /resume 要能穿过方法约束落到 handler（无此任务 → 404，
+	// 但绝不是 405 —— 钉住"这两条走 POST"的契约本身）
+	for _, p := range []string{"/stop?t=mg-token", "/resume?t=mg-token"} {
+		if w := do(http.MethodPost, p); w.Code == http.StatusMethodNotAllowed {
+			t.Errorf("POST %s 不应被方法约束拦截（该端点已改 POST）", p)
+		}
 	}
 
 	// 不带令牌的 POST /status：guard 先拦（401），不会落到方法检查

@@ -119,6 +119,27 @@ func TestNormStateRestoreRejectsUnknownVersion(t *testing.T) {
 	}
 }
 
+// TestRestoreFalseLeavesStateUntouched Restore 返回 false 时状态必须未被改动。
+//
+// false 的合同是「这份快照没被采纳」。三支拒绝（空字节 / 损坏 / 版本不符）原本
+// 都在写入前返回，唯独「有版本号但无 baseline」（init-only 快照）先写 end/init
+// 再返回 false —— 调用方（restoreContainer）按合同把 false 当"未采纳"处理，
+// 对象却被污染了。现在无 baseline 在写入前就拒绝。
+// 扰动点：把 Restore 里 `len(p.Baseline) == 0` 的提前返回删掉，本条会红。
+func TestRestoreFalseLeavesStateUntouched(t *testing.T) {
+	st := NewState()
+	// init-only 快照：有 v、只有 end、没有 baseline（真机形态是只带 init，同构）
+	if st.Restore([]byte(`{"v":1,"end":{"1":18000}}`)) {
+		t.Fatal("无 baseline 的快照应被拒绝（续传会让新分片从头计时）")
+	}
+	if got := st.endSnapshot(); len(got) != 0 {
+		t.Fatalf("Restore=false 却写入了 end: %v（违反「false ⇒ 未改动」合同）", got)
+	}
+	if got := st.baselineStrings(); len(got) != 0 {
+		t.Fatalf("Restore=false 却写入了 baseline: %v", got)
+	}
+}
+
 // TestNormStateSnapshotIncludesInit 持有 init 解析结果后，Snapshot 字节必须包含
 // init 信息（persist 往返一致），确保续传后 Finish 仍能回填。
 func TestNormStateSnapshotIncludesInit(t *testing.T) {

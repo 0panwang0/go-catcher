@@ -578,6 +578,12 @@ func reopenJobForFinalize(te *taskEntry) *dlJob {
 		// filename+saveDir 拼回，否则 .part 找不到，用户录的东西就成了磁盘上
 		// 无人认领的孤儿。与 pipeline 启动时的兜底同一套规则。
 		finalPath = filepath.Join(saveDir, filename)
+		// 重建值必须回写：外层算 .part 路径（engine.go 补偿收尾 / finishStop）
+		// 与 finalizeRecording 的 moveFile 目标读的都是 te.st.finalPath。不回写
+		// 会让它们拿空串拼出 ".part"，磁盘上完好的半成品被判「保存失败」。
+		te.mu.Lock()
+		te.st.finalPath = finalPath
+		te.mu.Unlock()
 	}
 	if finalPath == "" {
 		return nil
@@ -628,6 +634,14 @@ func finishStop(te *taskEntry, id, part string, segDone int64, outcome finalizeO
 		// 录的东西销毁掉，本项目红线。
 		job = reopenJobForFinalize(te)
 	}
+	// part 必须在 reopen 之后按 te.st.finalPath 重算：finalPath 为空时 reopen
+	// 会按 saveDir+filename 拼回并回写，沿用调用方传进来的旧值会拿空串拼出
+	// ".part"，校验与 moveFile 全部落空（评审自审 #8）。
+	te.mu.Lock()
+	if fp := te.st.finalPath; fp != "" {
+		part = fp + ".part"
+	}
+	te.mu.Unlock()
 	if job == nil || job.segFlushedNow() == 0 {
 		if part != "" {
 			if err := os.Remove(part); err != nil && !os.IsNotExist(err) {
@@ -754,7 +768,8 @@ func restoreContainer(job *dlJob, containerID, partPath string, normState []byte
 	if job.norm == nil {
 		return nil // 无状态容器：续传不依赖跨分片状态
 	}
-	// 空字节、版本不符、损坏都归这一处：Restore 全返回 false。
+	// 空字节、版本不符、无 baseline、损坏都归这一处：Restore 全返回 false，
+	// 且 false 保证 norm 未被改动（Restore 的合同，见 normalize.go）。
 	// 不再单列"字节为空"的分支 —— 它与 Restore(nil)=false 等价，
 	// 多一条路径只是多一处可能写错的地方（反向验证抓到过）。
 	if !job.norm.Restore(normState) {

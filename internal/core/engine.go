@@ -271,8 +271,13 @@ func (r *Runtime) salvageOneInterruptedLive(te *taskEntry) {
 		return
 	}
 
-	part := st.finalPath + ".part"
 	job := reopenJobForFinalize(te)
+	// part 在 reopen 之后取：finalPath 为空时 reopen 会按 saveDir+filename 拼回
+	// 并回写 te.st.finalPath，拿本函数开头的旧快照算会得到 ".part"，校验读不到、
+	// moveFile 必失败 —— 磁盘上完好的 .part 被判「保存失败」（评审自审 #8）。
+	te.mu.Lock()
+	part := te.st.finalPath + ".part"
+	te.mu.Unlock()
 	if job == nil || job.segFlushedNow() == 0 {
 		// 没有可保存的内容：.part 不存在/为空，或者**只写进了 init 段**。
 		//

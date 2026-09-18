@@ -113,7 +113,10 @@ func (n *normState) Snapshot() []byte {
 
 // Restore 载入持久化的全部状态（断点续传），返回是否采用了这份状态。
 //
-// 版本不符（含旧格式的无版本字节）或字节损坏一律整份丢弃并返回 false：
+// 返回 false 的合同是「这份状态没被采纳」：**保证 n 未被改动**。因此所有拒绝
+// 判据（空字节 / 非 JSON / 版本不符 / 有版本号但无 baseline）都必须在写入前
+// 判掉 —— 三支 false 里曾有一支（init-only 快照）先写 end/init 再返回 false，
+// 调用方按合同处理却拿到被污染的对象（评审自审 #12）。
 // 快照里的偏移与基准错了不会立刻报错，而是写进成品才暴露，宁可让调用方
 // 显式拒绝续传（tfdt 基准丢了会让新分片从头计时、与已录内容重叠），
 // 也不按错结构解析。
@@ -126,6 +129,11 @@ func (n *normState) Restore(b []byte) bool {
 		return false
 	}
 	if p.V != normPersistVersion {
+		return false
+	}
+	if len(p.Baseline) == 0 {
+		// 有版本号但没有 tfdt 基准：init-only 快照（只写完 init 段就退出）。
+		// 拿它续传同样会让新分片从头计时，照样拒绝 —— 与版本不符同语义。
 		return false
 	}
 	n.mu.Lock()
@@ -151,9 +159,7 @@ func (n *normState) Restore(b []byte) bool {
 			}
 		}
 	}
-	// 续传真正需要的是 tfdt 基准：只有 init 信息（没有任何分片）的快照，
-	// 拿它续传同样会让新分片从头计时。故判据取 baseline 非空。
-	return len(n.baseline) > 0
+	return true
 }
 
 // baselineStrings 导出基准（持久化，续传恢复用）。

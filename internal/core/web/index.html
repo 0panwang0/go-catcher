@@ -588,10 +588,10 @@ function toast(msg,isErr){
   if(toastTimer) clearTimeout(toastTimer);
   toastTimer=setTimeout(function(){ t.className='toast'; },5000);
 }
-async function call(url, okMsg){
+async function call(url, okMsg, method){
   lastAction = Date.now();
   try{
-    const r = await fetch(api(url),{cache:'no-store'});
+    const r = await fetch(api(url),{method: method||'GET', cache:'no-store'});
     if(!r.ok){ const t = await r.json().catch(()=>({})); throw new Error(t.error||('HTTP '+r.status)); }
     if(okMsg) toast(okMsg,false);
   }catch(e){ toast('操作失败：'+e.message,true); }
@@ -601,9 +601,10 @@ async function call(url, okMsg){
   render();
 }
 function pauseTask(id){ return call('/pause?id='+encodeURIComponent(id),'已暂停'); }
-// 直播专用：结束录制并把已录部分保存成正式文件（服务端会拒绝非直播任务）
-function stopTask(id){ return call('/stop?id='+encodeURIComponent(id),'已停止录制，已录部分已保存'); }
-function resumeTask(id){ return call('/resume?id='+encodeURIComponent(id),'已恢复下载'); }
+// 直播专用：结束录制并把已录部分保存成正式文件（服务端会拒绝非直播任务）。
+// /stop · /resume 有副作用，服务端按"新端点勿模仿"口径只收 POST。
+function stopTask(id){ return call('/stop?id='+encodeURIComponent(id),'已停止录制，已录部分已保存','POST'); }
+function resumeTask(id){ return call('/resume?id='+encodeURIComponent(id),'已恢复下载','POST'); }
 function cancelTask(id){
   if (!confirm('取消后已下载的分片会被删除，确定取消该任务？')) return;
   return call('/cancel?id='+encodeURIComponent(id),'已取消');

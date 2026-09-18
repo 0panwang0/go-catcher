@@ -20,7 +20,9 @@ func TestNativeHostExtensionIDMatchesManifest(t *testing.T) {
 	p := filepath.Join("..", "..", "edge_extension", "manifest.json")
 	data, err := os.ReadFile(p)
 	if err != nil {
-		t.Skipf("扩展清单不可读，跳过: %v", err)
+		// 清单在仓库内，正常 checkout 必然存在。读不到是环境坏了，跳过等于把
+		// 这条防漂移用例变成永远绿（「跳过伪装成通过」是项目红线）。
+		t.Fatalf("扩展清单不可读（它在仓库内，正常 checkout 必然存在）: %v", err)
 	}
 	var m struct {
 		Key string `json:"key"`

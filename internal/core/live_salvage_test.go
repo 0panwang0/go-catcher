@@ -724,3 +724,65 @@ func TestSalvageInterruptedLiveSkipsInitOnlyShell(t *testing.T) {
 		t.Fatalf("补偿收尾不该删 .part（用户仅有的内容）: %v", err)
 	}
 }
+
+// TestFinalizeRebuildsClearedFinalPath 旧版状态文件把 finalPath 清空（失败任务
+// 曾被清空）时，两条收尾路径都必须能按 saveDir+filename 拼回并保存成功。
+//
+// 回归（评审自审 #8）：reopenJobForFinalize 内部会拼回 finalPath，但外层算
+// .part 路径、finalizeRecording 的 moveFile 目标读的都是 te.st.finalPath（仍为
+// 空）——外层拿空串拼出 ".part"，校验读不到、moveFile 必失败，磁盘上完好的
+// 半成品被判「保存失败」，兜底代码等于白写。修法：reopen 拼回后回写
+// te.st.finalPath，两条路径在 reopen 之后重算 part。
+// 扰动点：删掉 reopenJobForFinalize 里的回写（或 finishStop/engine 里的重算），
+// 本条两个子场景都会红。
+func TestFinalizeRebuildsClearedFinalPath(t *testing.T) {
+	saveRestoreState(t)
+	dir := t.TempDir()
+	const want = "SEG-0SEG-1"
+
+	// 子场景 1：重启补偿收尾（engine.go salvageInterruptedLive）
+	if err := os.WriteFile(filepath.Join(dir, "t1.ts.part"), []byte(want), 0644); err != nil {
+		t.Fatal(err)
+	}
+	// 子场景 2：重启后用户点「停止」（finishStoppedTask → finishStop）
+	if err := os.WriteFile(filepath.Join(dir, "t2.ts.part"), []byte(want), 0644); err != nil {
+		t.Fatal(err)
+	}
+	seedStateFile(t, []persistedTask{
+		{ID: "t1", Filename: "t1.ts", SaveDir: dir, FinalPath: "",
+			M3u8URL: "https://example.com/live.m3u8",
+			Stage:   "录制中断（程序退出）", Live: true, Paused: true, SegDone: 2},
+		{ID: "t2", Filename: "t2.ts", SaveDir: dir, FinalPath: "",
+			M3u8URL: "https://example.com/live.m3u8",
+			Stage:   "录制中断（程序退出）", Live: true, Paused: true, SegDone: 2},
+	})
+	testStd.loadState()
+
+	testStd.salvageInterruptedLive()
+	finishStoppedTask(testStd.findTask("t2"))
+
+	for _, id := range []string{"t1", "t2"} {
+		te := testStd.findTask(id)
+		if te == nil {
+			t.Fatalf("%s 任务未被恢复", id)
+		}
+		te.mu.Lock()
+		st := te.st
+		te.mu.Unlock()
+		if !st.done || !st.interrupted {
+			t.Fatalf("%s: finalPath 清空后收尾失败: done=%v interrupted=%v stage=%q errorMsg=%q",
+				id, st.done, st.interrupted, st.stage, st.errorMsg)
+		}
+		got := filepath.Join(dir, id+".ts")
+		if st.finalPath != got {
+			t.Fatalf("%s: finalPath=%q want %q（拼回值应回写）", id, st.finalPath, got)
+		}
+		data, err := os.ReadFile(got)
+		if err != nil {
+			t.Fatalf("%s: 完好的 .part 没有收尾成成品文件: %v", id, err)
+		}
+		if string(data) != want {
+			t.Fatalf("%s: 成品内容=%q want %q", id, data, want)
+		}
+	}
+}

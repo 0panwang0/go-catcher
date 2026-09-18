@@ -11,12 +11,25 @@ import (
 	"unicode/utf8"
 )
 
-// normalizeOutput 补齐输出文件扩展名（无扩展名默认 .ts）
+// normalizeOutput 补齐输出文件扩展名（无扩展名默认 .ts），并剔除路径里的
+// bidi 方向控制符（isBidiControl）。
+//
+// 只做这一层窄清洗，**不套 sanitizeFilename**：-o 是用户给的完整路径，可以带
+// 目录（out/video.ts），把 / \ : 换成下划线会把路径毁掉。但 bidi 控制符在
+// 任何一层都不合法——不可见却能重排显示，而浮层兜底命令的 -o 正是从页面标题
+// 派生的（站点可控），JS 侧的 sanitizeFileName 又没有 bidi 规则，U+202E 能
+// 一路进到文件名（评审自审 #9）。删它们不会破坏任何合法路径。
 func (r *Runtime) normalizeOutput() string {
-	if filepath.Ext(r.outputFile) == "" {
-		return r.outputFile + ".ts"
+	name := strings.Map(func(c rune) rune {
+		if isBidiControl(c) {
+			return -1
+		}
+		return c
+	}, r.outputFile)
+	if filepath.Ext(name) == "" {
+		return name + ".ts"
 	}
-	return r.outputFile
+	return name
 }
 
 // moveFile 把 src 移到 dst：优先同卷 Rename，跨卷(不同盘)时回退为 复制+删除。
