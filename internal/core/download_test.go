@@ -597,6 +597,83 @@ func TestStreamWriterFlushBreakpointNotAhead(t *testing.T) {
 	}
 }
 
+// TestStreamWriterFlushedLagsMemoryBreakpoint 内存断点（Next）与落盘断点（Flushed）
+// 必须能区分开：缓冲里的字节还没进文件时 Next 已经前进，Flushed 不能动。
+// 持久化续传起点只能用 Flushed —— 用 Next 就是"断点领先磁盘"（R9）。
+// 旧版 Next 的注释写着"暂停时用它作为续传起点"，那正是缺陷的写法。
+func TestStreamWriterFlushedLagsMemoryBreakpoint(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "lag.ts")
+	sw, err := newStreamWriter(path, 0, func(int) {}, func(int) {}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 远小于 1MB 刷新阈值：数据留在 bufio 缓冲里，还没落盘
+	for i := 0; i < 3; i++ {
+		if err := sw.submit(i, bytes.Repeat([]byte{byte(i + 1)}, 100)); err != nil {
+			t.Fatalf("submit %d: %v", i, err)
+		}
+	}
+	if got := sw.Next(); got != 3 {
+		t.Fatalf("Next()=%d want 3（内存进度）", got)
+	}
+	if got := sw.Flushed(); got != 0 {
+		t.Fatalf("Flushed()=%d want 0（缓冲还没落盘，断点不得前进）", got)
+	}
+	if fi, err := os.Stat(path); err != nil || fi.Size() != 0 {
+		t.Fatalf("文件大小=%v err=%v want 0（数据还在缓冲里）", fi, err)
+	}
+	if err := sw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if got := sw.Flushed(); got != 3 {
+		t.Fatalf("Close 成功后 Flushed()=%d want 3", got)
+	}
+}
+
+// TestFinishStreamKeepsDiskBreakpointOnCloseFailure 关闭输出流时最终 Flush 失败
+// （磁盘满 / 句柄失效）：尾部若干 MB 并没有进文件，此时断点绝不能推进到内存
+// 进度。上层会把它当续传起点持久化（pipeline 的 st.segDone → 下次的 from），
+// 直播还用 segFlushedNow 推进去重水位线 —— 断点虚高就是"产物里留下永久空洞、
+// 而状态与日志一切正常"。关闭失败还必须作为错误交回调用方，不能只打一行警告
+// 就继续（"失败被降级成警告"是本项目点名的缺陷形态）。
+func TestFinishStreamKeepsDiskBreakpointOnCloseFailure(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "fail.ts")
+	j := &dlJob{rt: testStd}
+	sw, err := newStreamWriter(path, 0, func(int) {}, func(int) {}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 三片小数据留在缓冲里（< 1MB 阈值），随后把底层文件直接关掉，
+	// 让 Close 的最终 Flush 必然失败。
+	for i := 0; i < 3; i++ {
+		if err := sw.submit(i, bytes.Repeat([]byte{byte(i + 1)}, 100)); err != nil {
+			t.Fatalf("submit %d: %v", i, err)
+		}
+	}
+	memNext := sw.Next()
+	if err := sw.f.Close(); err != nil {
+		t.Fatal(err)
+	}
+	closeErr := sw.Close()
+	if closeErr == nil {
+		t.Fatal("底层文件已关闭，Close 必须报错（否则本用例根本没走到失败路径）")
+	}
+
+	got, err := finishStream(sw, j, 0, closeErr)
+	if err == nil {
+		t.Fatal("关闭失败必须交回调用方，不能吞掉")
+	}
+	if got != 0 || j.segFlushedNow() != 0 {
+		t.Fatalf("续传起点=%d segFlushedNow=%d want 0（尾部未落盘，断点不得前进；内存进度 %d）",
+			got, j.segFlushedNow(), memNext)
+	}
+	if j.segNow() != int64(memNext) {
+		t.Fatalf("界面进度 segNow=%d want %d（仍报真实内存进度）", j.segNow(), memNext)
+	}
+}
+
 // TestDownloadRangeLimitsOversizedResponse 缺陷形态回归：服务器忽略 Range 的
 // 结束偏移、把整份文件回给一个分片请求时（行为不当的 CDN / 中间层），多出的
 // 字节绝不能写进相邻分片的区域 —— 邻片若已标记完成就不会再被重写，成品里

@@ -296,6 +296,8 @@ func runDiskPipeline(te *taskEntry) {
 		// streamDownload 未运行，job 计数需手动同步（snapshot 的进度读 job 原子值）
 		next = from
 		job.setSeg(int64(len(pl.segments)), int64(len(pl.segments)))
+		// 断点同样要落盘值语义：下面 306 行会持久化 segFlushedNow 作为下次的 from
+		job.setSegFlushed(int64(from))
 	} else {
 		// 点播续传只下剩余分片：segURLs[0] 对应写入序号 from，重复传全量会把
 		// 整个列表重下一遍追加到断点后（内容重复 + segDone 超过 segTot）
@@ -303,13 +305,25 @@ func runDiskPipeline(te *taskEntry) {
 	}
 
 	te.mu.Lock()
-	te.st.segDone = int64(next)
+	// 持久化的断点必须是"确实落盘"的位置：212 行在下次启动时直接拿它当续传起点
+	// from。next 是内存进度，可能领先磁盘（streamDownload 关闭时最终 Flush 失败，
+	// 那条路径已经改用 Flushed 并回错误）。用 next 会让重启后从空洞之后继续
+	// append —— 缺口永久留在产物里，而状态与日志一切正常（R9）。
+	te.st.segDone = job.segFlushedNow()
 	if isLive {
 		te.st.segTot = 0 // 直播列表无限增长，进度由前端按录制时长展示
 	} else {
 		te.st.segTot = int64(len(pl.segments))
 	}
 	te.mu.Unlock()
+
+	// 内存进度与落盘断点不等 = 尾部有分片没进文件（缓冲丢失或关闭时 Flush 失败）。
+	// 正常情况下两者相等；不等就是上面那条断点回退条款在起作用，必须让它可见：
+	// 少了的那几片永远补不回来（窗口滚走后），用户该知道产物短了。
+	if flushed := job.segFlushedNow(); int(flushed) < next {
+		fmt.Printf("[disk] WARN: id=%s 尾部 %d 片未落盘（内存进度 %d，落盘断点 %d）\n",
+			st.id, int64(next)-flushed, next, flushed)
+	}
 
 	if err != nil {
 		if ctx.Err() != nil {

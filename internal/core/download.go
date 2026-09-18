@@ -280,12 +280,23 @@ func (sw *streamWriter) flushLocked() {
 	}
 }
 
-// Next 返回当前断点（下一个待写序号），暂停时用它作为续传起点。
-
+// Next 返回内存断点（下一个待写序号）。它反映"已受理的下载进度"，可能领先
+// 磁盘若干 MB（bufio 缓冲还没 flush），**不能**拿它当续传起点 —— 见 Flushed。
 func (sw *streamWriter) Next() int {
 	sw.mu.Lock()
 	defer sw.mu.Unlock()
 	return sw.next
+}
+
+// Flushed 返回已确认落盘的断点：所有 < Flushed() 的分片字节都已写进文件。
+// 持久化续传起点只能用这个值。用 Next() 会在两种情况下把断点推到磁盘之外：
+// 缓冲里的数据还没 flush，或关闭时的最终 Flush 失败（Close 只在成功时才推进
+// flushed）。断点虚高的后果是重启后从空洞之后继续追加 —— 缺口永久留在产物里，
+// 而状态与日志一切正常（R9 / 本项目头号缺陷形态）。
+func (sw *streamWriter) Flushed() int {
+	sw.mu.Lock()
+	defer sw.mu.Unlock()
+	return sw.flushed
 }
 
 // Close 冲刷缓冲并关闭文件。保存断点前必须先调用，否则尾部数据会丢。
@@ -902,12 +913,16 @@ func streamDownload(ctx context.Context, j *dlJob, segURLs []string, startIdx in
 		return startIdx, err
 	}
 	closed := false
+	var closeErr error
 	closeSW := func() {
 		if closed {
 			return
 		}
 		closed = true
 		if cerr := sw.Close(); cerr != nil {
+			// 关闭失败 = 尾部数据没进文件。记下来交给调用方，不降级成一行警告
+			// （见 finishStream 的说明）。
+			closeErr = cerr
 			fmt.Printf("\n  [!] 关闭输出文件失败: %v\n", cerr)
 		}
 	}
@@ -994,18 +1009,40 @@ dispatch:
 	wg.Wait()
 	fmt.Println()
 
-	// 先冲刷关闭、再取断点：返回的 next 会被上层当成续传起点持久化，
-	// 必须保证它对应的字节已经真正落在 .part 里（R9）。
+	// 先冲刷关闭、再定稿断点：返回值会被上层当成续传起点持久化（pipeline 的
+	// from），必须保证它对应的字节已经真正落在 .part 里（R9）。见 finishStream。
 	closeSW()
-	next := sw.Next()
-	j.setSeg(int64(next), dispTot)
-	j.setSegFlushed(int64(next))
+	next, ferr := finishStream(sw, j, dispTot, closeErr)
 
 	errMu.Lock()
 	e := firstErr
 	errMu.Unlock()
+	if ferr != nil {
+		return next, ferr
+	}
 	if e != nil {
 		return next, e
+	}
+	return next, nil
+}
+
+// finishStream 关闭输出流后把"可持久化断点"定稿，返回续传起点（写入序号）。
+//
+// 断点只能是 Flushed()（确实落盘的字节数），不能是 Next()（内存进度）：关闭时
+// 若最终 Flush 失败，尾部若干 MB 并没有进文件，而 Next() 已经领先它们。上层拿
+// 返回值当续传起点持久化（pipeline 的 te.st.segDone → 下次启动的 from），直播还会
+// 用 segFlushedNow 推进去重水位线 —— 断点虚高就是"产物里留下永久空洞、而状态与
+// 日志一切正常"（本项目头号缺陷形态）。界面进度仍报 Next()：那是给用户看的真实
+// 下载进度，与"能从哪里续"是两件事。
+//
+// closeErr 由 closeSW 转交（它可能已经被 defer 调用过）：关闭失败是真实故障，
+// 一路交回调用方走失败路径，不吞成一行警告。
+func finishStream(sw *streamWriter, j *dlJob, dispTot int64, closeErr error) (int, error) {
+	next, flushed := sw.Next(), sw.Flushed()
+	j.setSeg(int64(next), dispTot)
+	j.setSegFlushed(int64(flushed))
+	if closeErr != nil {
+		return flushed, closeErr
 	}
 	return next, nil
 }

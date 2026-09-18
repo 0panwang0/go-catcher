@@ -679,3 +679,48 @@ func TestLoadStateMarksLiveAsInterrupted(t *testing.T) {
 		t.Fatalf("点播任务恢复后 stage=%q paused=%v want 已暂停/true", vodStage, vodPaused)
 	}
 }
+
+// TestSalvageInterruptedLiveSkipsInitOnlyShell 强杀恰好落在「init 段已写进
+// .part、第一个媒体分片还没落盘」的窗口时，补偿收尾不得把那个 ~1KB 的空壳
+// rename 成成品并标成「录制中断 · 已保存」——它播不出任何画面，用户却会以为
+// 录到了东西（"产物坏了但状态与日志一切正常"，本项目头号缺陷形态）。
+//
+// init 段一写进 .part 文件就非空，而 reopenJobForFinalize 只判"文件非空"，
+// 所以"job != nil"挡不住它：判据必须是"真的有分片落盘"（segFlushedNow > 0），
+// 与另外两条收尾路径一致（故障中断见 pipeline、用户停止见 finishStop）。
+//
+// 这里故意用一个容器识别不出来的极短内容（走 generic 校验器，明文放行），
+// 让用例只钉住"零落盘分片"这条判据，不掺入 fMP4 校验器的行为差异。
+func TestSalvageInterruptedLiveSkipsInitOnlyShell(t *testing.T) {
+	saveRestoreState(t)
+	dir := t.TempDir()
+	final := filepath.Join(dir, "shell.mp4")
+	if err := os.WriteFile(final+".part", []byte("INIT-ONLY"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	seedStateFile(t, []persistedTask{{
+		ID: "t1", Filename: "shell.mp4", SaveDir: dir, FinalPath: final,
+		M3u8URL: "https://example.com/live.m3u8",
+		Stage:   "录制中断（程序退出）", Live: true, Paused: true, SegDone: 0,
+	}})
+	testStd.loadState()
+
+	testStd.salvageInterruptedLive()
+
+	te := testStd.findTask("t1")
+	if te == nil {
+		t.Fatal("任务未被恢复")
+	}
+	te.mu.Lock()
+	st := te.st
+	te.mu.Unlock()
+	if st.done {
+		t.Fatalf("只有 init 段却被收尾成了终态: stage=%q（用户会以为录到了东西）", st.stage)
+	}
+	if _, err := os.Stat(final); !os.IsNotExist(err) {
+		t.Fatal("init 空壳被 rename 成了成品文件")
+	}
+	if _, err := os.Stat(final + ".part"); err != nil {
+		t.Fatalf("补偿收尾不该删 .part（用户仅有的内容）: %v", err)
+	}
+}

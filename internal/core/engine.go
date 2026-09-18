@@ -273,8 +273,22 @@ func (r *Runtime) salvageOneInterruptedLive(te *taskEntry) {
 
 	part := st.finalPath + ".part"
 	job := reopenJobForFinalize(te)
-	if job == nil {
-		return // 只有 init 段（或什么都没有）：没有可保存的内容
+	if job == nil || job.segFlushedNow() == 0 {
+		// 没有可保存的内容：.part 不存在/为空，或者**只写进了 init 段**。
+		//
+		// 这条判据必须与另外两条收尾路径一致 —— 故障中断（pipeline.go 的
+		// `job.live && job.segFlushedNow() > 0`）与用户停止（finishStop 的
+		// `job.segFlushedNow() == 0`）都是这么判的。只判"job != nil"（= .part
+		// 非空）会漏掉 init 段：init 一写进 .part，文件就非空了，于是 ~1KB 的
+		// 空壳被 rename 成成品、标成「录制中断 · 已保存」，而它播不出任何画面。
+		// 体量守卫在这里帮不上忙：reopen 重建的 job 没有 initLen，validateOutput
+		// 的 MinBytes 为 0（pipeline.go 的 MinBytes 与 container.go 的下限分支），
+		// 校验会直接放行。
+		//
+		// 但补偿收尾**不删 .part**（那可能是用户仅有的内容，见本文件三条约束），
+		// 也不把任务标成任何终态：让它留在「录制中断」，用户点「停止」时由
+		// finishStop 走"无内容"分支收尾 —— 删临时文件只发生在用户明确表态之后。
+		return
 	}
 	te.mu.Lock()
 	te.job = job
