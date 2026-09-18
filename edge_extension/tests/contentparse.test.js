@@ -119,9 +119,21 @@ check("parseSegments 解不出 base 时原样返回而不是抛（整份播放�
 const master = "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=3000000,RESOLUTION=1920x1080,CODECS=\"avc1.640028\"\n1080p/v.m3u8\n";
 const [v] = shared.parseVariants(master, "https://cdn.x/a/index.m3u8");
 check("parseVariants 带出 codec 与 quality", v.codec === "avc1.640028" && v.quality === "1080P", v);
-check("variantLabel / variantQuality 参数序一致（都吃 uri 在前）",
-  shared.variantLabel("https://cdn.x/1080p/v.m3u8", "", 0) === shared.variantLabel("https://cdn.x/1080p/v.m3u8", "", 0) &&
-  shared.variantQuality("https://cdn.x/1080p/v.m3u8", "", 0) === "1080P");
+// 这条原先写成 `variantLabel(u,"",0) === variantLabel(u,"",0)` —— 两侧同一个表达式，
+// 恒真：标题声称验"参数序一致"，实际只验了后半句。**它绿着，却没守住任何东西**，
+// 而参数序漂移（两函数同名不同序、照另一份签名调用就静默算错画质）正是 F11 修的形态。
+// 现在拆成三条，判据是"改坏了就红"：
+//   ① 画质取自第 1 参（URI）——第 2 参换成别的分辨率不改结果；
+//   ② 第 2 参是 resolution、第 3 参是 bandwidth ——标签按「画质 · 分辨率 · 码率」拼；
+//   ③ 后两参对调必须算出**不同**结果 ——证明 ② 真的在验参数序，不是"怎么传都一样"。
+check("variantQuality：画质取自第 1 参（URI），第 2 参才是 resolution",
+  shared.variantQuality("https://cdn.x/1080p/v.m3u8", "1280x720", 0) === "1080P" &&
+  shared.variantQuality("https://cdn.x/v.m3u8", "1280x720", 0) === "720P");
+check("variantLabel：签名是 (uri, resolution, bandwidth)，标签按该顺序拼",
+  shared.variantLabel("https://cdn.x/v.m3u8", "1280x720", "1500000") === "720P · 1280x720 · 1500 kbps");
+check("（该断言有区分力：两参对调后第 2 段就换了人，否则上一条怎么传都绿）",
+  shared.variantLabel("https://cdn.x/v.m3u8", "1280x720", "1500000").split(" · ")[1] === "1280x720" &&
+  shared.variantLabel("https://cdn.x/v.m3u8", "1500000", "1280x720").split(" · ")[1] === "1500000");
 check("qualityFromURL 认得 ?quality=（content.js 旧实现漏掉的正是这一条）",
   shared.qualityFromURL("https://cdn.x/a/index.m3u8?quality=1440") === "1440",
   shared.qualityFromURL("https://cdn.x/a/index.m3u8?quality=1440"));

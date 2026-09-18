@@ -51,7 +51,7 @@ cover:
 	go test ./... -coverprofile=cover.out -count=1
 	go tool cover -func=cover.out
 
-# 与 CI 对齐的本地质量门（Go job）：格式 → 静态检查 → 测试（含竞态）。
+# 与 CI 对齐的本地质量门（Go job）：格式 → 断言纪律 → 静态检查 → 测试（含竞态）。
 # 提交前跑这个，和 .github/workflows/ci.yml 的 go job 是同一套判定。
 # 扩展侧的等价物是 ext-check；两边都跑用 check-all。
 check:
@@ -60,6 +60,7 @@ check:
 		echo "以下文件未格式化，请执行 gofmt -w："; echo "$$unformatted"; exit 1; \
 	fi; \
 	echo "gofmt OK"
+	node tools/assert-lint.mjs
 	go vet ./...
 	go test ./... -race -count=1
 

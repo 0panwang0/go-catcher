@@ -77,6 +77,13 @@ jobs:
           done
           node -e "JSON.parse(require('fs').readFileSync('manifest.json','utf8'));console.log('OK  manifest.json')"
 
+      - name: 断言纪律（恒真断言扫描）
+        # 放在 extension job 是因为这里已经装好 Node；它扫的是**两侧**的测试文件
+        # （internal/**/*_test.go 与 edge_extension/tests/*.test.js），不是只扫扩展。
+        # 规则见 tools/assert-lint.mjs 头注释：恒真断言通过时不产生信息，是"假绿"。
+        working-directory: .
+        run: node tools/assert-lint.mjs
+
       - name: 回归测试
         run: |
           # 用 glob 而不是逐个列文件：新增 tests/*.test.js 自动纳入，不会漏跑
