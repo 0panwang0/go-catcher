@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
 	"sync"
@@ -23,6 +24,11 @@ type dlJob struct {
 	id      string // 任务 ID（server 模式分配；CLI 模式为空）
 	m3u8URL string
 	referer string
+	// segRefs 分片主机 → 浏览器实际发出的 Referer（host 含端口，键归一小写）。
+	// 分片 CDN 防盗链可能只认解析站域名而非页面域名，抓分片时按 segURL 的 host
+	// 精确匹配选用；空串是有效值（浏览器对该 host 没带 Referer，此时不设该头），
+	// 只有未命中才回退到 referer。CLI / 直链任务恒为空。
+	segRefs map[string]string
 	saveDir string // 目标保存目录
 	fname   string // 目标文件名（含扩展名）
 	limit   int    // 分片上限（0 = 全部）
@@ -349,7 +355,7 @@ func (j *dlJob) downloadDirect(ctx context.Context, outPath string) error {
 	// 模式 3：单连接续传
 	offset := partFileOffset(outPath)
 	for attempt := 0; ; attempt++ {
-		req, err := j.rt.newRequest(j.m3u8URL, j.referer)
+		req, err := j.rt.newRequest(j.m3u8URL, j.segmentReferer(j.m3u8URL))
 		if err != nil {
 			return cleanURLParseErr(err, j.m3u8URL)
 		}
@@ -584,7 +590,7 @@ func (j *dlJob) newChunkPlan(total int64) (*chunkMeta, bool) {
 // probeRange 探测服务器是否支持 Range 并取得文件总大小。
 // 发 Range: bytes=0-0，仅当 206 且 Content-Range 给出明确总大小时确认可用。
 func (j *dlJob) probeRange(ctx context.Context) (int64, bool) {
-	req, err := j.rt.newRequest(j.m3u8URL, j.referer)
+	req, err := j.rt.newRequest(j.m3u8URL, j.segmentReferer(j.m3u8URL))
 	if err != nil {
 		return 0, false
 	}
@@ -685,7 +691,7 @@ func (j *dlJob) downloadRange(ctx context.Context, f *os.File, start, end int64)
 	expected := end - start + 1
 	attempt := 1
 	for {
-		req, err := j.rt.newRequest(j.m3u8URL, j.referer)
+		req, err := j.rt.newRequest(j.m3u8URL, j.segmentReferer(j.m3u8URL))
 		if err != nil {
 			return err
 		}
@@ -814,6 +820,54 @@ func streamToFile(body io.ReadCloser, outPath string, offset int64) (cpErr, clos
 	return
 }
 
+// segmentReferer 返回抓取 targetURL 应携带的 Referer：分片 CDN（以及部分站的播放
+// 列表 CDN）防盗链可能只认解析站域名（浏览器实际发出的那个 Referer），而不是页面
+// 域名。命中 segRefs（按 host 精确匹配）则**原样采用**它 —— 包括命中空串，空串表
+// 示浏览器对该 host 没带 Referer，带页面 Referer 反而会被 CDN 判 403；只有未命中
+// 才回退到 j.referer（CLI / 直链任务 segRefs 恒空，等于始终走这条）。
+//
+// segRefs 的键是扩展侧 `new URL().host` 的形态，查表键必须同形，否则命中不了。
+func (j *dlJob) segmentReferer(targetURL string) string {
+	if len(j.segRefs) == 0 {
+		return j.referer
+	}
+	u, err := url.Parse(targetURL)
+	if err != nil || u.Host == "" {
+		return j.referer
+	}
+	// host 大小写不敏感，而 url.Parse 不归一化 host。
+	host := strings.ToLower(u.Host)
+	if ref, ok := j.segRefs[host]; ok {
+		return ref
+	}
+	// 同上「键必须同形」：浏览器 `new URL().host` 会**消掉默认端口**（https:443 /
+	// http:80 都省掉），而 Go 的 url.Host 原样保留 —— m3u8 里显式写成 :443 / :80
+	// 的目标因此对不上，会退回页面 Referer（白名单型 CDN 上就是 403）。
+	// 端口为空或恰为 scheme 默认端口时，去掉端口再查一次（此时与浏览器视角等价）。
+	//
+	// 非默认端口不兜底：:8443 是另一个 origin，浏览器也会带着端口上报。
+	// 用字符串裁剪而不是 u.Hostname()，为的是保留 IPv6 的方括号 —— 浏览器
+	// new URL("http://[::1]:443/").host 给的是 "[::1]"，而 Hostname() 给 "::1"。
+	if p := u.Port(); p != "" && p == defaultPortOf(u.Scheme) {
+		if ref, ok := j.segRefs[strings.TrimSuffix(host, ":"+p)]; ok {
+			return ref
+		}
+	}
+	return j.referer
+}
+
+// defaultPortOf 返回 scheme 的默认端口 —— 即浏览器 URL 规范化时会从 host 里省掉的
+// 那个。非 http(s) 返回空串（此时不做去端口查表）。
+func defaultPortOf(scheme string) string {
+	switch strings.ToLower(scheme) {
+	case "http":
+		return "80"
+	case "https":
+		return "443"
+	}
+	return ""
+}
+
 // fetchSegment 带重试地把单个分片下载到内存。ctx 取消时立刻返回。
 
 func fetchSegment(ctx context.Context, j *dlJob, segURL string) ([]byte, error) {
@@ -822,7 +876,7 @@ func fetchSegment(ctx context.Context, j *dlJob, segURL string) ([]byte, error) 
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
-		req, err := j.rt.newRequest(segURL, j.referer)
+		req, err := j.rt.newRequest(segURL, j.segmentReferer(segURL))
 		if err != nil {
 			return nil, cleanURLParseErr(err, segURL)
 		}

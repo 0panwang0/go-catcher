@@ -2,6 +2,7 @@
 package core
 
 import (
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"path/filepath"
@@ -129,14 +130,52 @@ func handleLog(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprint(w, tail)
 }
 
+// parseSegRefs 解析 /download 的 segrefs 查询参数：JSON 对象 { host: referer }，
+// 记录「分片主机 → 浏览器实际发出的 Referer」。分片 CDN 防盗链可能只认解析站域名
+// 而非页面域名，抓分片时按 host 精确选用（见 dlJob.segmentReferer）。
+//
+// 返回的键统一归一小写（host 大小写不敏感，而 Go 的 url.Parse 不归一化 host）。
+// 空串 / 空 map 一律返回 (nil, nil)：segrefs 是可选参数，缺省即「不覆盖」。
+//
+// **值为空串的条目必须保留**：它表示「浏览器对该 host 根本没带 Referer」，是
+// segmentReferer 用来抑制页面 Referer 兜底的信号（丢掉它 = 回退页面 Referer ⇒
+// 白名单型防盗链必 403）。只有 host 为空 / 空白的条目才丢弃。
+func parseSegRefs(raw string) (map[string]string, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil, nil
+	}
+	var m map[string]string
+	if err := json.Unmarshal([]byte(raw), &m); err != nil {
+		return nil, fmt.Errorf("segrefs 必须是 JSON 对象（host→referer）: %w", err)
+	}
+	out := make(map[string]string, len(m))
+	for h, r := range m {
+		h = strings.ToLower(strings.TrimSpace(h))
+		if h == "" {
+			continue
+		}
+		out[h] = r
+	}
+	if len(out) == 0 {
+		return nil, nil
+	}
+	return out, nil
+}
+
 func (e *Engine) handleDownload(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 	m3u8URL := q.Get("m3u8")
 	refererParam := q.Get("referer")
+	segRefs, segRefsErr := parseSegRefs(q.Get("segrefs"))
 	filename := strings.TrimSpace(q.Get("filename"))
 	mode := strings.ToLower(q.Get("mode"))
 	if filename == "" {
 		filename = "video.ts"
+	}
+	if segRefsErr != nil {
+		jsonError(w, http.StatusBadRequest, "segrefs 参数非法: "+segRefsErr.Error())
+		return
 	}
 	if m3u8URL == "" {
 		http.Error(w, "missing required query param: m3u8", http.StatusBadRequest)
@@ -201,7 +240,7 @@ func (e *Engine) handleDownload(w http.ResponseWriter, r *http.Request) {
 	te.mu.Lock()
 	te.st = taskState{
 		id: id, queued: true, running: false, stage: "排队中", started: time.Now(),
-		m3u8URL: m3u8URL, referer: refererParam, filename: displayName, saveDir: saveDir,
+		m3u8URL: m3u8URL, referer: refererParam, segRefs: segRefs, filename: displayName, saveDir: saveDir,
 		finalPath: finalPath,
 	}
 	te.mu.Unlock()

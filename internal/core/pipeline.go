@@ -91,6 +91,7 @@ func runDiskPipeline(te *taskEntry) {
 		id:      st.id,
 		m3u8URL: st.m3u8URL,
 		referer: st.referer,
+		segRefs: st.segRefs,
 		saveDir: st.saveDir,
 		fname:   st.filename,
 	}

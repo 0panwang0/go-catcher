@@ -15,22 +15,23 @@ const stateVersion = 1
 // persistedTask 落盘的字段（不含运行时对象）
 
 type persistedTask struct {
-	ID        string    `json:"id"`
-	Filename  string    `json:"filename"`
-	SaveDir   string    `json:"saveDir"`
-	M3u8URL   string    `json:"m3u8URL"`
-	Referer   string    `json:"referer"`
-	SegDone   int64     `json:"segDone"`
-	SegTot    int64     `json:"segTot"`
-	Stage     string    `json:"stage"`
-	Done      bool      `json:"done"`
-	Paused    bool      `json:"paused"`
-	Canceled  bool      `json:"canceled"`
-	FinalPath string    `json:"finalPath"`
-	ErrorMsg  string    `json:"errorMsg"`
-	Started   time.Time `json:"started"`
-	Finished  time.Time `json:"finished"`
-	Live      bool      `json:"live"` // 直播跟随任务（播放列表无 ENDLIST）
+	ID        string            `json:"id"`
+	Filename  string            `json:"filename"`
+	SaveDir   string            `json:"saveDir"`
+	M3u8URL   string            `json:"m3u8URL"`
+	Referer   string            `json:"referer"`
+	SegRefs   map[string]string `json:"segrefs,omitempty"`
+	SegDone   int64             `json:"segDone"`
+	SegTot    int64             `json:"segTot"`
+	Stage     string            `json:"stage"`
+	Done      bool              `json:"done"`
+	Paused    bool              `json:"paused"`
+	Canceled  bool              `json:"canceled"`
+	FinalPath string            `json:"finalPath"`
+	ErrorMsg  string            `json:"errorMsg"`
+	Started   time.Time         `json:"started"`
+	Finished  time.Time         `json:"finished"`
+	Live      bool              `json:"live"` // 直播跟随任务（播放列表无 ENDLIST）
 	// 中断收尾（已保存已录部分但没录完）与产物时间轴上的缺口时长。
 	// 落盘是为了重启后界面仍能把"中断"与"完整录完"区分开。
 	Interrupted bool            `json:"interrupted,omitempty"`
@@ -115,7 +116,7 @@ func (r *Runtime) collectPersisted() []persistedTask {
 		}
 		pt := persistedTask{
 			ID: s.id, Filename: s.filename, SaveDir: s.saveDir,
-			M3u8URL: s.m3u8URL, Referer: s.referer,
+			M3u8URL: s.m3u8URL, Referer: s.referer, SegRefs: s.segRefs,
 			SegDone: segDone, SegTot: s.segTot, Stage: s.stage,
 			Done: s.done, Paused: s.paused, Canceled: s.canceled,
 			FinalPath: s.finalPath, ErrorMsg: s.errorMsg,
@@ -239,7 +240,7 @@ func (r *Runtime) loadState() {
 		te.st = taskState{
 			id: pt.ID, stage: pt.Stage, done: pt.Done, paused: pt.Paused,
 			canceled: pt.Canceled, finalPath: pt.FinalPath, errorMsg: pt.ErrorMsg,
-			m3u8URL: pt.M3u8URL, referer: pt.Referer, filename: pt.Filename,
+			m3u8URL: pt.M3u8URL, referer: pt.Referer, segRefs: pt.SegRefs, filename: pt.Filename,
 			saveDir: pt.SaveDir, segDone: pt.SegDone, segTot: pt.SegTot,
 			started: pt.Started, finished: pt.Finished,
 			live:        pt.Live,

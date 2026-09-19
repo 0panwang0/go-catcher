@@ -8,6 +8,7 @@
 //   exePath —— go-catcher.exe 本机路径，兜底"复制命令到终端"用；默认裸文件名（要求在 PATH）
 //   port    —— 本地服务端口，与 GoCatcher 客户端「设置」里的端口保持一致
 import { requestWake } from "./native-host.js";
+import { segmentReferers } from "./referer-capture.js";
 
 // 缓存 + onChanged 失效：service worker 随时可能被回收，重启后首次读取重建缓存
 let settingsCache = null;
@@ -148,6 +149,12 @@ export async function downloadViaServer({ m3u8Url, referer, title, filename } = 
     // 2) 请求 Go 直接落盘到所选目录（异步：立即返回，扩展轮询 /status）
     const params = new URLSearchParams({ m3u8: m3u8Url, mode: "disk", dir });
     if (referer) params.set("referer", referer);
+    // 分片 Referer：分片 CDN 防盗链可能只认解析站域名（不是页面域名），把它按
+    // host 捕获下来传给 Go，由 Go 抓分片时按域名选用（详见 referer-capture.js）。
+    const segRefs = await segmentReferers();
+    if (segRefs && Object.keys(segRefs).length) {
+      params.set("segrefs", JSON.stringify(segRefs));
+    }
     const safeFn = filename || `${title || "video"}.ts`;
     params.set("filename", safeFn);
 

@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/hex"
 	"fmt"
+	"math"
 	"net/url"
 	"path/filepath"
 	"regexp"
@@ -211,7 +212,9 @@ type KeyInfo struct {
 //
 // ctx 一路传到两次网络请求（含重试退避）：暂停/取消时不必等一轮重试跑完。
 func (j *dlJob) fetchPlaylist(ctx context.Context) (content, base string, isDirect bool, err error) {
-	body, isDirect, status, err := j.rt.httpGetPlaylist(ctx, j.m3u8URL, j.referer)
+	// playlist 与分片一样经 segmentReferer 按 host 选用 Referer：有的站把 m3u8 也
+	// 放在白名单型 CDN 上，一律用页面 Referer 会被 403（见 dlJob.segmentReferer）。
+	body, isDirect, status, err := j.rt.httpGetPlaylist(ctx, j.m3u8URL, j.segmentReferer(j.m3u8URL))
 	if err != nil {
 		if status != 0 {
 			return "", "", false, fmt.Errorf("HTTP %d: %w", status, err)
@@ -231,7 +234,9 @@ func (j *dlJob) fetchPlaylist(ctx context.Context) (content, base string, isDire
 			return "", "", false, err
 		}
 		fmt.Printf("发现 master playlist，选择最高码率: %s\n", subURL)
-		subBody, _, err := j.rt.httpGetWithRetry(ctx, subURL, j.referer)
+		// 第二跳（master → 子播放列表）同样按 host 选用：子流可能落在与 m3u8
+		// 不同的 CDN 上，用页面 Referer 同样可能被白名单型防盗链 403。
+		subBody, _, err := j.rt.httpGetWithRetry(ctx, subURL, j.segmentReferer(subURL))
 		if err != nil {
 			return "", "", false, err
 		}
@@ -311,14 +316,19 @@ func parsePlaylist(m3u8Text, base string) playlistInfo {
 	return pl
 }
 
-// parseEXTINFDuration 解析 "#EXTINF:10.0," 中的秒数；解析失败返回 0。
+// parseEXTINFDuration 解析 "#EXTINF:10.0," 中的秒数；解析失败或产生非有限值
+// （如 "#EXTINF:NaN," / "#EXTINF:+Inf,"：strconv.ParseFloat 会成功返回但结果是
+// NaN/+Inf，污染 totalDur 与 durs 令下游净时长比较失效）返回 0。
 func parseEXTINFDuration(line string) float64 {
 	rest := strings.TrimPrefix(line, "#EXTINF:")
 	rest = strings.TrimSpace(rest)
 	if i := strings.IndexAny(rest, ",\t "); i >= 0 {
 		rest = rest[:i]
 	}
-	d, _ := strconv.ParseFloat(rest, 64)
+	d, err := strconv.ParseFloat(rest, 64)
+	if err != nil || math.IsNaN(d) || math.IsInf(d, 0) {
+		return 0
+	}
 	return d
 }
 

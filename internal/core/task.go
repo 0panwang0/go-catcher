@@ -23,10 +23,11 @@ type taskState struct {
 	openPath  string // 当前真实存在的可打开文件（done 时为 finalPath；paused 时为 .part；其它为空）
 	errorMsg  string // 失败原因
 	// 本次任务的文件元信息（任务开始即填充，失败/成功后保留）
-	m3u8URL  string // 来源 m3u8
-	referer  string // 来源页（恢复下载时需要）
-	filename string // 目标文件名（如 xxx.ts）
-	saveDir  string // 用户选的目标保存目录
+	m3u8URL  string            // 来源 m3u8
+	referer  string            // 来源页（恢复下载时需要）
+	segRefs  map[string]string // 分片主机 → Referer（抓分片按 host 选用；恢复下载沿用）
+	filename string            // 目标文件名（如 xxx.ts）
+	saveDir  string            // 用户选的目标保存目录
 	// 分片下载进度（运行时由 dlJob 的原子计数刷新）
 	segDone  int64
 	segTot   int64

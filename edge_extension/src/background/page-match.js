@@ -93,6 +93,21 @@ export async function listCandidates(pageUrl) {
   return { hostM3U8: hostM3U8.filter(keep), hostMP4: hostMP4.filter(keep) };
 }
 
+// uniqueTabCandidate 权威 tab 级唯一候选（方案1，2026-09-18）。
+//   pageCandidates 收窄到「同一 frame / 同 page path」仍为空时，说明 content.js
+//   上报的 pageUrl（iframe 里是 iframe.location.href）与嗅探记录锚定的 URL 对不上。
+//   典型是「同源 iframe + MSE(blob) + 加密源」站点：iframe URL 参数加密、sniff 的
+//   frameUrl 常为空（details.documentUrl 拿不到），记录锚定的是顶层页 URL。
+//   此时退到浏览器权威的顶层页 URL（sender.tab.url）重做同页判定，并加唯一性
+//   闸门：整个顶层页恰好只有一条候选（m3u8 与 mp4 合并计数）才返回，否则 null
+//   —— 宁可不出按钮，也不在证据不足时按体积/新鲜度猜（宁缺勿假）。
+export async function uniqueTabCandidate(tabUrl) {
+  if (!tabUrl) return null;
+  const { hostM3U8, hostMP4 } = await pageCandidates(tabUrl);
+  const all = [...hostM3U8, ...hostMP4];
+  return all.length === 1 ? all[0] : null;
+}
+
 // isSamePageURL 两个页面 URL 是否指向同一页：hostname 相同且 pathname 相同
 // （末尾斜杠归一化后比较；任一不可解析返回 false）。
 function isSamePageURL(a, b) {

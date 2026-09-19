@@ -34,6 +34,12 @@ import {
   controlTask,
 } from "./server-api.js";
 import { setRefererRules, clearRefererRules, sweepStaleRules, allocRuleIds } from "./referer-rules.js";
+import {
+  installRefererCapture,
+  refererFromDetails,
+  captureSegmentReferer,
+  segmentReferers,
+} from "./referer-capture.js";
 import { requestWake, NATIVE_HOST_NAME } from "./native-host.js";
 
 // 点击工具栏图标：打开下载器页面
@@ -52,13 +58,13 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     return true;
   }
   if (msg.type === "getVideoSource") {
-    getVideoSource(msg)
+    getVideoSource(msg, sender)
       .then((res) => sendResponse({ ok: true, source: res }))
       .catch((e) => sendResponse({ ok: false, error: String(e && e.message ? e.message : e) }));
     return true;
   }
   if (msg.type === "getVideoSources") {
-    getVideoSources(msg)
+    getVideoSources(msg, sender)
       .then((res) => sendResponse({ ok: true, sources: res }))
       .catch((e) => sendResponse({ ok: false, error: String(e && e.message ? e.message : e) }));
     return true;
@@ -129,6 +135,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 });
 
 installSniffProbes();
+installRefererCapture();
 
 // 下载器页签关闭时清掉它的 Referer 规则：规则按 tabId 生效，tab 没了规则
 // 就永远匹配不到请求，只会占用动态规则配额（浏览器动态规则上限 5000 条）。
@@ -174,4 +181,9 @@ export const __test__ = {
   // 原生消息唤起（tests/nativehost.test.js）
   requestWake,
   NATIVE_HOST_NAME,
+  // 分片 Referer 捕获（tests/referercapture.test.js）
+  refererFromDetails,
+  captureSegmentReferer,
+  segmentReferers,
+  downloadViaServer,
 };

@@ -211,12 +211,19 @@ func (r *Runtime) newRequest(target, ref string) (*http.Request, error) {
 	if err != nil {
 		return nil, err
 	}
-	// 伪造浏览器请求头。Origin 从 Referer 的同源推导（浏览器里真实播放时就是这么发的）；
-	// Referer 为空则不设 Origin。
+	// 伪造浏览器请求头。Origin 从 Referer 的同源推导（浏览器里真实播放时就是这么发的）。
+	//
+	// ref == "" 的语义是「浏览器对该 URL 根本没带 Referer 头」（页面声明 no-referrer
+	// 时就是这样），所以这里**整头不设**：真机上量过 —— 页面带
+	// `<meta name="referrer" content="no-referrer">` 时，Chrome 发往跨源子资源的请求
+	// 里连 referer 键都没有（对照组默认策略 3/3 带 Referer）；浏览器不发空值头，
+	// 我们也不发。无 Referer 也就没有 Origin。
 	req.Header.Set("User-Agent", r.userAgent)
-	req.Header.Set("Referer", ref)
-	if u, err := url.Parse(ref); err == nil && u.Scheme != "" && u.Host != "" {
-		req.Header.Set("Origin", u.Scheme+"://"+u.Host)
+	if ref != "" {
+		req.Header.Set("Referer", ref)
+		if u, err := url.Parse(ref); err == nil && u.Scheme != "" && u.Host != "" {
+			req.Header.Set("Origin", u.Scheme+"://"+u.Host)
+		}
 	}
 	req.Header.Set("Accept", "*/*")
 	req.Header.Set("Accept-Language", "zh-CN,zh;q=0.9,en;q=0.8")
