@@ -3,6 +3,7 @@ package core
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -224,7 +225,7 @@ func TestLiveFollow(t *testing.T) {
 	defer func() { testStd.livePollInterval, testStd.liveMaxEmptyPolls = oldI, oldE }()
 
 	out := filepath.Join(t.TempDir(), "live.ts")
-	j := &dlJob{rt: testStd, m3u8URL: srv.URL + "/live.m3u8", live: true, seen: make(map[string]bool)}
+	j := &dlJob{rt: testStd, m3u8URL: srv.URL + "/live.m3u8", live: true}
 
 	next, err := j.liveDownload(context.Background(), out, 0)
 	if err != nil {
@@ -261,7 +262,7 @@ func TestLiveFollowStop(t *testing.T) {
 	defer func() { testStd.livePollInterval = oldI }()
 
 	out := filepath.Join(t.TempDir(), "live.ts")
-	j := &dlJob{rt: testStd, m3u8URL: srv.URL + "/live.m3u8", live: true, seen: make(map[string]bool)}
+	j := &dlJob{rt: testStd, m3u8URL: srv.URL + "/live.m3u8", live: true}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	go func() {
@@ -309,7 +310,7 @@ func TestVODStreamResumeRemainder(t *testing.T) {
 		tots = append(tots, tot)
 		pmu.Unlock()
 	}
-	content, base, isDirect, err := j.fetchPlaylist()
+	content, base, isDirect, err := j.fetchPlaylist(context.Background())
 	if err != nil || isDirect {
 		t.Fatalf("fetchPlaylist: isDirect=%v err=%v", isDirect, err)
 	}
@@ -371,7 +372,7 @@ func TestVODFMP4(t *testing.T) {
 
 	ctx := context.Background()
 	j := &dlJob{rt: testStd, m3u8URL: srv.URL + "/vod.m3u8"}
-	content, base, isDirect, err := j.fetchPlaylist()
+	content, base, isDirect, err := j.fetchPlaylist(context.Background())
 	if err != nil || isDirect {
 		t.Fatalf("fetchPlaylist: isDirect=%v err=%v", isDirect, err)
 	}
@@ -415,5 +416,186 @@ func TestVODFMP4(t *testing.T) {
 	want := "FTYP-MOOV-INIT" + "\x00\x00\x00\x10moofDATA0" + "\x00\x00\x00\x10moofDATA1"
 	if string(data) != want {
 		t.Fatalf("文件=%q want %q", data, want)
+	}
+}
+
+// TestLiveEventStreamNoDuplicate 只增不减的 EVENT 直播列表（旧分片永远留在
+// 列表里）不能重复录制：判定必须靠 media sequence 水位线 —— 一旦 URL 窗口有界，
+// 早期 URL 会被淘汰，按「URL 是否在窗口里」判重会把它们当新分片重下一遍。
+func TestLiveEventStreamNoDuplicate(t *testing.T) {
+	var mu sync.Mutex
+	polls := 0
+	mux := http.NewServeMux()
+	mux.HandleFunc("/event.m3u8", func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		polls++
+		n := polls
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/vnd.apple.mpegurl")
+		var b strings.Builder
+		b.WriteString("#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-PLAYLIST-TYPE:EVENT\n#EXT-X-MEDIA-SEQUENCE:0\n")
+		total := 3 * n
+		if total > 6 {
+			total = 6
+		}
+		for i := 0; i < total; i++ {
+			fmt.Fprintf(&b, "#EXTINF:2.0,\nseg/%d.ts\n", i)
+		}
+		if n >= 3 {
+			b.WriteString("#EXT-X-ENDLIST\n")
+		}
+		fmt.Fprint(w, b.String())
+	})
+	mux.HandleFunc("/seg/", func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintf(w, "SEG-%s", strings.TrimPrefix(r.URL.Path, "/seg/"))
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	oldI, oldE := testStd.livePollInterval, testStd.liveMaxEmptyPolls
+	testStd.livePollInterval = 5 * time.Millisecond
+	testStd.liveMaxEmptyPolls = 3
+	defer func() { testStd.livePollInterval, testStd.liveMaxEmptyPolls = oldI, oldE }()
+
+	out := filepath.Join(t.TempDir(), "event.ts")
+	j := &dlJob{rt: testStd, m3u8URL: srv.URL + "/event.m3u8", live: true}
+
+	next, err := j.liveDownload(context.Background(), out, 0)
+	if err != nil {
+		t.Fatalf("liveDownload: %v", err)
+	}
+	if next != 6 {
+		t.Fatalf("next=%d want 6（每片恰好录一次）", next)
+	}
+	data, err := os.ReadFile(out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantOut := ""
+	for i := 0; i < 6; i++ {
+		wantOut += fmt.Sprintf("SEG-%d.ts", i)
+	}
+	if string(data) != wantOut {
+		t.Fatalf("内容=%q\nwant %q（EVENT 列表不得重复录制）", data, wantOut)
+	}
+}
+
+// TestSeenWatermarkMonotonic 直播去重靠 media sequence 水位线：单调推进、
+// 被滑动窗口淘汰的早期分片仍判为已录（否则 EVENT 列表会把它们重录一遍）、
+// 超前序号判为新分片、回退序号不拉低水位线。
+//
+// B0 之后不存在跨会话续录，旧实现里那个"兼容只存了 URL 的旧状态文件"的
+// URL 窗口已删除（见 TestLiveSeenStateNotPersisted），水位线是唯一判据。
+func TestSeenWatermarkMonotonic(t *testing.T) {
+	j := &dlJob{rt: testStd, live: true}
+	if j.seenCovers(0) {
+		t.Error("尚未录过任何分片时不该判为已录")
+	}
+	const n = uint64(5000)
+	for i := uint64(0); i < n; i++ {
+		if j.seenCovers(i) {
+			t.Fatalf("seq=%d 尚未录制却判为已录", i)
+		}
+		j.seenRecord(i)
+	}
+	if !j.seenCovers(0) {
+		t.Error("录过 seq=0 之后仍判为未录（EVENT 流会被重复录制）")
+	}
+	if !j.seenCovers(n - 1) {
+		t.Error("最近录过的分片应判为已录")
+	}
+	if j.seenCovers(n) {
+		t.Error("超前序号应判为新分片")
+	}
+	// 乱序回退（重复轮询里旧分片再次出现）不得把水位线拉低
+	j.seenRecord(10)
+	if wm, ok := j.seenWatermark(); !ok || wm != n-1 {
+		t.Fatalf("水位线=%d ok=%v want %d/true", wm, ok, n-1)
+	}
+}
+
+// TestLiveFailureDoesNotAdvanceWaterline 记账必须晚于落盘（P1-1）：
+// 一批分片全下载失败时，水位线一步都不能前进——推进了，后续轮询就会把它们
+// 当"已录制"跳过，产物时间轴上留一段空洞，而状态与日志都说一切正常。
+func TestLiveFailureDoesNotAdvanceWaterline(t *testing.T) {
+	useFastLive(t, 1<<20) // 不让"空轮询"抢先结束：失败必须来自分片下载
+	list := "#EXTM3U\n#EXT-X-VERSION:3\n#EXTINF:6.0,\nseg/0.ts\n" +
+		"#EXTINF:6.0,\nseg/1.ts\n#EXTINF:6.0,\nseg/2.ts\n"
+	srv := startLiveServer(t, []string{list}, map[string]string{},
+		map[string]bool{"/seg/0.ts": true, "/seg/1.ts": true, "/seg/2.ts": true})
+
+	job := &dlJob{rt: testStd, id: "twater", live: true, m3u8URL: srv.URL + "/live.m3u8"}
+	out := filepath.Join(t.TempDir(), "live.ts")
+	if _, err := job.liveDownload(context.Background(), out, 0); err == nil {
+		t.Fatal("分片全 500 应返回错误")
+	}
+	if wm, ok := job.seenWatermark(); ok {
+		t.Fatalf("3 片全部下载失败，水位线却推进到 %d：下一轮会把它们当已录制跳过", wm)
+	}
+	if info, err := os.Stat(out); err == nil && info.Size() > 0 {
+		t.Fatalf("一片都没落盘，输出文件却有 %d 字节", info.Size())
+	}
+}
+
+// TestLivePartialBatchCommitsOnlyFlushed 只提交"确认落盘"的前缀：
+// 3 片里第 2 片失败时，只有第 1 片能记成已录制；第 3 片虽然内容正常，
+// 但它后面的分片没写进去，序号必须留在水位线之后（下一轮窗口里还在就补）。
+func TestLivePartialBatchCommitsOnlyFlushed(t *testing.T) {
+	useFastLive(t, 1<<20)
+	list := "#EXTM3U\n#EXT-X-VERSION:3\n#EXTINF:6.0,\nseg/0.ts\n" +
+		"#EXTINF:6.0,\nseg/1.ts\n#EXTINF:6.0,\nseg/2.ts\n"
+	srv := startLiveServer(t, []string{list},
+		map[string]string{"/seg/0.ts": "SEG-0", "/seg/2.ts": "SEG-2"},
+		map[string]bool{"/seg/1.ts": true})
+
+	job := &dlJob{rt: testStd, id: "tpartial", live: true, m3u8URL: srv.URL + "/live.m3u8"}
+	out := filepath.Join(t.TempDir(), "live.ts")
+	if _, err := job.liveDownload(context.Background(), out, 0); err == nil {
+		t.Fatal("分片失败应返回错误")
+	}
+	wm, ok := job.seenWatermark()
+	if !ok || wm != 0 {
+		t.Fatalf("水位线=%d ok=%v want 0/true（只有第 1 片落盘）", wm, ok)
+	}
+	if job.seenCovers(1) {
+		t.Fatal("没落盘的第 2 片被记成已录制")
+	}
+	if job.seenCovers(2) {
+		t.Fatal("第 3 片被提前记成已录制：它的写入序号在第 2 片之后，文件里根本没有")
+	}
+	data, err := os.ReadFile(out)
+	if err != nil {
+		t.Fatalf("读输出: %v", err)
+	}
+	if string(data) != "SEG-0" {
+		t.Fatalf("输出内容=%q want %q", data, "SEG-0")
+	}
+}
+
+// TestLiveSeenStateNotPersisted 直播去重状态不进状态文件。
+//
+// B0 之后直播只有「停止」「取消」两态，不存在跨会话续录——这些字段写进去
+// 没人读（复核证实此前更是从未真正写过：collectPersisted 的 s.live 分支
+// 因 P1-4 不可达），只会让状态文件随录制时长线性膨胀（6 小时直播按 2s/片
+// 是上万条 URL）。
+func TestLiveSeenStateNotPersisted(t *testing.T) {
+	saveRestoreState(t)
+	job := &dlJob{rt: testStd, live: true}
+	for i := uint64(0); i < 50; i++ {
+		job.seenRecord(i)
+	}
+	te := &taskEntry{rt: testStd, job: job, st: taskState{
+		id: "t1", live: true, stage: "录制中", segDone: 50,
+	}}
+	testStd.tasks[te.st.id] = te
+
+	data, err := json.Marshal(testStd.collectPersisted())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, frag := range []string{"seenSeq", "seenAny", "seenURLs"} {
+		if strings.Contains(string(data), frag) {
+			t.Errorf("状态文件里仍有 %s：B0 之后没有跨会话续录，这些字段没人读", frag)
+		}
 	}
 }

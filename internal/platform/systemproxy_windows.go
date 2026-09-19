@@ -1,12 +1,14 @@
 //go:build windows
 
-// 系统代理读取：Clash 等工具的「系统代理」开关写的 WinINET 注册表设置
+package platform
+
+// 系统代理读取：系统「代理」开关写入的 WinINET 注册表设置
 // （HKCU\...\Internet Settings 的 ProxyEnable/ProxyServer）。
 // system 代理模式每次建连现读注册表，开关/改端口即时跟随。
-package core
 
 import (
 	"fmt"
+	"net/url"
 	"strings"
 
 	"golang.org/x/sys/windows/registry"
@@ -37,46 +39,65 @@ func readSystemProxy() systemProxyReading {
 	return systemProxyReading{server: server, enabled: true}
 }
 
-// realSystemProxyAddr 读当前用户 WinINET 系统代理（Runtime.systemProxyAddrFn
-// 的默认实现；测试可向 Runtime 注入桩函数）。
+// RealSystemProxyAddr 读当前用户 WinINET 系统代理（引擎 Runtime.systemProxyAddrFn
+// 的默认实现；测试可向引擎注入桩函数）。
 // 返回规范化 http://host:port；未启用/读取失败返回 ""（= 直连）。
-func realSystemProxyAddr() string {
+func RealSystemProxyAddr() string {
 	r := readSystemProxy()
 	if !r.enabled {
 		return ""
 	}
-	return normalizeSystemProxy(r.server)
+	return NormalizeSystemProxy(r.server)
 }
 
-// systemProxyWarning 报告"系统代理已启用、但本引擎用不了"的原因（空 = 无需提示）。
+// SystemProxyWarning 报告"系统代理已启用、但本引擎用不了"的原因（空 = 无需提示）。
 //
-// socks5:// 之类的协议无法走 HTTP CONNECT 隧道，normalizeSystemProxy 会返回空串
-// ——效果是静默直连。用户以为走了代理、实际暴露真实 IP，这种"安静的降级"必须
-// 显式说出来，否则排查时完全看不出问题在哪。
-func (rt *Runtime) systemProxyWarning() string {
-	if !strings.EqualFold(strings.TrimSpace(rt.getProxyAddr()), "system") {
+// 引擎在 system 模式（proxyMode）下逐连接现读注册表；socks5:// 之类的协议无法走
+// HTTP CONNECT 隧道，NormalizeSystemProxy 会返回空串——效果是静默直连。用户以为
+// 走了代理、实际暴露真实 IP，这种"安静的降级"必须显式说出来，否则排查时完全
+// 看不出问题在哪。
+func SystemProxyWarning(proxyMode string) string {
+	if !strings.EqualFold(strings.TrimSpace(proxyMode), "system") {
 		return "" // 手动/直连模式与系统代理无关
 	}
 	r := readSystemProxy()
 	if !r.enabled {
 		return ""
 	}
-	if normalizeSystemProxy(r.server) != "" {
+	if NormalizeSystemProxy(r.server) != "" {
 		return "" // 解析成功，没有可提示的
 	}
 	return systemProxyNotice(r.server)
 }
 
-// systemProxyNotice 解释 ProxyServer 为何不可用；无法归因时返回通用提示。
+// systemProxyNotice 解释 ProxyServer 为何不可用；无法归因时返回空串。
+//
+// 文案刻意短：「系统代理协议不受支持（当前为 socks5），已按直连处理」。只说事实、
+// 不解释原理，括号里点名注册表里的实际协议——用户据此就知道该把代理软件切成
+// http 模式，比笼统的「协议不受支持」少一轮排查。
 func systemProxyNotice(server string) string {
-	s := strings.TrimSpace(server)
+	proto := unsupportedProtoName(server)
+	if proto == "" {
+		return ""
+	}
+	return fmt.Sprintf("系统代理协议不受支持（当前为 %s），已按直连处理", proto)
+}
+
+// unsupportedProtoName 从 ProxyServer 原始值里提取「不受支持」的协议名；
+// 空串 = 无话可说。注册表有两种已知形态：
+//
+//   - scheme 形态 "socks5://host:port" → 取 scheme；
+//   - 分协议形态 "ftp=h:21;http=h:8080" → 取所有键名。
+//
+// 出现 http/https 键即返回空：那意味着有能用的项，轮不到这条提示。
+func unsupportedProtoName(s string) string {
+	s = strings.TrimSpace(s)
 	if s == "" {
 		return ""
 	}
-	const rule = "本工具只支持 http:// 代理（socks5 等无法走 CONNECT 隧道），已按直连处理"
 	if !strings.Contains(s, "=") {
 		if i := strings.Index(s, "://"); i > 0 {
-			return fmt.Sprintf("系统代理协议为 %s，%s", strings.ToLower(s[:i]), rule)
+			return strings.ToLower(s[:i])
 		}
 		return ""
 	}
@@ -88,21 +109,24 @@ func systemProxyNotice(server string) string {
 			continue
 		}
 		p := strings.ToLower(strings.TrimSpace(kv[:eq]))
+		if p == "" {
+			continue
+		}
 		protos = append(protos, p)
 		if p == "http" || p == "https" {
 			hasHTTP = true
 		}
 	}
-	if !hasHTTP && len(protos) > 0 {
-		return fmt.Sprintf("系统代理只配置了 %s，%s", strings.Join(protos, "/"), rule)
+	if hasHTTP || len(protos) == 0 {
+		return ""
 	}
-	return ""
+	return strings.Join(protos, "/")
 }
 
-// normalizeSystemProxy 规范化 ProxyServer 值：可能是 "host:port"、
+// NormalizeSystemProxy 规范化 ProxyServer 值：可能是 "host:port"、
 // "http://host:port" 或 "ftp=h:21;http=h:8080;https=h:7890" 按协议分设格式。
 // 本引擎只发 HTTPS 请求，优先取 https=，回退 http=，再回退整串。
-func normalizeSystemProxy(server string) string {
+func NormalizeSystemProxy(server string) string {
 	s := strings.TrimSpace(server)
 	if s == "" {
 		return ""
@@ -132,8 +156,15 @@ func normalizeSystemProxy(server string) string {
 	} else {
 		s = "http://" + s
 	}
-	if !validProxyAddr(s) {
+	if !ValidProxyAddr(s) {
 		return ""
 	}
 	return s
+}
+
+// ValidProxyAddr 校验代理地址：仅支持 http://host[:port]（dialTLSContext 走
+// HTTP CONNECT 隧道，socks5/https 代理无法工作）。
+func ValidProxyAddr(p string) bool {
+	u, err := url.Parse(p)
+	return err == nil && u.Scheme == "http" && u.Host != ""
 }

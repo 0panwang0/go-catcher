@@ -12,6 +12,7 @@ import (
 	"os"
 
 	"github.com/0panwang0/go-catcher/internal/fmp4"
+	"github.com/0panwang0/go-catcher/internal/platform"
 )
 
 // InitPolicy 说明是否需要「初始化段」（fMP4 的 ftyp/moov 文件头）。
@@ -40,8 +41,13 @@ const (
 type NormState interface {
 	// Snapshot 导出全部跨分片状态（tfdt 基准、结束时间、init 信息）为不透明字节
 	Snapshot() []byte
-	// Restore 载入持久化的状态（断点续传；格式自解释，未知/损坏字节静默忽略）
-	Restore(b []byte)
+	// Restore 载入持久化的状态（断点续传），返回是否真的采用了这份状态。
+	//
+	// 版本不符、字节损坏一律整份丢弃并返回 false —— 不猜测、不部分解析。
+	// 返回值是续传能否安全进行的判据：状态丢了而容器又依赖它（fMP4 的 tfdt
+	// 基准），新分片会从头计时、与已录内容重叠，属"成品能播、内容是错的"，
+	// 必须由调用方显式拒绝（见 restoreContainer）。
+	Restore(b []byte) bool
 
 	// Normalize 处理一段写入前的数据（fMP4：init 段补 mehd 占位 + 分片时间戳
 	// 归一化 + 裸 NAL→AVCC）；非本容器数据原样返回（不报错），保证管线不受影响
@@ -164,9 +170,11 @@ func containsBytes(p []byte, s string) bool {
 
 // ---- 注册表 ----
 
-// fmp4State 把 fmp4.NewState 包装为 NormState 接口工厂（注册表条目共用）。
+// fmp4State 把 fmp4.NewStateWithLogger 包装为 NormState 接口工厂（注册表条目共用）。
+// 注入 platform.Logf 而不是让库自己 fmt.Printf：库不该往进程 stdout 写东西
+// （原生消息宿主模式下那条流是协议通道），诊断要归口到统一日志出口。→ P3-7
 // 此处即编译期验证：*fmp4.normState 的方法集满足 NormState 接口。
-func fmp4State() NormState { return fmp4.NewState() }
+func fmp4State() NormState { return fmp4.NewStateWithLogger(platform.Logf) }
 
 // containerRegistry 按序探测（先命中的格式优先）。fmp4 有两个条目，用不同 ID
 // 区分（原先两条同 ID，逼得 findContainerByID 必须特判 Init 字段才能挑对）：

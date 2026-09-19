@@ -11,12 +11,25 @@ import (
 	"unicode/utf8"
 )
 
-// normalizeOutput 补齐输出文件扩展名（无扩展名默认 .ts）
+// normalizeOutput 补齐输出文件扩展名（无扩展名默认 .ts），并剔除路径里的
+// bidi 方向控制符（isBidiControl）。
+//
+// 只做这一层窄清洗，**不套 sanitizeFilename**：-o 是用户给的完整路径，可以带
+// 目录（out/video.ts），把 / \ : 换成下划线会把路径毁掉。但 bidi 控制符在
+// 任何一层都不合法——不可见却能重排显示，而浮层兜底命令的 -o 正是从页面标题
+// 派生的（站点可控），JS 侧的 sanitizeFileName 又没有 bidi 规则，U+202E 能
+// 一路进到文件名（评审自审 #9）。删它们不会破坏任何合法路径。
 func (r *Runtime) normalizeOutput() string {
-	if filepath.Ext(r.outputFile) == "" {
-		return r.outputFile + ".ts"
+	name := strings.Map(func(c rune) rune {
+		if isBidiControl(c) {
+			return -1
+		}
+		return c
+	}, r.outputFile)
+	if filepath.Ext(name) == "" {
+		return name + ".ts"
 	}
-	return r.outputFile
+	return name
 }
 
 // moveFile 把 src 移到 dst：优先同卷 Rename，跨卷(不同盘)时回退为 复制+删除。
@@ -48,33 +61,81 @@ func emitOutput(partPath, finalPath string) error {
 	return nil
 }
 
-// uniquePath 若 path 已存在（或对应的 .part 半成品已存在）则返回
-// "name (1).ext"、"name (2).ext"… 直到不冲突。
-// 必须同时检查 .part：下载期间磁盘上只有 <name>.ext.part（<name>.ext 尚未 rename 出来），
-// 若不查 .part，两个并发同标题任务会分到同一个 finalPath，互相写同一个 .part 冲突。
-func uniquePath(p string) string {
-	occupied := func(cand string) bool {
+// uniquePath 返回一个可用的输出路径，并**原子地把它认领下来**：
+// 返回时 <结果>.part 一定已经存在（0 字节占位）。
+//
+// 两条判据缺一不可：
+//  1. 磁盘检查：正式文件已存在，或对应的 .part 半成品已存在；
+//  2. 原子认领：用 O_CREATE|O_EXCL 创建 <候选>.part，失败即换下一个候选。
+//
+// 为什么需要第 2 条（P2-8）：只有第 1 条时是 TOCTOU —— 两个并发 /download
+// 在彼此都还没创建 .part 的瞬间会算出同一个路径，然后两个任务互相写同一个
+// 文件、抢同一个成品名。EXCL 创建把"选中"和"占用"合成一个原子操作，
+// 而且认领随 .part 的删除（取消任务）自动释放，不需要额外的登记表。
+//
+// 调用方直接往返回路径 + ".part" 写即可；写入方（writeInitSegment /
+// newStreamWriter）都是 O_APPEND|O_CREATE，追加到 0 字节占位上与新建等价。
+func uniquePath(p string) (string, error) {
+	claim := func(cand string) (bool, error) {
 		if _, err := os.Stat(cand); err == nil {
-			return true // 正式文件已存在
+			return false, nil // 正式文件已存在
 		}
-		if _, err := os.Stat(cand + ".part"); err == nil {
-			return true // 半成品正在被写入
+		f, err := os.OpenFile(cand+".part", os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0644)
+		if err != nil {
+			if os.IsExist(err) {
+				return false, nil // 已被占用（并发任务或磁盘上的残留半成品）
+			}
+			// 目录不存在 / 无权限：换个名字也一样失败，如实上报
+			return false, fmt.Errorf("创建临时文件失败 %s: %w", cand+".part", err)
 		}
-		return false
+		return true, f.Close()
 	}
-	if !occupied(p) {
-		return p
+
+	if ok, err := claim(p); err != nil {
+		return "", err
+	} else if ok {
+		return p, nil
 	}
+
 	dir := filepath.Dir(p)
 	base := filepath.Base(p)
 	ext := filepath.Ext(base)
 	stem := strings.TrimSuffix(base, ext)
-	for i := 1; ; i++ {
+	for i := 1; i <= maxNameAttempts; i++ {
 		cand := filepath.Join(dir, fmt.Sprintf("%s (%d)%s", stem, i, ext))
-		if !occupied(cand) {
-			return cand
+		ok, err := claim(cand)
+		if err != nil {
+			return "", err
+		}
+		if ok {
+			return cand, nil
 		}
 	}
+	return "", fmt.Errorf("同名文件过多，无法为 %s 生成可用文件名", base)
+}
+
+// maxNameAttempts 找空闲文件名时的最大尝试次数（防"目录里躺着一万个同名文件"
+// 时无限循环；正常情况第一两次就命中）。
+const maxNameAttempts = 9999
+
+// reclaimPath 修正扩展名（TS 内容不能存成 .ts 以外的错名、MP4 不能存成 .ts）
+// 之后重新认领目标路径：新路径照旧原子占位，旧路径上那个 0 字节占位顺手清掉。
+//
+// 只在"任务刚开工、还没有任何下载内容"时调用（pipeline 里从断点 0 开始的两条
+// 分支），所以清旧占位是安全的；这里仍只删 0 字节文件，万一调用点被挪到
+// 已有数据的路径上，也只会留下一个多余文件而不是删掉真实进度。
+func reclaimPath(saveDir, newName, oldFinalPath string) (string, error) {
+	np, err := uniquePath(filepath.Join(saveDir, newName))
+	if err != nil {
+		return "", err
+	}
+	if oldFinalPath == "" || strings.EqualFold(oldFinalPath, np) {
+		return np, nil
+	}
+	if fi, serr := os.Stat(oldFinalPath + ".part"); serr == nil && fi.Size() == 0 {
+		_ = os.Remove(oldFinalPath + ".part")
+	}
+	return np, nil
 }
 
 func copyFile(src, dst string) error {
@@ -114,6 +175,7 @@ const maxPathLen = 260
 
 // sanitizeFilename 把调用方给的文件名清洗成 Windows 上一定可写的名字：
 //   - 非法字符 < > : " / \ | ? * 与控制字符 → 下划线（删除）
+//   - bidi/嵌套控制符（不可见但会重排显示）→ 删除（见 isBidiControl）
 //   - 结尾的点与空格：Windows 会静默丢弃，自己先去掉，避免"以为叫 A. 实际叫 A"
 //   - 保留设备名（CON/PRN/NUL/COM1…）加前缀规避
 //
@@ -127,6 +189,12 @@ func sanitizeFilename(name string) string {
 		if r < 0x20 || r == 0x7f {
 			return -1
 		}
+		// 不可见却能改变显示顺序的字符必须删掉：名字是给用户看的，
+		// 显示与真实字符顺序不一致就是欺骗（扩展名白名单限制了危害，
+		// 但"看着叫 a.mp4 实际叫别的"这一半得在这里堵）。
+		if isBidiControl(r) {
+			return -1
+		}
 		return r
 	}, name)
 	name = strings.TrimRight(name, ". ")
@@ -137,6 +205,25 @@ func sanitizeFilename(name string) string {
 		name = "_" + name
 	}
 	return name
+}
+
+// isBidiControl 报告 r 是否会改变文本的显示方向或嵌套层级（Unicode 双向算法
+// 里的显式格式字符）。它们不可见，却能让同一串字符显示成完全不同的样子。
+//
+// 只删这一类，**不整体删 Cf（格式）类**：零宽连接符 U+200D 是 emoji 组合序列的
+// 组成部分（👨‍👩‍👧 靠它连成一个字），一刀切会把正常标题拆坏。
+func isBidiControl(r rune) bool {
+	switch {
+	case r >= 0x202A && r <= 0x202E: // LRE / RLE / PDF / LRO / RLO
+		return true
+	case r >= 0x2066 && r <= 0x2069: // LRI / RLI / FSI / PDI
+		return true
+	case r == 0x200E || r == 0x200F: // LRM / RLM：不可见的方向标记
+		return true
+	case r == 0x061C: // ALM（阿拉伯字母标记）
+		return true
+	}
+	return false
 }
 
 // isWindowsReservedName 判断名字（忽略扩展名）是否为 Windows 保留设备名。
@@ -182,16 +269,31 @@ func clipFilenameForDir(dir, name string) string {
 	return stem[:keep] + ext
 }
 
-// isExecutableExt 报告扩展名是否属于「可被系统当程序执行」的那一类。
-// 用于拒绝调用方要求把远端内容落盘成可执行文件（见 handleDownload）。
-func isExecutableExt(ext string) bool {
-	switch strings.ToLower(strings.TrimSpace(ext)) {
-	case ".exe", ".com", ".bat", ".cmd", ".ps1", ".psm1", ".vbs", ".vbe",
-		".js", ".jse", ".wsf", ".wsh", ".scr", ".msi", ".msp", ".cpl",
-		".lnk", ".url", ".reg", ".hta", ".jar", ".dll", ".sys":
-		return true
-	}
-	return false
+// allowedDownloadExts /download 允许落盘的扩展名（白名单）。
+//
+// 为什么用白名单而不是黑名单（P2-10）：本服务把远端内容原样落盘，只要扩展名能被
+// 系统当程序执行，配合 /openfile 就是一个本机代码执行原语。而黑名单天然列不完
+// —— .pif / .msc / .inf / .settingcontent-ms / .search-ms / .diagcab… 以及将来
+// 新增的关联类型都在外面。反过来看，"本服务会产出哪些格式"是有限且已知的，
+// 所以列白名单更可靠：漏列的后果是"某个冷门格式下不了"，而不是"能落盘可执行文件"。
+//
+// 视频/音频部分与 container.go 的 containerRegistry 扩展名保持一致，否则修正确
+// 扩展名的正常流程会被自己拦下。
+var allowedDownloadExts = map[string]bool{
+	// 视频容器
+	".ts": true, ".m2ts": true, ".mts": true, ".mp4": true, ".m4v": true, ".m4s": true,
+	".mov": true, ".flv": true, ".mkv": true, ".webm": true, ".avi": true, ".wmv": true,
+	".mpg": true, ".mpeg": true, ".3gp": true,
+	// 音频
+	".m4a": true, ".aac": true, ".mp3": true, ".wav": true, ".flac": true, ".ogg": true,
+	".oga": true, ".opus": true,
+	// 字幕（同一次下载常见的伴生文件）
+	".vtt": true, ".srt": true, ".ass": true, ".ssa": true,
+}
+
+// isAllowedDownloadExt 报告扩展名是否在 /download 的落盘白名单内（大小写不敏感）。
+func isAllowedDownloadExt(ext string) bool {
+	return allowedDownloadExts[strings.ToLower(strings.TrimSpace(ext))]
 }
 
 // ============================================================

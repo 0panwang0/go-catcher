@@ -6,6 +6,8 @@
 package core
 
 import (
+	"crypto/rand"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -94,6 +96,125 @@ func TestGuardTokenFreePaths(t *testing.T) {
 	}
 }
 
+// TestGuardFrameDeniedPages 注入令牌的页面默认禁止被 iframe 嵌套（点击劫持）：
+// 它们免令牌且 HTML 里带着真令牌，任意网页透明 iframe 覆盖诱导点击，就能让
+// 页面自身去 POST /config 改代理（流量经中间人）或改端口。Host 校验拦不住 ——
+// iframe 发请求时 Host 就是本机地址。
+//
+// 例外分支必须一起验证：DENY 对"父文档是 opaque origin"的 GUI 外壳同样生效，
+// 一刀切会让客户端整个白屏。已发出去的版本只测了"该拒的都拒了"、漏测"该放的
+// 没放"，于是先后踩了两次——首次加载被拦（缺键）、点设置被拦（框架内跳转没键）。
+func TestGuardFrameDeniedPages(t *testing.T) {
+	setTestToken(t, "secret-token")
+	if testStd.embedKey == "" {
+		t.Fatal("embedKey 不应为空：空键会让外壳拿不到豁免，也说明 newRuntime 漏了初始化")
+	}
+
+	hdr := func(w *httptest.ResponseRecorder) (string, string) {
+		return w.Header().Get("X-Frame-Options"), w.Header().Get("Content-Security-Policy")
+	}
+	// 被拒 = 两个头都在；放行 = 两个头都不许出现（浏览器只看头，不看意图）
+	assertDenied := func(what string, w *httptest.ResponseRecorder) {
+		t.Helper()
+		if xfo, csp := hdr(w); xfo != "DENY" || !strings.Contains(csp, "frame-ancestors 'none'") {
+			t.Errorf("%s 应被拒嵌套，得到 XFO=%q CSP=%q", what, xfo, csp)
+		}
+	}
+	assertFramable := func(what string, w *httptest.ResponseRecorder) {
+		t.Helper()
+		if xfo, csp := hdr(w); xfo != "" || csp != "" {
+			t.Errorf("%s 应可被嵌套，却带上了 XFO=%q CSP=%q（客户端会白屏）", what, xfo, csp)
+		}
+	}
+
+	for _, p := range []string{"/", "/settings"} {
+		// 1) 任意网页的 iframe：无键、无同源信号 → 拒
+		assertDenied(p+"（普通 iframe）", guardedDo(t, "GET", p, "127.0.0.1:7891", nil))
+		// 2) 恶意页面能标出的只有 cross-site → 拒
+		assertDenied(p+"（cross-site）",
+			guardedDo(t, "GET", p, "127.0.0.1:7891", map[string]string{"Sec-Fetch-Site": "cross-site"}))
+		// 3) 猜错的键 / 空键：不能因为"带了参数"就放行
+		for _, bad := range []string{"", "deadbeef", testStd.embedKey + "0"} {
+			assertDenied(p+"（错键 "+bad+"）",
+				guardedDo(t, "GET", p+"?"+embedKeyParam+"="+bad, "127.0.0.1:7891", nil))
+		}
+		// 4) GUI 外壳首次加载 iframe：父文档是 opaque origin，只带得动这把钥匙 → 放行
+		assertFramable(p+"（正确内嵌键）",
+			guardedDo(t, "GET", p+"?"+embedKeyParam+"="+testStd.embedKey, "127.0.0.1:7891", nil))
+		// 5) 框架内自发跳转（监控页 ⚙ → /settings）：发起方就是本服务文档，
+		//    浏览器标 same-origin，这条没有任何钥匙可用 → 必须放行
+		assertFramable(p+"（same-origin 框架内跳转）",
+			guardedDo(t, "GET", p, "127.0.0.1:7891", map[string]string{"Sec-Fetch-Site": "same-origin"}))
+	}
+
+	// 非 frameGuard 的端点不受影响（不因豁免逻辑而误设头）
+	if xfo, _ := hdr(guardedDo(t, "GET", "/health", "127.0.0.1:7891", nil)); xfo != "" {
+		t.Errorf("/health 不该有 X-Frame-Options，得到 %q", xfo)
+	}
+
+	// 未知路径必须落到 catch-all "/" 上、继承防护，而不是"没登记就放行"：
+	// guard 曾经用的是一份独立的硬编码路径 map，与路由表各写一份，漏项即静默
+	// fail-open。现在改为 routeFor 解析实际命中的路由项，这条用例把它钉住。
+	// /settingsX 是前缀相近但不等的对照——不能因为像就误判成页面。
+	for _, p := range []string{"/nonexistent", "/settingsX", "/index.html"} {
+		assertDenied("未知路径 "+p, guardedDo(t, "GET", p, "127.0.0.1:7891", nil))
+		assertDenied("未知路径 "+p+"（cross-site）",
+			guardedDo(t, "GET", p, "127.0.0.1:7891", map[string]string{"Sec-Fetch-Site": "cross-site"}))
+	}
+	// 键是充分条件，与路径是否是页面无关——带对键时未知路径同样放行
+	assertFramable("未知路径 + 正确内嵌键",
+		guardedDo(t, "GET", "/nonexistent?"+embedKeyParam+"="+testStd.embedKey, "127.0.0.1:7891", nil))
+}
+
+// TestFrameGuardCoversTokenFreeHTMLPages 遍历路由表，断言「免令牌且返回 HTML 的
+// 端点必须声明 frameGuard」。这是防脱钩的守卫：防护集合一旦与路由表分离，新增
+// 页面漏登记就是**静默放行**（fail-open），而无论"被嵌套"还是"客户端白屏"都不会
+// 报错——只能靠用例兜。
+//
+// 反向也查：声明了 frameGuard 却不返回 HTML = 声明过期（路径或 handler 被改过），
+// 需人工复核，避免防护挂在一个已不再是页面的端点上。
+func TestFrameGuardCoversTokenFreeHTMLPages(t *testing.T) {
+	e := testEngine()
+	for _, rd := range routeDefs {
+		if rd.needToken {
+			// 需要令牌的端点拿不到页面内容（401），不是点击劫持目标；且调用它们的
+			// handler 可能有副作用（/pickdir 会弹窗、/download 会起任务），不在此验证。
+			if rd.frameGuard {
+				t.Errorf("%s 声明了 frameGuard 却要求令牌 —— 这类端点不该挂页面防护，请复核", rd.path)
+			}
+			continue
+		}
+		w := httptest.NewRecorder()
+		rd.new(e)(w, httptest.NewRequest(http.MethodGet, rd.path, nil))
+		ct := w.Header().Get("Content-Type")
+		isHTML := strings.HasPrefix(ct, "text/html")
+
+		if isHTML && !rd.frameGuard {
+			t.Errorf("%s 免令牌且返回 HTML（Content-Type=%q）却没声明 frameGuard —— 可被任意网页 iframe 嵌套",
+				rd.path, ct)
+		}
+		if rd.frameGuard && !isHTML {
+			t.Errorf("%s 声明了 frameGuard 但 Content-Type=%q 不是 HTML —— 声明已过期，请复核",
+				rd.path, ct)
+		}
+	}
+}
+
+// TestEmbedKeyPerRuntime 内嵌豁免键必须每次新建 Runtime 都重新随机：
+// 固定键（如写死常量）等于把钥匙公开，点击劫持防护直接失效。
+func TestEmbedKeyPerRuntime(t *testing.T) {
+	a, b := newRuntime(), newRuntime()
+	if a.embedKey == "" || b.embedKey == "" {
+		t.Fatal("embedKey 不应为空")
+	}
+	if len(a.embedKey) != 32 {
+		t.Errorf("embedKey 应为 32 位十六进制，得到 %d 位: %q", len(a.embedKey), a.embedKey)
+	}
+	if a.embedKey == b.embedKey {
+		t.Errorf("两个 Runtime 的 embedKey 相同（%q），说明没随机生成", a.embedKey)
+	}
+}
+
 // TestGuardRejectsForeignHost DNS rebinding 防护：Host 不是本机地址一律 403，
 // 即使令牌正确——这条挡的是"攻击者域名解析到 127.0.0.1 后与页面同源"。
 func TestGuardRejectsForeignHost(t *testing.T) {
@@ -112,16 +233,50 @@ func TestGuardRejectsForeignHost(t *testing.T) {
 
 // TestGuardCORSOnlyWithToken 未通过令牌校验的响应绝不能带 CORS 头，
 // 否则网页能读到响应体，令牌形同虚设。
+//
+// 必须枚举全部路径，不能只挑一个代表：这条不变量第一次被漏掉，正是因为
+// 只采样了 /status——一个"恰好行为正确"的路径，而真正出事的是 /svc/info
+// 这类免令牌端点，它们的响应体里就有令牌。
 func TestGuardCORSOnlyWithToken(t *testing.T) {
 	setTestToken(t, "secret-token")
+	evil := map[string]string{"Origin": "https://evil.example"}
 
-	w := guardedDo(t, "GET", "/status", "127.0.0.1:7891", map[string]string{"Origin": "https://evil.example"})
-	if got := w.Header().Get("Access-Control-Allow-Origin"); got != "" {
-		t.Fatalf("未授权响应不应带 CORS 头，得到 %q", got)
+	// 需要令牌的路径：401，且不带 CORS 头
+	for _, p := range []string{"/status", "/config", "/log", "/download", "/probe", "/svc/stop"} {
+		w := guardedDo(t, "GET", p, "127.0.0.1:7891", evil)
+		if w.Code != http.StatusUnauthorized {
+			t.Errorf("%s 无令牌应 401，得到 %d", p, w.Code)
+		}
+		if got := w.Header().Get("Access-Control-Allow-Origin"); got != "" {
+			t.Errorf("%s（未授权）不应带 CORS 头，得到 %q", p, got)
+		}
 	}
-	w = guardedDo(t, "GET", "/status?t=secret-token", "127.0.0.1:7891", map[string]string{"Origin": "https://page.example"})
+
+	// 免令牌路径：放行，但绝不能带 CORS 头——它们是"不含秘密"才被豁免的，
+	// 而 /svc/info 的响应体里就有令牌、/ 与 /settings 的 HTML 里注入了令牌。
+	for _, p := range []string{"/health", "/svc/info", "/", "/settings"} {
+		if !tokenFreePath(p) {
+			t.Fatalf("%s 不在免令牌清单里，本用例已失效", p)
+		}
+		w := guardedDo(t, "GET", p, "127.0.0.1:7891", evil)
+		if w.Code != http.StatusOK {
+			t.Errorf("%s 应免令牌放行，得到 %d", p, w.Code)
+		}
+		if got := w.Header().Get("Access-Control-Allow-Origin"); got != "" {
+			t.Errorf("%s（免令牌）绝不能带 CORS 头，否则响应体里的令牌会被任意网页读走；得到 %q", p, got)
+		}
+	}
+
+	// 带对令牌：必须带 CORS 头，否则扩展的 content script 读不到响应体
+	w := guardedDo(t, "GET", "/status?t=secret-token", "127.0.0.1:7891", map[string]string{"Origin": "https://page.example"})
 	if got := w.Header().Get("Access-Control-Allow-Origin"); got != "*" {
 		t.Fatalf("授权响应应带 CORS 头，得到 %q", got)
+	}
+	// 免令牌路径带上正确令牌时同样可以拿到 CORS 头（扩展靠 /svc/info?t= 兜底重握手），
+	// 这不再是泄露——令牌本身就是通行证。
+	w = guardedDo(t, "GET", "/svc/info?t=secret-token", "127.0.0.1:7891", evil)
+	if got := w.Header().Get("Access-Control-Allow-Origin"); got != "*" {
+		t.Fatalf("带令牌的 /svc/info 应带 CORS 头，得到 %q", got)
 	}
 }
 
@@ -322,5 +477,87 @@ func TestMuxEndToEnd(t *testing.T) {
 	// 6) /probe 不能当 SSRF 跳板
 	if w := do("/probe?t=e2e-token&url=http%3A%2F%2F169.254.169.254%2Flatest%2Fmeta-data%2F", nil); w.Code != http.StatusBadRequest {
 		t.Errorf("云元数据地址应 400，得到 %d", w.Code)
+	}
+}
+
+// errReader 恒返回错误的 reader，用来模拟熵源不可用（crypto/rand 故障）。
+type errReader struct{}
+
+func (errReader) Read([]byte) (int, error) { return 0, errors.New("熵源不可用") }
+
+// TestNewAPITokenFailsWithoutEntropy 熵源失败必须报错并返回空串，
+// **绝不退化**成可预测的值。
+//
+// 回归的缺陷形态：旧实现在这里退化成纳秒时间戳（16 位十六进制），
+// 于是"随机数拿不到"变成"有一枚弱令牌"——看着能用，实际上攻击者可以猜。
+// 扰动点：把 newAPIToken 的时间戳退化写回去，本条会红。
+func TestNewAPITokenFailsWithoutEntropy(t *testing.T) {
+	tok, err := newAPIToken(errReader{})
+	if err == nil {
+		t.Fatalf("熵源失败必须报错，得到 token=%q", tok)
+	}
+	if tok != "" {
+		t.Fatalf("失败时不得产出任何 token，得到 %q", tok)
+	}
+
+	key, err := newEmbedKey(errReader{})
+	if err == nil || key != "" {
+		t.Fatalf("内嵌豁免键同样不得退化：key=%q err=%v", key, err)
+	}
+
+	// 正常熵源照旧产出 32 位十六进制
+	good, err := newAPIToken(rand.Reader)
+	if err != nil || len(good) != 2*tokenBytes {
+		t.Fatalf("正常熵源应产出 %d 位十六进制：%q err=%v", 2*tokenBytes, good, err)
+	}
+}
+
+// TestEngineStartRefusesWithoutEntropy 熵源不可用时引擎必须拒绝启动，
+// 而不是带着空/可预测的令牌把服务跑起来。
+// 扰动点：删掉 Engine.Start 里的 entropyFailure 检查，本条会红。
+func TestEngineStartRefusesWithoutEntropy(t *testing.T) {
+	rt := newRuntimeWithEntropy(errReader{})
+	if rt.entropyFailure() == nil {
+		t.Fatal("构造时就该记下熵源故障（内嵌豁免键拿不到）")
+	}
+	if rt.embedKey != "" {
+		t.Fatalf("熵源故障时内嵌键必须留空，得到 %q", rt.embedKey)
+	}
+
+	eng := &Engine{rt: rt}
+	if err := eng.Start(); err == nil {
+		eng.Stop()
+		t.Fatal("熵源不可用时 Start 必须返回错误（不得先监听再报错）")
+	}
+	if eng.running {
+		t.Fatal("拒绝启动后不得处于运行态")
+	}
+}
+
+// TestEnsureAPITokenRecordsEntropyFailure 令牌生成路径同样不退化：
+// 熵源故障时留空并记因，空令牌下 tokenAccepted 一律拒绝（fail-closed）。
+func TestEnsureAPITokenRecordsEntropyFailure(t *testing.T) {
+	rt := newRuntimeWithEntropy(errReader{})
+	// 令牌首次生成会落盘：先把它指到临时目录，别写到测试二进制旁边
+	rt.configPath = filepath.Join(t.TempDir(), "config.json")
+	// 用一定能成功的内存熵源替换构造期标记，单独验 ensureAPIToken 这条路径
+	rt.cfgMu.Lock()
+	rt.entropyErr = nil
+	rt.cfg.APIToken = ""
+	rt.cfgMu.Unlock()
+
+	// 正常环境下 ensureAPIToken 会拿到真随机 token（生产路径），
+	// 这里只断言它不再可能产出时间戳形态的弱值。
+	tok := rt.ensureAPIToken()
+	if rt.entropyFailure() != nil {
+		t.Fatalf("真实熵源可用时不应报故障: %v", rt.entropyFailure())
+	}
+	if len(tok) != 2*tokenBytes {
+		t.Fatalf("token 应为 %d 位十六进制，得到 %q", 2*tokenBytes, tok)
+	}
+	// 空令牌必须被守卫拒绝（这是拒绝启动之外的第二道）
+	setTestToken(t, "")
+	if w := guardedDo(t, "GET", "/status", "127.0.0.1:7891", nil); w.Code != http.StatusUnauthorized {
+		t.Fatalf("空令牌下任何请求都应 401（fail-closed），得到 %d", w.Code)
 	}
 }

@@ -7,6 +7,9 @@
 // 扩展设置（downloader.html 设置卡片里可改，存 chrome.storage.local）：
 //   exePath —— go-catcher.exe 本机路径，兜底"复制命令到终端"用；默认裸文件名（要求在 PATH）
 //   port    —— 本地服务端口，与 GoCatcher 客户端「设置」里的端口保持一致
+import { requestWake } from "./native-host.js";
+import { segmentReferers } from "./referer-capture.js";
+
 // 缓存 + onChanged 失效：service worker 随时可能被回收，重启后首次读取重建缓存
 let settingsCache = null;
 
@@ -82,6 +85,30 @@ export async function pingServer(timeoutMs = 2000) {
   }
 }
 
+// ensureServerRunning 确保本地服务可用：已经在跑就直接用，没在跑就通过原生消息宿主
+// 把客户端唤起来，再确认一次。
+//
+// 为什么值得这么做：HTTP 客户端没法启动服务端，"服务没开"是用户最常见的卡点；
+// 宿主通道让"先打开客户端"这一步不再需要用户手动完成。
+export async function ensureServerRunning() {
+  if (await pingServer()) return true;
+  const resp = await requestWake();
+  if (resp && resp.ok) return true;
+  // 宿主回话但报未就绪时（例如客户端已在运行、服务却被手动停掉了），它已经把
+  // 客户端拉到前台过一次；这里再等一小段，覆盖"服务刚起、健康检查还没生效"的窄窗口。
+  return waitForServer(2000);
+}
+
+// waitForServer 在给定时间内轮询，直到服务可用。
+async function waitForServer(totalMs) {
+  const deadline = Date.now() + totalMs;
+  for (;;) {
+    if (await pingServer(1000)) return true;
+    if (Date.now() >= deadline) return false;
+    await new Promise((r) => setTimeout(r, 300));
+  }
+}
+
 // 从 /svc/info 记录服务自报的 exe 绝对路径与访问令牌（同一个握手响应）。
 // 兜底"复制命令到终端"需要完整路径，但每台机器路径不同不能写死；
 // 服务跑过一次这里就缓存下来，content.js 生成兜底命令时直接用（用户零配置）。
@@ -92,11 +119,11 @@ export async function detectExePath() {
 export async function downloadViaServer({ m3u8Url, referer, title, filename } = {}) {
   if (!m3u8Url) return { ok: false, error: "缺少 m3u8Url" };
 
-  const healthy = await pingServer();
+  const healthy = await ensureServerRunning();
   if (!healthy) {
     return {
       ok: false,
-      error: "本地下载服务未启动。请打开 go-catcher.exe（GoCatcher 客户端，打开即自动启动下载服务），然后重试。",
+      error: "本地下载服务未启动，自动唤起也没成功。请手动打开 go-catcher.exe（GoCatcher 客户端，打开即自动启动下载服务），然后重试。",
       code: "SERVER_DOWN",
     };
   }
@@ -122,6 +149,12 @@ export async function downloadViaServer({ m3u8Url, referer, title, filename } = 
     // 2) 请求 Go 直接落盘到所选目录（异步：立即返回，扩展轮询 /status）
     const params = new URLSearchParams({ m3u8: m3u8Url, mode: "disk", dir });
     if (referer) params.set("referer", referer);
+    // 分片 Referer：分片 CDN 防盗链可能只认解析站域名（不是页面域名），把它按
+    // host 捕获下来传给 Go，由 Go 抓分片时按域名选用（详见 referer-capture.js）。
+    const segRefs = await segmentReferers();
+    if (segRefs && Object.keys(segRefs).length) {
+      params.set("segrefs", JSON.stringify(segRefs));
+    }
     const safeFn = filename || `${title || "video"}.ts`;
     params.set("filename", safeFn);
 
@@ -199,7 +232,15 @@ export async function queryDownload(msg) {
       exists: true,
       id: t.id,
       state: t.paused ? "paused" : "inProgress",
-      stage: t.queued ? "排队中" : (t.paused ? "已暂停" : (t.stage || "下载中")),
+      // 直播任务没有"暂停"语义：它的 paused 只可能来自"程序退出时还没录完"，
+      // 那是"中断待处理"而不是"可继续的暂停"。直说后端的 stage，别覆盖成
+      // "已暂停"——面板据此显示「停止」，用户才不会去找不存在的「继续」。
+      stage: t.queued
+        ? "排队中"
+        : (t.live ? (t.stage || "录制中") : (t.paused ? "已暂停" : (t.stage || "下载中"))),
+      // live 是控制按钮分流的判据（content.js 的 activeLive）：服务端说了算，
+      // 嗅探侧的 live 只是启发式。
+      live: !!t.live,
       pct: t.pct || 0,
       segDone: t.segDone || 0,
       segTot: t.segTot || 0,
@@ -213,13 +254,26 @@ export async function queryDownload(msg) {
   }
 }
 
-// 对 Go server 上某任务执行控制动作：pause / resume / cancel
-// action 直接作为 URL 路径段，id 作为查询参数（与 server 路由一致）
+// 对 Go server 上某任务执行控制动作：pause / resume / stop / cancel
+// id 作为查询参数（与 server 路由一致）；方法按动作分：/stop · /resume 有副作用，
+// 服务端按"新端点勿模仿"口径只收 POST；/pause · /cancel 是与 /download 同批的
+// 历史 GET 契约，维持不动（见 server.go 路由表注释）。
+//
+// stop 与 pause 的分工由服务端把关（它才是唯一权威）：
+//   - /stop  只对直播有效（结束录制并把已录部分收尾成正式文件）
+//   - /pause 对直播返回 400，/resume 同理 —— 直播没有断点可续
+// 所以扩展侧不能凭"界面看起来该给暂停"就发 pause，得先看 taskState.live。
+const actionMap = {
+  pause: { path: "pause", method: "GET" },
+  resume: { path: "resume", method: "POST" },
+  stop: { path: "stop", method: "POST" },
+  cancel: { path: "cancel", method: "GET" },
+};
+
 export async function controlTask({ taskId, action } = {}) {
   if (!taskId) return { ok: false, error: "缺少 taskId" };
-  const actionMap = { pause: "pause", resume: "resume", cancel: "cancel" };
-  const path = actionMap[action];
-  if (!path) return { ok: false, error: `未知动作: ${action}` };
+  const act = actionMap[action];
+  if (!act) return { ok: false, error: `未知动作: ${action}` };
 
   const healthy = await pingServer();
   if (!healthy) {
@@ -227,8 +281,8 @@ export async function controlTask({ taskId, action } = {}) {
   }
   try {
     const resp = await apiFetch(
-      `/${path}?id=${encodeURIComponent(taskId)}`,
-      { cache: "no-store" }
+      `/${act.path}?id=${encodeURIComponent(taskId)}`,
+      { method: act.method, cache: "no-store" }
     );
     const body = await resp.json().catch(() => ({}));
     if (!resp.ok) {

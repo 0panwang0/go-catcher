@@ -8,6 +8,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	"github.com/0panwang0/go-catcher/internal/platform"
 )
 
 // ============================================================
@@ -55,7 +57,8 @@ func (r *Runtime) findTask(id string) *taskEntry {
 	return r.tasks[id]
 }
 
-// handlePause 暂停任务：cancel 掉下载 ctx，pipeline 会把断点存下来
+// handlePause 暂停任务：cancel 掉下载 ctx，pipeline 会把断点存下来。
+// 直播任务不走这条路——暂停期间的流已从列表滚走，续录只会在产物里留空洞。
 
 func (e *Engine) handlePause(w http.ResponseWriter, r *http.Request) {
 	id := strings.TrimSpace(r.URL.Query().Get("id"))
@@ -68,6 +71,11 @@ func (e *Engine) handlePause(w http.ResponseWriter, r *http.Request) {
 	if te.st.done {
 		te.mu.Unlock()
 		jsonError(w, http.StatusBadRequest, "task already finished")
+		return
+	}
+	if te.st.live {
+		te.mu.Unlock()
+		jsonError(w, http.StatusBadRequest, "直播录制请使用停止：直播流不支持暂停后续录（暂停期间的分片已从列表滚走）")
 		return
 	}
 	if te.st.paused {
@@ -84,6 +92,53 @@ func (e *Engine) handlePause(w http.ResponseWriter, r *http.Request) {
 		cancel()
 	}
 	writeJSON(w, http.StatusOK, actionResp{OK: true, ID: id, Paused: true})
+}
+
+// handleStop 停止直播录制：中断跟随，并把已录部分收尾成正式文件。
+//
+// 为什么直播只有这一条路：直播流是滑动的，暂停/停止期间的分片会从列表里
+// 滚走且不可补回。与其产出一个"看起来连续、其实中间缺一段"的文件，不如
+// 明确结束录制、保存已录内容，让用户回直播页重新开始。
+// 点播任务不走这里——它的「停」语义是可续的暂停，走 /pause。
+func (e *Engine) handleStop(w http.ResponseWriter, r *http.Request) {
+	id := strings.TrimSpace(r.URL.Query().Get("id"))
+	te := e.rt.findTask(id)
+	if te == nil {
+		jsonError(w, http.StatusNotFound, "task not found")
+		return
+	}
+	te.mu.Lock()
+	if !te.st.live {
+		te.mu.Unlock()
+		jsonError(w, http.StatusBadRequest, "非直播任务请使用暂停")
+		return
+	}
+	if te.st.done {
+		// 幂等：已结束的直播任务（含已收尾的中断态）重复点停止不算错
+		te.mu.Unlock()
+		writeJSON(w, http.StatusOK, actionResp{OK: true, ID: id})
+		return
+	}
+	if !te.st.running && !te.st.queued {
+		// pipeline 已经退出（失败/中断后的静止态）：没有下载可中断，直接按
+		// 现有 .part 收尾。抽到 goroutine 里做——校验与改名是磁盘 IO，
+		// 不该卡住 HTTP 响应。
+		te.intent = intentStop
+		te.st.stage = "停止中"
+		te.mu.Unlock()
+		go finishStoppedTask(te)
+		writeJSON(w, http.StatusOK, actionResp{OK: true, ID: id})
+		return
+	}
+	te.intent = intentStop
+	te.st.stage = "停止中"
+	cancel := te.cancel
+	te.mu.Unlock()
+
+	if cancel != nil {
+		cancel()
+	}
+	writeJSON(w, http.StatusOK, actionResp{OK: true, ID: id})
 }
 
 // handleResume 恢复任务：从上次断点继续下载（重新走一遍 pipeline，会重新排队）
@@ -104,6 +159,14 @@ func (e *Engine) handleResume(w http.ResponseWriter, r *http.Request) {
 		jsonError(w, http.StatusBadRequest, "task already finished")
 		return
 	}
+	// 直播任务一律不给恢复入口（含"录制中断"的终态与旧状态文件遗留的断点任务）。
+	// 这是产品语义，不是能力缺失：中间的内容已经从滑动窗口滚走，接着录只能
+	// 产出一个时间轴带空洞的文件。要接着录就回直播页重新开始。
+	if te.st.live {
+		te.mu.Unlock()
+		jsonError(w, http.StatusBadRequest, "直播流不支持恢复：暂停期间的内容已从列表滚走，请重新开始录制")
+		return
+	}
 	if te.st.running && !te.st.paused {
 		te.mu.Unlock()
 		writeJSON(w, http.StatusOK, actionResp{OK: true, ID: id, Running: true})
@@ -119,7 +182,9 @@ func (e *Engine) handleResume(w http.ResponseWriter, r *http.Request) {
 	te.st.queued = true
 	te.mu.Unlock()
 
-	go runDiskPipeline(te)
+	// 清掉旧意图，重新起一个 goroutine（会重新拿并发槽并接着断点下）。
+	// 与新建任务同一入口，也必须走 runGuarded：续传会重新跑一遍 init 段处理。
+	go runGuarded(te, func() { runDiskPipeline(te) })
 	writeJSON(w, http.StatusOK, actionResp{OK: true, ID: id, Resumed: true})
 }
 
@@ -145,6 +210,10 @@ func (e *Engine) handleCancel(w http.ResponseWriter, r *http.Request) {
 			te.st.stage = "已取消"
 			te.st.errorMsg = ""
 			te.st.finalPath = ""
+			// 取消 = 这个文件不要了：中断收尾的标记与缺口提示一并清掉，
+			// 否则列表里会留一条"已取消"却写着"缺失 N 秒"的记录。
+			te.st.interrupted = false
+			te.st.gapSeconds = 0
 		}
 		te.mu.Unlock()
 		if part != "" {
@@ -228,10 +297,6 @@ func (e *Engine) handleRemove(w http.ResponseWriter, r *http.Request) {
 // handleOpenFile 用系统关联程序直接打开文件（区别于 /openfolder 只选中）
 
 func (e *Engine) handleOpenFile(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
 	target, status, msg := e.taskOpenPath(r.URL.Query().Get("id"))
 	if status != 0 {
 		http.Error(w, msg, status)
@@ -239,7 +304,7 @@ func (e *Engine) handleOpenFile(w http.ResponseWriter, r *http.Request) {
 	}
 	// 直接 ShellExecute（x/sys/windows），不经过 cmd/powershell/explorer 子进程。
 	// 避免 detached 服务进程 fork 外部 shell 后 GUI 无法送上交互桌面的问题。
-	if err := shellOpen(target); err != nil {
+	if err := platform.ShellOpen(target); err != nil {
 		jsonError(w, http.StatusInternalServerError, "open file: "+err.Error())
 		return
 	}
@@ -304,7 +369,7 @@ type pickDirResp struct {
 }
 
 func (e *Engine) handlePickDir(w http.ResponseWriter, r *http.Request) {
-	dir, err := pickFolder(0, "选择视频保存文件夹")
+	dir, err := platform.PickFolder(0, "选择视频保存文件夹")
 	if err != nil {
 		// 用户取消，err 带 cancelled 标记
 		writeJSON(w, http.StatusOK, pickDirResp{Cancelled: true, Error: err.Error()})
@@ -351,12 +416,10 @@ func (e *Engine) handleStatus(w http.ResponseWriter, r *http.Request) {
 }
 
 func (e *Engine) handleHomePage(w http.ResponseWriter, r *http.Request) {
+	// "/" 在 ServeMux 里是 catch-all：所有未命中更具体模式的路径都会进来，
+	// 必须精确匹配 "/" 才渲染首页（方法已由路由表的 methodGuard 限定 GET）。
 	if r.URL.Path != "/" {
 		http.NotFound(w, r)
-		return
-	}
-	if r.Method != http.MethodGet {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
@@ -371,10 +434,6 @@ func (e *Engine) handleSettingsPage(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	if r.Method != http.MethodGet {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-store")
 	fmt.Fprint(w, e.rt.injectToken(settingsPageHTML))
@@ -383,17 +442,13 @@ func (e *Engine) handleSettingsPage(w http.ResponseWriter, r *http.Request) {
 // handleOpenFolder 打开任务产物所在文件夹并选中该文件。只接受任务 id，
 // 路径从任务记录推导（同 /openfile，砍掉"任意路径"的参数面）。
 func (e *Engine) handleOpenFolder(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
 	target, status, msg := e.taskOpenDir(r.URL.Query().Get("id"))
 	if status != 0 {
 		http.Error(w, msg, status)
 		return
 	}
 	// shellReveal：文件→explorer /select 打开父目录并选中；目录→直接打开。
-	if err := shellReveal(target); err != nil {
+	if err := platform.ShellReveal(target); err != nil {
 		jsonError(w, http.StatusInternalServerError, "reveal in explorer: "+err.Error())
 		return
 	}
@@ -437,7 +492,7 @@ func (e *Engine) handleConfig(w http.ResponseWriter, r *http.Request) {
 			UIView:             cur.UIView,
 			Proxy:              cur.Proxy,
 			SystemProxy:        e.rt.systemProxyAddr(),
-			SystemProxyWarning: e.rt.systemProxyWarning(),
+			SystemProxyWarning: platform.SystemProxyWarning(e.rt.getProxyAddr()),
 			RestartRequired:    restartRequired,
 			Clamped:            clamped,
 		}
@@ -450,10 +505,7 @@ func (e *Engine) handleConfig(w http.ResponseWriter, r *http.Request) {
 		writeCfg(false, false, nil)
 		return
 	}
-	if r.Method != http.MethodPost {
-		jsonError(w, http.StatusMethodNotAllowed, "method not allowed")
-		return
-	}
+	// 到这里只有 POST：方法约束由路由表的 methodGuard 统一拦截（GET/POST 之外一律 405）。
 	// 指针字段区分「未提供」与「显式为零」（如 maxRetries:0 是合法值）
 	var in struct {
 		MaxConcurrent  *int    `json:"maxConcurrent"`
@@ -475,7 +527,7 @@ func (e *Engine) handleConfig(w http.ResponseWriter, r *http.Request) {
 			p = "direct" // 空输入语义 = 直连；落盘为显式 direct，重载时不被当旧配置回退默认
 		case strings.EqualFold(p, "system"):
 			p = "system"
-		case isDirectStr(p), validProxyAddr(p):
+		case isDirectStr(p), platform.ValidProxyAddr(p):
 		default:
 			jsonError(w, http.StatusBadRequest, "代理地址无效：应为 http://host:port、system 跟随系统或 direct 直连")
 			return

@@ -8,6 +8,7 @@
 //   m3u8-parse    m3u8/画质解析
 //   video-source  「这个视频」的候选与选项
 //   server-api    本地 Go 服务访问（令牌握手 / 下载 / 轮询 / 控制）
+//   native-host   原生消息唤起（服务没跑时把客户端拉起来）
 //   referer-rules DNR Referer 注入
 import {
   recordMedia,
@@ -15,10 +16,14 @@ import {
   pickEvictionIndex,
   pruneExpired,
   clearLists,
+  readLists,
+  resetListCache,
 } from "./list-store.js";
 import { installSniffProbes, contentTypeMediaType, isLikelyFullFile } from "./sniff-probes.js";
-import { sameSite, isCandidateURL, findSniffedByURL } from "./page-match.js";
-import { getVideoOptions, getVideoSources, getVideoSource, openDownloader } from "./video-source.js";
+import { sameSite, findSniffedByURL } from "./page-match.js";
+// isCandidateURL 的唯一实现在 media-url.js（下载器页面共用同一份，评审 P3-6）
+import { isCandidateURL } from "./media-url.js";
+import { getVideoSources, getVideoSource, openDownloader } from "./video-source.js";
 import {
   getSettings,
   getApiToken,
@@ -28,7 +33,14 @@ import {
   queryDownload,
   controlTask,
 } from "./server-api.js";
-import { setRefererRules } from "./referer-rules.js";
+import { setRefererRules, clearRefererRules, sweepStaleRules, allocRuleIds } from "./referer-rules.js";
+import {
+  installRefererCapture,
+  refererFromDetails,
+  captureSegmentReferer,
+  segmentReferers,
+} from "./referer-capture.js";
+import { requestWake, NATIVE_HOST_NAME } from "./native-host.js";
 
 // 点击工具栏图标：打开下载器页面
 chrome.action.onClicked.addListener(() => {
@@ -45,20 +57,14 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       .catch((e) => sendResponse({ ok: false, error: String(e) }));
     return true;
   }
-  if (msg.type === "getVideoOptions") {
-    getVideoOptions(sender.tab)
-      .then((res) => sendResponse({ ok: true, options: res }))
-      .catch((e) => sendResponse({ ok: false, error: String(e) }));
-    return true;
-  }
   if (msg.type === "getVideoSource") {
-    getVideoSource(msg)
+    getVideoSource(msg, sender)
       .then((res) => sendResponse({ ok: true, source: res }))
       .catch((e) => sendResponse({ ok: false, error: String(e && e.message ? e.message : e) }));
     return true;
   }
   if (msg.type === "getVideoSources") {
-    getVideoSources(msg)
+    getVideoSources(msg, sender)
       .then((res) => sendResponse({ ok: true, sources: res }))
       .catch((e) => sendResponse({ ok: false, error: String(e && e.message ? e.message : e) }));
     return true;
@@ -68,12 +74,18 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     sendResponse({ ok: true });
     return true;
   }
+  if (msg.type === "getList") {
+    // 下载器页面读嗅探列表。必须走这里而不是让页面直读 storage：list-store
+    // 持内存权威副本，合并落盘窗口内 storage 里可能还是旧值（评审 P2-6 / F10）。
+    readLists()
+      .then((all) => sendResponse({ ok: true, list: all[msg.key] || [] }))
+      .catch((e) => sendResponse({ ok: false, error: String(e) }));
+    return true;
+  }
   if (msg.type === "clearList") {
+    // 徽标归零由 list-store 落盘后统一处理（updateBadge），这里不再手设
     clearLists()
-      .then(() => {
-        chrome.action.setBadgeText({ text: "" });
-        sendResponse({ ok: true });
-      })
+      .then(() => sendResponse({ ok: true }))
       .catch((e) => sendResponse({ ok: false, error: String(e) }));
     return true;
   }
@@ -97,7 +109,8 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     return true;
   }
   if (msg.type === "controlTask") {
-    // 暂停 / 恢复 / 取消 Go server 上某个任务（disk 落盘模式）
+    // 暂停 / 恢复 / 停止 / 取消 Go server 上某个任务（disk 落盘模式）。
+    // 直播的"停"走 stop（结束录制并保存已录部分），点播才是 pause/resume。
     controlTask(msg)
       .then((res) => sendResponse(res))
       .catch((e) => sendResponse({ ok: false, error: String(e) }));
@@ -122,11 +135,22 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 });
 
 installSniffProbes();
+installRefererCapture();
+
+// 下载器页签关闭时清掉它的 Referer 规则：规则按 tabId 生效，tab 没了规则
+// 就永远匹配不到请求，只会占用动态规则配额（浏览器动态规则上限 5000 条）。
+// 监听器必须在顶层同步注册（MV3 事件唤醒机制的要求）。
+chrome.tabs.onRemoved.addListener((tabId) => {
+  clearRefererRules(tabId).catch(() => {});
+});
 
 // SW 每次唤醒（页面导航/webRequest/消息都会唤醒）都探测一次 exe 路径。
 // 兜底命令可能在从未发起过下载时出现（如"视频未嗅探到"错误面板），
 // 不能只依赖下载流程里 pingServer 的顺带探测。
 detectExePath();
+
+// SW 休眠期间错过的 tabs.onRemoved 无法追补，每次唤醒扫一遍死 tab 的规则。
+sweepStaleRules().catch(() => {});
 
 // ============================================================
 // 测试导出面（node tests 通过 new Function + chrome 桩加载本 bundle 后取用）
@@ -135,6 +159,9 @@ detectExePath();
 export const __test__ = {
   recordMedia,
   updateMediaItem,
+  readLists,
+  // 测试专用：丢弃内存权威副本（用例直接重置 storage 桩造场景时必须先调它）
+  resetListCache,
   pickEvictionIndex,
   pruneExpired,
   clearLists,
@@ -146,4 +173,17 @@ export const __test__ = {
   // 探测器判据（纯函数，供 tests/probes.test.js 直接断言）
   contentTypeMediaType,
   isLikelyFullFile,
+  // DNR Referer 规则管理（tests/refererrules.test.js）
+  setRefererRules,
+  clearRefererRules,
+  sweepStaleRules,
+  allocRuleIds,
+  // 原生消息唤起（tests/nativehost.test.js）
+  requestWake,
+  NATIVE_HOST_NAME,
+  // 分片 Referer 捕获（tests/referercapture.test.js）
+  refererFromDetails,
+  captureSegmentReferer,
+  segmentReferers,
+  downloadViaServer,
 };

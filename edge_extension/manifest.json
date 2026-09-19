@@ -1,37 +1,46 @@
 {
   "manifest_version": 3,
   "name": "M3U8 Video Catcher",
-  "version": "1.0.0",
-  "description": "嗅探网页中的 m3u8 视频并一键下载（自动注入 Referer，走浏览器系统代理/Clash）",
+  "version": "0.5.0",
+  "description": "嗅探网页中的 m3u8 视频并一键下载（自动注入 Referer，走浏览器系统代理）",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAxx1GS7+8CnsNY5aYsAA8Dj1txoWBGE7c2ctiercKO8SeNfJ6FGIvqfyAkEX99ru4UPv6NANcD2d+9dqOCatXePhM+D+R9UVrlvjCdRnp6pLPJfd3mYRMwA9GLoP3jAvX3vL68NXXJ9/LPzp/0P21cis4sS8sBVIg3cd/VUGHXmtfuUxypchwadzNyUyFQGJAXeIquPrRJluUPwhp5c6wiC7Jzs0DG6F+V5BgFi7tgpUb6I0SENjJHiDKEPjpoiqB2mOQnERiA20o4vkpvqLto9R01ZV1Uui2Z78b3lc/QfUqObwn1MLwg01MqhsSb4UY/ZXK44WWaWxcHF2nNT/sKQIDAQAB",
   "permissions": [
     "storage",
     "webRequest",
-    "declarativeNetRequest"
+    "declarativeNetRequest",
+    "nativeMessaging"
   ],
   "host_permissions": [
     "http://*/*",
-    "https://*/*",
-    "http://127.0.0.1/*",
-    "http://localhost/*"
+    "https://*/*"
   ],
   "background": {
     "service_worker": "background.js"
   },
   "content_scripts": [
     {
-      "matches": ["<all_urls>"],
+      "matches": [
+        "<all_urls>"
+      ],
       "all_frames": true,
       "match_about_blank": true,
       "run_at": "document_idle",
-      "js": ["content.js"]
+      "js": [
+        "content-shared.js",
+        "content.js"
+      ]
     },
     {
-      "matches": ["<all_urls>"],
+      "matches": [
+        "<all_urls>"
+      ],
       "all_frames": true,
       "match_about_blank": true,
       "run_at": "document_idle",
       "world": "MAIN",
-      "js": ["content-main.js"]
+      "js": [
+        "content-main.js"
+      ]
     }
   ],
   "action": {

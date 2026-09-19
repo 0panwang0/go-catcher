@@ -11,7 +11,7 @@
 - **HLS AES-128 解密**：自动识别 `#EXT-X-KEY` 加密流，拉取密钥并逐分片解密（显式 IV / 按分片序号派生 IV），落盘即明文可播
 - **断点续传**：任务状态持久化到本地，服务重启后自动恢复未完成任务
 - **并发与重试**：分片并发下载、失败自动重试、`--limit` 试片模式
-- **代理支持**：默认跟随 Windows 系统代理（Clash 等工具开「系统代理」即自动生效），设置页可切换手动指定 / 直连，保存即生效；CLI 模式用 `--proxy` 指定
+- **代理支持**：默认跟随 Windows 系统代理（在系统设置里开启「代理」即自动生效），设置页可切换手动指定 / 直连，保存即生效；CLI 模式用 `--proxy` 指定
 - **端口可配置**：监控页设置里可改服务端口（解决端口冲突），重启服务生效
 - **Edge 浏览器扩展**：网页内一键发起下载，自动回填页面 URL 作为 Referer
 - **本地优先**：服务只监听 `127.0.0.1`，监控页与 API 不对外暴露
@@ -22,11 +22,46 @@
 2. 双击运行 —— 打开即自动启动下载服务，窗口常驻系统托盘
 3. 在浏览器（配合 Edge 扩展）或监控页 `http://127.0.0.1:7891/` 添加下载任务
 
+## 在新机器上部署
+
+换一台机器只要两样东西：`go-catcher.exe` 和 `edge_extension` 目录。两者之间走本机回环
+与原生消息通道，不需要账号、不需要额外配置。前置条件：Windows 10/11（图形界面依赖
+WebView2 运行时，Win11 与较新的 Win10 已自带）。
+
+1. **放好 exe**：从 [Releases](https://github.com/0panwang0/go-catcher/releases) 下载
+   `go-catcher.exe`，放进一个**固定目录**（例如 `D:\Tools\GoCatcher\`）。宿主清单里记录的是
+   exe 的绝对路径，所以别放在「下载」「临时」这类会被清理或搬动的目录。
+2. **先启动一次**：双击 `go-catcher.exe`。它会在 exe 旁生成 `native-host\` 清单，并在
+   **当前用户**的注册表里登记（`HKCU`，**不需要管理员权限**）。托盘出现图标即成功。
+   也可以不开界面，直接跑 `go-catcher.exe --install-native-host`。
+3. **装扩展**：把仓库中的 `edge_extension` 整个目录拷到新机器（`background.js` 已随仓库提交，
+   **无需 Node、无需构建**），然后在浏览器扩展管理页（Edge 为 `edge://extensions`，
+   Chrome 为 `chrome://extensions`）打开**开发者模式** → **加载解压缩的扩展** → 选中该目录。
+   > 扩展 ID 由 `manifest.json` 里的固定 `key` 决定，**每台机器都相同**，因此宿主清单中的
+   > 授权来源是通用的——新机器不必重新登记授权。
+4. **完全退出浏览器再打开**：这一步最保险——宿主登记有可能被浏览器在启动时那一次读进缓存，
+   重启能省掉后续"改了没生效"的排查（关掉所有窗口还不够，要从任务栏/托盘彻底退出）。
+5. **验证**：终端里跑 `go-catcher.exe --native-host-status`，Chrome / Edge 两处都应显示已登记；
+   然后打开视频页点一次下载 —— 此时即便客户端没在运行，也应当被自动唤起（托盘形态）。
+
+> **挪了位置怎么办**：exe 换目录后**再启动一次就会自动改写登记**——清单生成在新目录，
+> 注册表两处都跟到新路径（实测：把 exe 副本换到别的目录跑一次 `--install-native-host`，
+> Chrome 与 Edge 两个位置都改指副本的清单了）。注意三点：
+>
+> - 旧目录里的 `native-host\` 不会自动删，留着无害，想清掉手动删除即可；
+> - 新旧两份 exe 都还在、又都被启动过，**谁最后启动谁生效**——换目录后建议把旧的那份删掉；
+> - 核对现状用 `go-catcher.exe --native-host-status`，与期望路径不一致时会明确标成
+>   `[!] ... 指向其它路径`。
+>
+> 想彻底清掉登记用 `go-catcher.exe --uninstall-native-host`。
+
 ## 使用模式
 
 | 模式 | 启动方式 | 说明 |
 |---|---|---|
 | GUI 客户端 | 双击 `go-catcher.exe` | 打开即自动启动服务，托盘右键可停止/重启服务、退出 |
+| 托盘常驻 | `go-catcher.exe --tray` | 同上，但**不弹出主窗口**；被扩展自动唤起时用的就是这个形态 |
+| 原生消息宿主 | `go-catcher.exe --native-host` | 由浏览器按注册表清单拉起，只负责确保服务在运行（正常无需手动调用） |
 | 无头服务 | `go-catcher.exe --server [--port=端口]` | 只有下载服务，无界面；用浏览器访问监控页管理任务 |
 | 命令行直下 | `go-catcher.exe --url=<地址> [选项]` | 单任务直接下载，不依赖服务，适合脚本调用 |
 
@@ -42,25 +77,49 @@ go-catcher.exe --url="https://cdn.example.com/video/1080p/video.m3u8" --referer=
 |---|---|
 | `--url` | 下载地址（m3u8 流地址或直链文件） |
 | `--referer` | 来源页 URL，部分站点必填 |
-| `--proxy` | 代理：`system` 跟随 Windows 系统代理（默认）、`http://127.0.0.1:7890` 手动指定、`direct`/`none` 直连 |
+| `--proxy` | 代理：`system` 跟随 Windows 系统代理（默认）、`http://127.0.0.1:8080` 手动指定、`direct`/`none` 直连 |
 | `-c` | 分片并发数，默认 10 |
 | `-o` | 输出文件名（默认 output.ts；HLS 原始流直接落盘，不做封装转换） |
 | `--limit` | 只下载前 N 个分片（0 = 全部，用于试片） |
 | `--server` | 无头服务模式 |
 | `--port` | 服务监听端口（仅 `--server` 时有效；不指定则用监控页设置里配置的端口） |
+| `--tray` | 托盘常驻启动（起服务 + 托盘，不弹主窗口） |
+| `--native-host` | 以浏览器原生消息宿主形态运行（由浏览器拉起，走 stdin/stdout） |
+| `--install-native-host` | 登记原生消息宿主，让扩展能自动唤起本程序（客户端启动时也会自动登记） |
+| `--uninstall-native-host` | 注销原生消息宿主登记 |
+| `--native-host-status` | 查看原生消息宿主在各浏览器位置的登记状态 |
 
-## Edge 浏览器扩展
+## 浏览器扩展
 
-扩展位于 `edge_extension/` 目录，支持在网页内一键把视频流交给 GoCatcher 下载。
+扩展位于 `edge_extension/` 目录，是标准 MV3 扩展（Chrome / Edge 等 Chromium 系浏览器通用），
+支持在网页内一键把视频流交给 GoCatcher 下载。
 
 安装步骤：
 
-1. 打开 Edge，访问 `edge://extensions`
+1. 打开浏览器扩展管理页（Edge 为 `edge://extensions`，Chrome 为 `chrome://extensions`）
 2. 开启右上角 **开发者模式**
 3. 点击 **加载解压缩的扩展**，选择本项目的 `edge_extension` 目录
 4. 打开任意视频页面，点击页面上的 GoCatcher 按钮即可发起下载
 
-> 首次使用需先启动 GoCatcher（双击 `go-catcher.exe`），扩展会自动检测服务状态并给出提示。
+> **服务没启动也能点。** 客户端运行过一次后会把自己登记为浏览器的原生消息宿主；
+> 之后扩展检测到服务不在运行时，会通过这条通道自动把客户端唤起来（托盘常驻形态，
+> 不弹主窗口），再继续下载。若唤起失败（宿主未登记、或被浏览器策略拦下），
+> 扩展会给出提示并附一条可直接粘贴到终端的命令作为兜底。
+>
+> 排障：`go-catcher.exe --native-host-status` 可以查看宿主登记状态。
+> 唤起一直失败的常见原因，按出现频率排：
+>
+> 1. **客户端还没运行过**（注册表里没有宿主机记录）——先双击一次 `go-catcher.exe`，
+>    或执行 `go-catcher.exe --install-native-host`；客户端每次启动都会幂等补登记。
+> 2. **登记之后浏览器没重新起过**——登记写进注册表是即时的，但浏览器可能按启动那一刻的
+>    状态取；登记完先完全退出再打开一次最省事。
+> 3. **同一个扩展目录被加载过两次**——扩展 ID 固定后（`manifest.json` 的 `key`），
+>    改动前加载过的旧副本会留着成为另一个条目。去扩展管理页把多余的那个**移除**，
+>    只留一个；旧条目的 ID 不在宿主清单的允许来源里，用它唤不起来。
+> 4. **配置项被改过**——扩展设置里的端口要与客户端一致（默认 7891）。
+>
+> 想看具体原因：扩展管理页 → 本扩展 → **Service Worker**（"检查视图"），
+> 控制台里 `[go-catcher]` 开头的一行就是原生消息通道给出的原文报错。
 
 ### 扩展开发
 
@@ -89,14 +148,17 @@ CI 会校验 `background.js` 与 `src/` 是否一致（不一致即失败）；�
 
 ```
 go-catcher.exe
-├── internal/core   # 下载引擎：HTTP 服务（127.0.0.1:7891）、任务调度、m3u8 解析、持久化
-│   └── web/        # 内嵌监控页（go:embed）
-└── internal/app    # GUI 外壳：WebView2 窗口（内嵌监控页）、系统托盘、单实例互斥
+├── internal/core       # 下载引擎：HTTP 服务（127.0.0.1:7891）、任务调度、m3u8 解析、持久化
+│   └── web/            # 内嵌监控页（go:embed）
+├── internal/platform   # 平台层：Windows 控制台挂接、文件夹对话框、日志落盘、系统代理、Shell 操作
+└── internal/app        # GUI 外壳：WebView2 窗口（内嵌监控页）、系统托盘、单实例互斥
 ```
 
 - **引擎**（`internal/core`）：核心下载逻辑，独立于 UI，可被 GUI、无头服务、CLI 三种模式复用；
   全部可变运行状态收在 `Runtime` 结构（`runtime.go`）上，Engine / CLI 各持一份实例，
   可多实例化或作为库引用
+- **平台层**（`internal/platform`）：Windows 特定能力的独立包（`//go:build windows` 隔离），
+  core 与 app 只依赖其导出函数，不直接触碰系统 API——未来移植到其它系统时只需替换此包
 - **外壳**（`internal/app`）：基于 WebView2（系统自带 Edge 运行时，不打包浏览器）+ 系统托盘，与引擎通过 `Start/Stop/Running` 交互
 - **监控页**：同一份 Web UI 供客户端内嵌、浏览器直访、无头模式共用
 
@@ -122,7 +184,7 @@ go-catcher.exe
 | 限制 | 说明 |
 |---|---|
 | 只支持 HLS(m3u8) 与直链 MP4 | 不支持 DASH(`.mpd`)、HLS over WebSocket |
-| 加密只支持 AES-128 | SAMPLE-AES / Widevine 会明确报错（不支持的 METHOD） |
+| 加密只支持 AES-128 | SAMPLE-AES 与商业 DRM 方案会明确报错（不支持的 METHOD / KEYFORMAT） |
 | 全程必须同一把密钥 | 播放列表中途换 key（key rotation）会明确报错而不是产出损坏文件 |
 | 明文 `http://` 同样走代理 | 已修正：此前只有 https 走 CONNECT 隧道，明文请求会绕过代理直连 |
 | 代理只支持 `http://` | `socks5://` 系统代理会在启动横幅与 `/config` 的 `systemProxyWarning` 里提示"已按直连处理" |

@@ -1,10 +1,24 @@
-// M3U8 Video Catcher - IDM 式单视频下载按钮
+// M3U8 Video Catcher - 悬停单视频下载按钮
 // 鼠标悬停在某个 video 上时显示"下载该视频"按钮，点击后在页面内完成下载。
 // 所有真实网络请求通过 MAIN world fetch 代理发出，Origin/Referer/Cookie 与页面一致，绕过 CDN 403。
+//
+// m3u8 解析、画质推断、文件名清洗、命令参数净化**不在本文件里实现**：本文件是
+// 经典 content script（非模块，不能 import ESM），manifest 里由 content-shared.js
+// 先注入同一 isolated world，唯一实现见 src/background/m3u8-parse.js 与 cli-args.js
+// （构建期生成，见 build.mjs 与 scripts/check.mjs 的一致性校验）。
 
 (function () {
   if (window.__m3u8_catcher_injected__) return;
   window.__m3u8_catcher_injected__ = true;
+
+  // 唯一实现的取用口。取不到是**装配错误**（content-shared.js 缺失、或 manifest
+  // 里没排在 content.js 之前），不是运行时可降级的环境差异：降级成空对象只会把
+  // 故障推迟到第一次 P.fn() 才以 TypeError 暴露，报错点离根因很远（评审自审
+  // #11）。装配错了就立刻死、死得可读——上层 catch 会把它呈现成"分析失败"。
+  const P = globalThis.__m3u8Shared;
+  if (!P) {
+    throw new Error("__m3u8Shared 未注入：content-shared.js 缺失或未先于 content.js 执行");
+  }
 
   const MIN_W = 200;
   const MIN_H = 120;
@@ -36,6 +50,9 @@
   let panel = null;
   let activeTaskId = null; // 多任务并发：本次下载的 server 任务 id，轮询用
   let activePaused = false; // 当前任务是否处于暂停态（控制按钮切换用）
+  // 当前任务是否为直播录制。**判据以服务端 taskState.live 为准**（每次轮询用
+  // resp.live 覆盖），启动时先用嗅探结果占位，免得首帧先画成点播的「暂停」。
+  let activeLive = false;
   let analyzing = false;
   let abortController = null;
 
@@ -257,7 +274,7 @@
 
   // extractEmbedUrl 解析页 iframe 的 src 常形如
   //   https://parser.example/play/?url=<目标地址>
-  // 取出 ?url= 里的目标地址（常见的苹果CMS 解析页签名）。解析页往往会跳到
+  // 取出 ?url= 里的目标地址（第三方解析页的通用签名）。解析页往往会跳到
   // 另一个主机去播放，后台按 frameUrl 同站匹配就会落空，这个参数是最可靠的锚点。
   function extractEmbedUrl(target) {
     if (!target || target.src || !target.pageUrl) return "";
@@ -396,7 +413,7 @@
       const src = target.src;
       const pageUrl = target.pageUrl;
 
-      // IDM 式：取"该视频"的全部候选链接，再在页面主世界解析出各画质/格式
+      // 取"该视频"的全部候选链接，再在页面主世界解析出各画质/格式
       const resp = await chrome.runtime.sendMessage({
         type: "getVideoSources",
         src,
@@ -416,7 +433,7 @@
         return;
       }
 
-      // 单链接直接确认面板；多链接展示 IDM 式列表
+      // 单链接直接确认面板；多链接展示链接列表
       if (options.length === 1) {
         renderConfirmPanel(options[0]);
       } else {
@@ -478,9 +495,9 @@
   }
 
   // latestMediaDir 最近 SEGMENT_WINDOW_MS 内**最新一条**媒体请求的目录
-  //（分片 .ts/.m4s/.flv 或 .m3u8 均算——B 站直播的变体 playlist 持续刷新且与
+  //（分片 .ts/.m4s/.flv 或 .m3u8 均算——直播的变体 playlist 持续刷新且与
   // 分片同目录，刷新请求本身也是"当前流"的可靠信号）。
-  // 与 activeSegmentDirs 的区别：旧流切走后的"余波"请求（B 站切直播间时旧流
+  // 与 activeSegmentDirs 的区别：旧流切走后的"余波"请求（切流时旧流
   // 会再拉几秒）落在活跃集合里会让旧流误判为正在播放；最新一条一定是
   // 当前正在播放的流。
   function latestMediaDir() {
@@ -504,83 +521,12 @@
   }
 
   // ============================================================
-  // 解析工具
+  // 画质排序
+  //
+  // 解析（parseSegments / parseVariants / parseDuration / variantLabel /
+  // qualityFromURL）已收敛到 src/background/m3u8-parse.js，经 content-shared.js
+  // 注入为全局 P。这里只留页面侧的排序权重。
   // ============================================================
-  function resolveURL(base, rel) {
-    try {
-      return new URL(rel, base).href;
-    } catch {
-      return rel;
-    }
-  }
-
-  function parseSegments(text, baseURL) {
-    const list = [];
-    for (const raw of text.split("\n")) {
-      const line = raw.trim();
-      if (!line || line.startsWith("#")) continue;
-      list.push(resolveURL(baseURL, line));
-    }
-    return list;
-  }
-
-  function parseDuration(text) {
-    let total = 0;
-    for (const m of text.matchAll(/#EXTINF:([\d.]+)/g)) {
-      total += parseFloat(m[1]);
-    }
-    return total;
-  }
-
-  function parseVariants(text, baseURL) {
-    const lines = text.split("\n");
-    const list = [];
-    for (let i = 0; i < lines.length; i++) {
-      if (!lines[i].startsWith("#EXT-X-STREAM-INF")) continue;
-      const info = lines[i];
-      const next = (lines[i + 1] || "").trim();
-      if (!next || next.startsWith("#")) continue;
-      const bw = parseInt((info.match(/BANDWIDTH=(\d+)/) || [])[1] || "0", 10);
-      const res = (info.match(/RESOLUTION=(\d+x\d+)/) || [])[1] || "";
-      const codec = (info.match(/CODECS="([^"]+)"/) || [])[1] || "";
-      list.push({
-        url: resolveURL(baseURL, next),
-        bandwidth: bw,
-        resolution: res,
-        codec,
-        quality: variantQuality(next, res, bw),
-        label: variantLabel(next, res, bw),
-      });
-    }
-    list.sort((a, b) => b.bandwidth - a.bandwidth);
-    return list;
-  }
-
-  function variantQuality(uri, resolution, bandwidth) {
-    const m = String(uri).match(/(2160p|1440p|1080p|720p|480p|360p|240p)/i);
-    if (m) return m[1].toUpperCase();
-    if (resolution) {
-      const h = parseInt(resolution.split("x")[1], 10);
-      const map = { 2160: "4K", 1440: "2K", 1080: "1080P", 720: "720P", 480: "480P", 360: "360P", 240: "240P" };
-      if (map[h]) return map[h];
-    }
-    if (bandwidth) return `${(bandwidth / 1e6).toFixed(1)} Mbps`;
-    return "";
-  }
-
-  function variantLabel(uri, resolution, bandwidth) {
-    const q = variantQuality(uri, resolution, bandwidth);
-    const parts = [q || "未知画质"];
-    if (resolution) parts.push(resolution);
-    if (bandwidth) parts.push(`${(bandwidth / 1000).toFixed(0)} kbps`);
-    return parts.join(" · ");
-  }
-
-  function qualityFromURL(url) {
-    const m = String(url).match(/(2160p|1440p|1080p|720p|480p|360p|240p)/i);
-    return m ? m[1].toUpperCase() : "";
-  }
-
   function qualityRank(q) {
     return (
       {
@@ -596,7 +542,7 @@
   }
 
   // ============================================================
-  // IDM 式候选展开：全部候选 → 每个可下载的画质/格式选项
+  // 候选展开：全部候选 → 每个可下载的画质/格式选项
   // master m3u8 展开为各变体；媒体 playlist 补时长/分片数；mp4 透传。
   // 列表限定"悬停的那个视频"：src 直链隔离 → 分辨率/时长特征匹配 →
   // 活跃分片目录过滤，逐级空回退（宁多勿漏）。
@@ -606,7 +552,7 @@
   async function expandVideoOptions(candidates, pageUrl, video) {
     const fallbackTitle = document.title || "";
     // 预检优先走本地 Go 服务 /probe：浏览器对无 CORS 头的 CDN 只能拿到 opaque
-    // 空响应（"未预检"的根源），服务端带 Referer 直连（uTLS 指纹）能拿到。
+    // 空响应（"未预检"的根源），服务端带 Referer + 指纹伪装直连能拿到。
     // 本地服务未启动时回退页面主世界 fetch。
     let serverBase = null;
     try {
@@ -667,7 +613,7 @@
             url: c.url,
             title: c.title || fallbackTitle,
             pageUrl: c.pageUrl || pageUrl,
-            quality: qualityFromURL(c.url),
+            quality: P.qualityFromURL(c.url),
             size: c.size || 0,
             group: c.url,
             fromSrc: !!c.fromSrc,
@@ -681,7 +627,7 @@
           url: c.url,
           title: c.title || fallbackTitle,
           pageUrl: c.pageUrl || pageUrl,
-          quality: qualityFromURL(c.url),
+          quality: P.qualityFromURL(c.url),
           resolution: "",
           bandwidth: 0,
           group: c.url,
@@ -694,7 +640,7 @@
       [...tsMeta.entries()].map(async ([url, meta]) => {
         const text = await fetchPlaylist(url);
         if (!text || !text.includes("#EXT-X-STREAM-INF")) return;
-        const variants = parseVariants(text, url);
+        const variants = P.parseVariants(text, url);
         if (!variants.length) return;
         for (const v of variants) {
           const existing = tsMeta.get(v.url);
@@ -721,7 +667,7 @@
     );
 
     // 悬停视频自带 http src 时，其余 mp4 是页面上其他视频（推荐流卡片）的
-    // 嗅探条目——全部剔除，列表只保留选中视频（IDM 同行为）
+    // 嗅探条目——全部剔除，列表只保留选中视频
     const videoSrc = video ? String(video.currentSrc || video.src || "") : "";
     if (/^https?:/i.test(videoSrc)) {
       for (let i = mp4Options.length - 1; i >= 0; i--) {
@@ -740,8 +686,8 @@
         let segments = 0;
         let live = false;
         if (!text.includes("#EXT-X-STREAM-INF")) {
-          duration = parseDuration(text);
-          segments = parseSegments(text, m.url).length;
+          duration = P.parseDuration(text);
+          segments = P.parseSegments(text, m.url).length;
           live = !text.includes("#EXT-X-ENDLIST");
         }
         return { ...m, duration, segments, live };
@@ -794,7 +740,7 @@
 
     // 只保留"正在播放的流"，三级严格→宽松→全集（每级剔光即回退）：
     // 1. 最新媒体目录严格匹配：真正在播放的流必然刚拉过 .ts/.m3u8/.flv，
-    //    旧流切走后的余波请求（B 站切直播间旧流再拉几秒）目录更旧，被挤掉。
+    //    旧流切走后的余波请求（切流时旧流再拉几秒）目录更旧，被挤掉。
     // 2. 全部活跃目录宽松匹配：最新目录与候选 URL 前缀不一致（CDN 目录分属
     //    不同路径层级）或暂停播放时兜底。
     // 3. 无任何活跃信号（暂停）回退全集，宁多勿漏。
@@ -863,14 +809,7 @@
     return options;
   }
 
-  function fmtDur(sec) {
-    const h = Math.floor(sec / 3600);
-    const m = Math.floor((sec % 3600) / 60);
-    const s = Math.round(sec % 60);
-    return h > 0
-      ? `${h}:${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}`
-      : `${m}:${String(s).padStart(2, "0")}`;
-  }
+  // 时长格式化由共享的 P.fmtDur 提供（与下载器页面同一份，评审 P3-6）。
 
   // ============================================================
   // 单视频选择面板
@@ -902,7 +841,7 @@
     return `
       <div style="max-width:720px;width:90%;max-height:85vh;background:#fff;border-radius:8px;box-shadow:0 8px 32px rgba(0,0,0,0.35);display:flex;flex-direction:column;overflow:hidden;">
         <div style="display:flex;align-items:center;justify-content:space-between;padding:14px 18px;border-bottom:1px solid #e5e7eb;background:#f8f9fb;">
-          <div style="font-size:16px;font-weight:700;color:#111;">${escapeHtml(title)}</div>
+          <div style="font-size:16px;font-weight:700;color:#111;">${P.escapeHtml(title)}</div>
           <button id="m3u8-catcher-close" style="border:none;background:transparent;font-size:20px;color:#6b7280;cursor:pointer;line-height:1;">×</button>
         </div>
         ${bodyHTML}
@@ -945,12 +884,12 @@
         "下载该视频",
         `<div style="padding:24px 28px 0;">
           ${serverDownBanner}
-          <div style="color:#d32f2f;margin-bottom:12px;font-size:14px;line-height:1.5;word-break:break-all;overflow-wrap:anywhere;">下载失败: ${escapeHtml(errMsg)}</div>
+          <div style="color:#d32f2f;margin-bottom:12px;font-size:14px;line-height:1.5;word-break:break-all;overflow-wrap:anywhere;">下载失败: ${P.escapeHtml(errMsg)}</div>
           <div style="color:#374151;font-size:13px;margin-bottom:8px;">也可以手动复制下面的命令到终端运行（不需要服务）：</div>
-          ${outName ? `<div style="color:#374151;font-size:13px;margin-bottom:6px;">输出文件：<code style="background:#f3f4f6;padding:1px 5px;border-radius:3px;">${escapeHtml(outName)}</code></div>` : ""}
+          ${outName ? `<div style="color:#374151;font-size:13px;margin-bottom:6px;">输出文件：<code style="background:#f3f4f6;padding:1px 5px;border-radius:3px;">${P.escapeHtml(outName)}</code></div>` : ""}
         </div>
          <div style="padding:0 28px 20px;">
-           <div style="background:#1f2937;color:#e5e7eb;padding:12px;border-radius:6px;font-family:Menlo,Consolas,monospace;font-size:12px;line-height:1.6;word-break:break-all;white-space:pre-wrap;" id="go-cmd-text">${escapeHtml(goCmd)}</div>
+           <div style="background:#1f2937;color:#e5e7eb;padding:12px;border-radius:6px;font-family:Menlo,Consolas,monospace;font-size:12px;line-height:1.6;word-break:break-all;white-space:pre-wrap;" id="go-cmd-text">${P.escapeHtml(goCmd)}</div>
            <div style="margin-top:6px;color:#9ca3af;font-size:11.5px;line-height:1.5;">exe 路径由本地服务运行时自动检测；显示为裸文件名时，先打开一次 GoCatcher 客户端即可，或在扩展设置里手动配置。</div>
            <div style="margin-top:10px;display:flex;gap:8px;align-items:center;">
              <button id="copy-go-cmd" style="padding:6px 14px;font-size:13px;border:none;background:#3b82f6;color:#fff;border-radius:4px;cursor:pointer;font-weight:600;">复制命令</button>
@@ -992,16 +931,16 @@
         "下载该视频",
         `<div style="padding:22px 28px;">
           <div style="color:#22c55e;font-weight:600;font-size:14px;margin-bottom:10px;">✓ 已开始下载，由本地 Go 服务保存到所选文件夹</div>
-          ${dir ? `<div style="font-size:12px;color:#6b7280;margin-bottom:12px;word-break:break-all;">保存位置：${escapeHtml(dir)}</div>` : ""}
+          ${dir ? `<div style="font-size:12px;color:#6b7280;margin-bottom:12px;word-break:break-all;">保存位置：${P.escapeHtml(dir)}</div>` : ""}
           <div style="background:#f3f4f6;padding:8px 10px;border-radius:4px;font-size:12px;color:#374151;margin-bottom:14px;">
-            文件：<code style="font-family:Menlo,Consolas,monospace;">${escapeHtml(fn)}</code>
+            文件：<code style="font-family:Menlo,Consolas,monospace;">${P.escapeHtml(fn)}</code>
           </div>
           <div id="initiated-progress-text" style="margin-bottom:10px;color:#374151;font-size:13px;">正在连接本地 Go 服务…</div>
           <div style="width:100%;height:8px;background:#e5e7eb;border-radius:4px;overflow:hidden;">
             <div id="initiated-progress-fill" style="width:0%;height:100%;background:#3b82f6;transition:width .2s;"></div>
           </div>
           <div id="initiated-controls" style="margin-top:14px;display:flex;gap:8px;align-items:center;justify-content:flex-end;"></div>
-          <div style="margin-top:8px;font-size:11px;color:#9ca3af;">下载过程不经过浏览器下载栏，可在此暂停/继续或取消。</div>
+          <div id="initiated-hint" style="margin-top:8px;font-size:11px;color:#9ca3af;"></div>
         </div>`
       );
     } else if (state === "completed") {
@@ -1011,8 +950,8 @@
         `<div style="padding:32px 28px;text-align:center;">
           <div style="font-size:32px;margin-bottom:10px;">🎉</div>
           <div style="color:#22c55e;font-weight:600;font-size:16px;margin-bottom:8px;">下载完成</div>
-          <div style="font-size:13px;color:#374151;margin-bottom:6px;">文件名：<code style="background:#f3f4f6;padding:2px 6px;border-radius:3px;font-family:Menlo,Consolas,monospace;">${escapeHtml(fn)}</code></div>
-          ${payload && payload.finalPath ? `<div style="font-size:12px;color:#6b7280;margin-bottom:14px;word-break:break-all;">位置：${escapeHtml(payload.finalPath)}</div>` : ""}
+          <div style="font-size:13px;color:#374151;margin-bottom:6px;">文件名：<code style="background:#f3f4f6;padding:2px 6px;border-radius:3px;font-family:Menlo,Consolas,monospace;">${P.escapeHtml(fn)}</code></div>
+          ${payload && payload.finalPath ? `<div style="font-size:12px;color:#6b7280;margin-bottom:14px;word-break:break-all;">位置：${P.escapeHtml(payload.finalPath)}</div>` : ""}
           <button id="completed-close" style="margin-top:10px;padding:8px 20px;font-size:13px;border:none;background:#3b82f6;color:#fff;border-radius:5px;cursor:pointer;">完成</button>
         </div>`
       );
@@ -1033,7 +972,7 @@
   }
 
   // ============================================================
-  // IDM 式链接列表面板：多候选时列出全部可选链接（格式/画质/码率/时长）
+  // 链接列表面板：多候选时列出全部可选链接（格式/画质/码率/时长）
   // ============================================================
   function optionMeta(o) {
     const parts = [];
@@ -1042,7 +981,7 @@
     if (o.quality) parts.push(o.quality);
     if (o.resolution) parts.push(o.resolution);
     if (o.bandwidth) parts.push(`${(o.bandwidth / 1000).toFixed(0)} kbps`);
-    if (o.duration) parts.push(`时长 ${fmtDur(o.duration)}`);
+    if (o.duration) parts.push(`时长 ${P.fmtDur(o.duration)}`);
     else if (o.type === "ts" && o.segments) parts.push(`${o.segments} 分片`);
     if (o.size) {
       parts.push(`${(o.size / 1024 / 1024).toFixed(1)} MB`);
@@ -1079,9 +1018,9 @@
         <div class="m3u8-catcher-row" data-idx="${idx}" style="display:flex;align-items:center;padding:10px 14px;border-bottom:1px solid #f3f4f6;cursor:pointer;${o.unchecked ? "opacity:0.55;" : ""}">
           <div style="flex:none;width:44px;margin-right:12px;padding:3px 0;text-align:center;border-radius:4px;font-size:11px;font-weight:700;color:#fff;background:${o.type === "ts" ? "#3b82f6" : "#64748b"};">${o.type === "ts" ? "TS" : "MP4"}</div>
           <div style="flex:1;min-width:0;">
-            <div style="font-size:13.5px;color:#111;font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${escapeHtml(o.title || "(无标题)")}</div>
-            <div style="font-size:11px;color:#9ca3af;margin-top:2px;">${escapeHtml(optionMeta(o))}</div>
-            <div style="font-size:10.5px;color:#c3cad4;margin-top:1px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${escapeHtml(optionURLLabel(o.url))}</div>
+            <div style="font-size:13.5px;color:#111;font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${P.escapeHtml(o.title || "(无标题)")}</div>
+            <div style="font-size:11px;color:#9ca3af;margin-top:2px;">${P.escapeHtml(optionMeta(o))}</div>
+            <div style="font-size:10.5px;color:#c3cad4;margin-top:1px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${P.escapeHtml(optionURLLabel(o.url))}</div>
           </div>
           <div style="margin-left:10px;padding:4px 10px;background:#3b82f6;color:#fff;font-size:12px;border-radius:4px;font-weight:600;">下载</div>
         </div>`
@@ -1089,7 +1028,7 @@
       .join("");
 
     panel.innerHTML = panelShell(
-      `下载该视频 - ${escapeHtml(options[0].title || document.title || "")}`,
+      `下载该视频 - ${P.escapeHtml(options[0].title || document.title || "")}`,
       `<div style="overflow-y:auto;max-height:60vh;">${rows}</div>
        <div style="padding:12px 18px;border-top:1px solid #e5e7eb;background:#f8f9fb;color:#6b7280;font-size:12px;">共 ${options.length} 个链接，点击任一行选择该画质下载。</div>`
     );
@@ -1124,24 +1063,24 @@
       `<div style="padding:20px 24px;">
         <div style="margin-bottom:14px;">
           <div style="font-size:12px;color:#6b7280;margin-bottom:3px;">视频名称</div>
-          <div style="font-weight:600;color:#111;">${escapeHtml(title || "(无标题)")}</div>
+          <div style="font-weight:600;color:#111;">${P.escapeHtml(title || "(无标题)")}</div>
         </div>
 
         ${quality ? `<div style="margin-bottom:14px;">
           <div style="font-size:12px;color:#6b7280;margin-bottom:3px;">画质</div>
-          <div style="font-weight:600;color:#111;">${escapeHtml(quality)}</div>
+          <div style="font-weight:600;color:#111;">${P.escapeHtml(quality)}</div>
         </div>` : ""}
 
         <div style="margin-bottom:14px;">
           <div style="font-size:12px;color:#6b7280;margin-bottom:3px;">资源链接</div>
-          <div style="background:#f3f4f6;padding:10px;border-radius:4px;font-family:Menlo,Consolas,monospace;font-size:11px;line-height:1.5;word-break:break-all;max-height:90px;overflow-y:auto;color:#1f2937;">${escapeHtml(url)}</div>
+          <div style="background:#f3f4f6;padding:10px;border-radius:4px;font-family:Menlo,Consolas,monospace;font-size:11px;line-height:1.5;word-break:break-all;max-height:90px;overflow-y:auto;color:#1f2937;">${P.escapeHtml(url)}</div>
           <button id="confirm-copy-url" style="margin-top:6px;padding:5px 12px;font-size:12px;border:1px solid #d1d5db;background:#fff;border-radius:4px;cursor:pointer;color:#374151;">📋 复制链接</button>
           <span id="confirm-copy-feedback" style="margin-left:8px;color:#22c55e;font-size:12px;display:none;">✓ 已复制</span>
         </div>
 
         <div style="margin-bottom:18px;">
           <div style="font-size:12px;color:#6b7280;margin-bottom:3px;">保存文件名</div>
-          <div style="background:#fef3c7;padding:8px 10px;border-radius:4px;font-family:Menlo,Consolas,monospace;font-size:12px;color:#78350f;">${escapeHtml(filename)}</div>
+          <div style="background:#fef3c7;padding:8px 10px;border-radius:4px;font-family:Menlo,Consolas,monospace;font-size:12px;color:#78350f;">${P.escapeHtml(filename)}</div>
           <div style="margin-top:4px;font-size:11px;color:#9ca3af;">下载时可改名字 / 改位置</div>
         </div>
 
@@ -1212,6 +1151,11 @@
       // 目录已选好，Go 已开始落盘 → 进入进度面板
       // 多任务并发：记录本次任务 id，供后续轮询精确定位（多个标签页各下各的互不串扰）
       activeTaskId = resp.taskId || null;
+      // live 标记按本任务重算：上个任务若是直播，残留的 true 会让点播任务首帧
+      // 画出「停止（保存已录）」（评审自审 #13）。嗅探的 live 是启发式——false
+      // 不代表点播，误判由第一次轮询以服务端字段纠正；这里重算只为清掉上一个
+      // 任务的残留、并让本任务 sniff 到的 true 即刻生效。
+      activeLive = !!(source && source.live);
       activePaused = false;
       showPanel("initiated", {
         ...source,
@@ -1234,6 +1178,8 @@
 
   // 追踪 Go server 下载进度（轮询 /status），把阶段/百分比回写到面板，并按暂停态切换控制按钮
   function trackDownload(source) {
+    // 首帧的 live 标记由 triggerDownload 在进面板前按本任务重算（嗅探启发式），
+    // 服务端的权威标记要等第一次轮询才到；任一状态变化都会重画控件。
     const interval = setInterval(async () => {
       try {
         const resp = await chrome.runtime.sendMessage({ type: "queryDownload", taskId: activeTaskId });
@@ -1242,8 +1188,12 @@
         if (state === "inProgress" || state === "paused") {
           const stage = resp.stage || "下载中";
           const pct = typeof resp.pct === "number" ? resp.pct / 100 : 0;
-          if (activePaused !== !!resp.paused) {
+          // 直播标记以服务端 taskState.live 为准：嗅探的 live 只是启发式（看有没有
+          // ENDLIST），任务真正走的是哪条路径只有服务端知道。任一状态变化都重画控件。
+          const live = !!resp.live;
+          if (activePaused !== !!resp.paused || activeLive !== live) {
             activePaused = !!resp.paused;
+            activeLive = live;
             renderInitiatedControls();
           }
           updateInitiatedProgress(pct, stage, resp);
@@ -1280,18 +1230,66 @@
     renderInitiatedControls();
   }
 
-  // 渲染进度面板底部的 暂停/继续 + 取消 控制按钮
+  // controlButtons 决定进度面板底部放哪些控制按钮。
+  //
+  // 直播与点播是两套语义，混用会直接坏掉 —— 服务端 /pause 对直播返回 400
+  // （"直播录制请使用停止：直播流不支持暂停后续录"）：
+  //   - 直播：只有「停止（保存已录）」与「取消」，**没有任何恢复入口**。
+  //     暂停期间的分片已从滑动窗口滚走，接着录只会在产物里留一个时间轴空洞。
+  //     这与主界面 index.html 的控制按钮（'⏹ 停止（保存已录）'）一致。
+  //   - 点播：运行中「暂停」，暂停后「继续下载」——断点续传在这里是真的。
+  // 纯函数、不碰 DOM，renderInitiatedControls 与回归测试共用同一份判据。
+  //
+  // 配色与图标跟内置前端（web/index.html 的 actions()/rowCard()）保持同一套：
+  //   - 主操作（⏸ 暂停 / ⏹ 停止 / ⏯ 继续）一律 primary 蓝底 —— 它们都是"让任务动起来"；
+  //   - ✕ 取消一律 danger 红底（学徒 2026-09-16：取消不用改）；
+  //   - 「继续」用 ⏯ 而不是 ▶：▶ 已被「打开文件 / 播放」占用，同形不同义。
+  function controlButtons(live, paused) {
+    if (live) {
+      return [
+        { ctl: "stop", label: "⏹ 停止（保存已录）", kind: "primary" },
+        { ctl: "cancel", label: "✕ 取消", kind: "danger" },
+      ];
+    }
+    if (paused) {
+      return [
+        { ctl: "resume", label: "⏯ 继续下载", kind: "primary" },
+        { ctl: "cancel", label: "✕ 取消", kind: "danger" },
+      ];
+    }
+    return [
+      { ctl: "pause", label: "⏸ 暂停", kind: "primary" },
+      { ctl: "cancel", label: "✕ 取消", kind: "danger" },
+    ];
+  }
+
+  // 控制按钮的外观。label 全是我们自己的常量、不含页面数据，所以下面拼
+  // innerHTML 是安全的（与 settings.html 那个"注册表值不可信"的场景不同）。
+  // plain 只是未知 kind 的兜底：现有按钮都会命中 primary / danger。
+  const CTL_STYLE = {
+    primary: "border:none;background:#3b82f6;color:#fff;font-weight:600;",
+    danger: "border:none;background:#ef4444;color:#fff;font-weight:600;",
+    plain: "border:1px solid #e5e7eb;background:#fff;color:#374151;",
+  };
+
+  // 渲染底部控制按钮，并同步底部那行说明 —— 说明与按钮必须同源，
+  // 否则会出现"按钮已经是停止、提示还在说可以暂停继续"的错位。
   function renderInitiatedControls() {
     const wrap = panel && panel.querySelector("#initiated-controls");
     if (!wrap) return;
-    if (activePaused) {
-      wrap.innerHTML =
-        '<button data-ctl="resume" style="padding:6px 16px;font-size:13px;border:none;background:#3b82f6;color:#fff;border-radius:5px;cursor:pointer;font-weight:600;">▶ 继续下载</button>' +
-        '<button data-ctl="cancel" style="padding:6px 16px;font-size:13px;border:1px solid #e5e7eb;background:#fff;color:#374151;border-radius:5px;cursor:pointer;">✕ 取消</button>';
-    } else {
-      wrap.innerHTML =
-        '<button data-ctl="pause" style="padding:6px 16px;font-size:13px;border:1px solid #e5e7eb;background:#fff;color:#374151;border-radius:5px;cursor:pointer;">⏸ 暂停</button>' +
-        '<button data-ctl="cancel" style="padding:6px 16px;font-size:13px;border:none;background:#ef4444;color:#fff;border-radius:5px;cursor:pointer;font-weight:600;">✕ 取消</button>';
+    wrap.innerHTML = controlButtons(activeLive, activePaused)
+      .map(
+        (b) =>
+          `<button data-ctl="${b.ctl}" style="padding:6px 16px;font-size:13px;border-radius:5px;cursor:pointer;${
+            CTL_STYLE[b.kind] || CTL_STYLE.plain
+          }">${b.label}</button>`
+      )
+      .join("");
+    const hint = panel.querySelector("#initiated-hint");
+    if (hint) {
+      hint.textContent = activeLive
+        ? "直播只有「停止」：停止后已录部分会保存成文件；要接着录请回直播页重新开始。"
+        : "下载过程不经过浏览器下载栏，可在此暂停/继续或取消。";
     }
     wrap.querySelectorAll("button[data-ctl]").forEach((btn) => {
       btn.addEventListener("click", () => {
@@ -1300,7 +1298,7 @@
     });
   }
 
-  // 向 Go server 发送 暂停/继续/取消（经 background 代理）；立即切换本地按钮态，等 poll 确认
+  // 向 Go server 发送 暂停/继续/停止/取消（经 background 代理）；立即切换本地按钮态，等 poll 确认
   async function sendControl(action) {
     const btn = panel && panel.querySelector(`#initiated-controls button[data-ctl="${action}"]`);
     if (btn) { btn.disabled = true; btn.style.opacity = ".5"; }
@@ -1313,9 +1311,20 @@
         renderInitiatedControls();
         return;
       }
-      // pause → 立即进暂停态（省一次 poll）；resume → 立即回到下载态
+      // 本地立即反馈（省一次 poll 的往返）：
       if (action === "pause") { activePaused = true; renderInitiatedControls(); updateInitiatedProgress(0, "已暂停，点击继续可恢复", {}); }
       else if (action === "resume") { activePaused = false; renderInitiatedControls(); }
+      else if (action === "stop") {
+        // 直播收尾要落盘（校验 + 改名），不是瞬时的。把按钮换成不可点的提示，
+        // 免得用户以为没生效又点一次 —— 后端虽然幂等，但连点会让人怀疑没反应。
+        const wrap = panel && panel.querySelector("#initiated-controls");
+        if (wrap) {
+          wrap.innerHTML =
+            '<button disabled style="padding:6px 16px;font-size:13px;border:none;background:#9ca3af;color:#fff;border-radius:5px;cursor:default;">停止中…</button>';
+        }
+        const hint = panel && panel.querySelector("#initiated-hint");
+        if (hint) hint.textContent = "正在保存已录部分…";
+      }
       else if (action === "cancel") { activePaused = false; renderInitiatedControls(); }
     } catch (e) {
       renderInitiatedControls();
@@ -1353,14 +1362,13 @@
     }
   }
 
-  function escapeHtml(s) {
-    return String(s).replace(/[&<>"']/g, (c) => ({"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"}[c]));
-  }
-
   // 兜底命令的 exe 路径解析（优先级从高到低）：
   //   1. 设置里显式配置的路径（≠ 默认值才算"显式"）
   //   2. 服务自报的路径（/svc/info 自动探测缓存；没有缓存时让 background 实时问一次）
   //   3. 裸文件名 go-catcher.exe（依赖 PATH；服务从未运行过时才会走到这）
+  // ⚠ 与 downloader.js 的 getExePath 是同一套优先级，措辞也刻意保持相同；本函数多
+  //   第 2 步那后半跳（页面世界直发本机请求会被 CORS 挡，只能让 background 代问）。
+  //   两份有意保留（评审 P3-6 留档）：改这条优先级时两处必须一起改。
   async function getExePath() {
     let detected = "";
     try {
@@ -1379,27 +1387,38 @@
     return "go-catcher.exe";
   }
 
-  // 生成跨 PowerShell / Git Bash / CMD 可直接粘贴运行的下载命令
-  // 用 ; 而非 && 分隔：Windows PowerShell 5.1 不支持 && 作语句分隔符
-  // 路径加双引号：bash 下不加引号会把位置参数按空白切片
+  // 生成跨 PowerShell / Git Bash / CMD 可直接粘贴运行的下载命令。
+  // 拼装本身（chcp 前缀 / 引号 / ; 分隔 / 逐值净化走 P.quoteArg）全部交给共享的
+  // P.assembleGoCommand——唯一实现（评审 P3-6：这里曾与下载器页面各写一份同形实现）。
+  // 本函数只剩一件事：把「输出文件名怎么算」翻译成它的入参，见下面 buildOutputName
+  // 的对照表。用户把「复制文件地址」拿到的带引号路径粘进设置页时，值里的引号会把
+  // 路径切到引号外、按空白裂成两个参数（评审 P2-8 / F9），净化在拼装那层做。
   function buildGoCommand(m3u8Url, pageUrl, title, exePath) {
-    // 直接调用单文件 exe（三种模式之一：--url= 直下，无需先起服务）
-    const goArgs = [`"${exePath || "go-catcher.exe"}"`];
-    if (m3u8Url) goArgs.push(`--url="${m3u8Url}"`);
-    if (pageUrl) goArgs.push(`--referer="${pageUrl}"`);
-
-    // -o 输出文件名：视频标题 + 画质（由 buildOutputName 统一构造）
-    const outName = buildOutputName(m3u8Url, title);
-    if (outName) goArgs.push(`-o "${outName}"`);
-
-    return [
-      "chcp 65001",
-      goArgs.join(" "),
-    ].join(" ; ");
+    return P.assembleGoCommand(m3u8Url, pageUrl, buildOutputName(m3u8Url, title), exePath);
   }
 
-  // 拼输出文件名：<标题>_<画质>.ts
-  // 画质从 m3u8 URL 里推断（.../1080p/video.m3u8 或 xxx_720p.m3u8）
+  // ============================================================
+  // 文件名的构造：buildOutputName —— 与 downloader.js 的 makeFilename 对照
+  // ------------------------------------------------------------
+  // 这一对**不合并**（评审 P3-6）：两者的输入不同，强行统一会让一侧失真。但凡是
+  // 两侧应当一致的部分，都由共享函数决定，并由 tests/filename-consistency.test.js
+  // 逐条钉住（有标题时必须逐字节相同）。对照表如下：
+  //
+  //   维度           本函数 buildOutputName        本页/下载器 makeFilename
+  //   -------------  ---------------------------  ---------------------------
+  //   画质来源       从 URL 推断 qualityFromURL   调用方传入（用户手选的档位）
+  //   无标题兜底     取倒数第一个非画质段          路径段用 _ 连起来
+  //   名字仍为空     返回空串（命令里不出现 -o）    video_<毫秒时间戳>
+  //   扩展名         固定 .ts                      可传参（默认 .ts）
+  //   -------------  ---------------------------  ---------------------------
+  //   名称清洗       sanitizeFileName             sanitizeFileName
+  //   画质段剔除     跳过 2160p…240p              跳过 2160p…240p
+  //   长度上限       80 字符                     80 字符
+  //
+  // 「画质来源」的差异是有意的：下载器页面能弹档位选择框，学到的画质是 CDN 自报的，
+  // 比从 URL 猜准。但两侧**默认路径**下画质都出自共享的 qualityFromURL，所以同一个
+  // 视频从浮层下载与从扩展页下载，文件名后缀一致（评审 P2-7）。
+  // ============================================================
   function buildOutputName(m3u8Url, title) {
     let name = String(title || "").trim();
 
@@ -1427,34 +1446,23 @@
     }
     if (!name) return "";
 
-    // 清掉 Windows 文件名非法字符，并把替换留下的碎屑归并干净
-    // （例："Bad/Name: with* x" → "Bad_Name_with_x"，而不是 "Bad_Name_ with_ x"）
-    name = name
-      .replace(/[\\/:*?"<>|]/g, "_")
-      .replace(/_{2,}/g, "_")
-      .replace(/\s*_\s*/g, "_")
-      .replace(/\s+/g, " ")
-      .replace(/^[_\s]+|[_\s]+$/g, "")
-      .trim()
-      .slice(0, 80);
+    // 清掉 Windows 文件名非法字符与控制字符（\x07 \x1b 之类会原样进文件名），
+    // 并把替换留下的碎屑归并干净：共享实现，见 src/background/cli-args.js
+    name = P.sanitizeFileName(name).slice(0, 80);
     if (!name) return "";
 
-    // 画质后缀（输出 .ts：HLS 原始流直接落盘，Go 侧不做封装，PotPlayer/VLC 可播）
-    const q = qualityFromUrl(m3u8Url);
+    // 画质后缀（输出 .ts：HLS 原始流直接落盘，Go 侧不做封装，主流播放器可播）
+    // 画质由共享的 qualityFromURL 决定——与 downloader 页面的文件名同源，
+    // 否则同一个视频从浮层下载与从扩展页下载会得到不同的文件名后缀（P2-7）。
+    const q = P.qualityFromURL(m3u8Url);
     return name + (q ? `_${q}` : "") + ".ts";
   }
 
-  // 从 URL 里抠画质档位：优先路径里的 /1080p/，其次 xxx_720p.m3u8
-  function qualityFromUrl(u) {
-    if (!u) return "";
-    try {
-      const path = decodeURIComponent(new URL(u).pathname);
-      const m =
-        path.match(/\/(2160p|1440p|1080p|720p|480p|360p|240p)\//i) ||
-        path.match(/[_-](2160p|1440p|1080p|720p|480p|360p|240p)\.m3u8/i);
-      if (m) return m[1].toUpperCase();
-    } catch {}
-    return "";
+  // 测试钩子：node 环境下（有 module、无扩展 API）把纯函数挂出去，供
+  // tests/livecontrols.test.js 与 tests/contentparse.test.js 直接调用。
+  // content script 里没有 module，整段不执行 —— 对线上行为零影响。
+  if (typeof module !== "undefined" && module.exports) {
+    module.exports.__ui = { controlButtons, CTL_STYLE, buildGoCommand, buildOutputName };
   }
 
   if (document.readyState === "loading") {

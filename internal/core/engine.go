@@ -10,10 +10,23 @@ import (
 	"net/http"
 	"sync"
 	"time"
+
+	"github.com/0panwang0/go-catcher/internal/platform"
 )
 
 // DefaultPort 监控页 / Edge 扩展默认端口
 const DefaultPort = 7891
+
+// maskToken 只保留前缀，用于在启动横幅里辨认"是不是这枚令牌"，不泄露可用的完整值。
+//
+// 横幅会经 SetupFileLogging 落进 gocatcher.log，而日志文件是 0644——完整令牌
+// 等于把钥匙写进日志。需要完整值时从 gocatcher_config.json 或 /svc/info 取。
+func maskToken(tok string) string {
+	if len(tok) <= 8 {
+		return "****"
+	}
+	return tok[:8] + "****"
+}
 
 type Engine struct {
 	// rt 是本引擎的运行时状态（配置/任务表/代理客户端等，见 runtime.go）。
@@ -45,7 +58,21 @@ func (e *Engine) Start() error {
 		// 先建限制器并装载持久化配置（并发数在恢复任务前就绪），再恢复历史任务
 		e.rt.initRuntimeConfig()
 		e.rt.loadState()
+		// 补偿收尾"上次进程被强杀、没来得及收尾"的直播录制。
+		//
+		// 异步：它要读用户磁盘上的文件（抽样校验）并改任务终态，而 GUI 的
+		// 启动路径正等着这里返回去建窗口。**不占并发槽**——它没有网络 IO，
+		// 只有一次 256KB 读 + 一次 rename；抢一个下载槽位只会让它排在一堆
+		// 无关下载后面白等。任务之间也是串行处理（单次遍历），不会出现
+		// "N 个任务同时敲磁盘"。
+		go e.rt.salvageInterruptedLive()
 	})
+	// 熵源不可用必须拒绝启动：访问令牌与内嵌豁免键都从 crypto/rand 来，
+	// 拿不到就只能退化，而退化出来的值是可预测的——服务照跑等于没有访问控制。
+	// 放在监听之前：绝不先开门再报错。
+	if err := e.rt.entropyFailure(); err != nil {
+		return fmt.Errorf("拒绝启动：%w", err)
+	}
 	// 端口解析：--port 覆盖 > 配置文件；端口只在本方法和 Port() 里读，改动即时生效于下次 Start
 	port := e.override
 	if port <= 0 {
@@ -59,7 +86,15 @@ func (e *Engine) Start() error {
 	// guard 包在最外层：Host 校验 + 访问令牌（见 auth.go）。
 	// 服务只监听 127.0.0.1，但浏览器里的任意网页都能打到 127.0.0.1，
 	// 而本服务具备"写任意路径"和"执行程序"两种能力——这道门必须自己设。
-	e.srv = &http.Server{Handler: e.rt.guard(newMux(e))}
+	e.srv = &http.Server{
+		Handler: e.rt.guard(newMux(e)),
+		// 连接级超时：令牌挡的是"谁能调用"，但不挡"谁都能占一条连接"。
+		// 没有 ReadHeaderTimeout 时，一条连上来只发一半请求头的 TCP 连接能一直
+		// 占住一个 goroutine（Slowloris 式），且不需要令牌。两者都与下载无关
+		// ——下载走的是出站共享 client（见 net.go 的分层超时），互不影响。
+		ReadHeaderTimeout: 10 * time.Second,
+		IdleTimeout:       120 * time.Second,
+	}
 	e.done = make(chan struct{})
 	e.running = true
 	go func() { _ = e.srv.Serve(ln) }()
@@ -69,8 +104,8 @@ func (e *Engine) Start() error {
 	fmt.Println("  GoCatcher 本地下载服务")
 	fmt.Printf("  监听地址: http://%s:%d\n", e.rt.bindAddr, port)
 	fmt.Printf("  最大并发下载: %d / %d 运行\n", active, limit)
-	fmt.Printf("  访问令牌: %s\n", e.rt.ensureAPIToken())
-	if w := e.rt.systemProxyWarning(); w != "" {
+	fmt.Printf("  访问令牌: %s\n", maskToken(e.rt.ensureAPIToken()))
+	if w := platform.SystemProxyWarning(e.rt.getProxyAddr()); w != "" {
 		// 静默降级成直连必须说出来：用户以为走了代理、实际暴露真实 IP，
 		// 不提示的话排查时完全看不出问题在哪。
 		fmt.Printf("  [!] %s\n", w)
@@ -79,8 +114,9 @@ func (e *Engine) Start() error {
 	return nil
 }
 
-// Stop 优雅停机：进行中任务转暂停（保留断点）→ 状态落盘 → 关监听。
-// 幂等；不退出进程——进程退出由调用方（GUI 退出路径 / 无头模式的 Done 通道）决定。
+// Stop 优雅停机：进行中任务收尾（直播保存已录内容为正式文件，点播转暂停保留
+// 断点）→ 状态落盘 → 关监听。幂等；不退出进程——进程退出由调用方
+// （GUI 退出路径 / 无头模式的 Done 通道）决定。
 func (e *Engine) Stop() {
 	e.mu.Lock()
 	if !e.running {
@@ -93,7 +129,7 @@ func (e *Engine) Stop() {
 	e.mu.Unlock()
 
 	fmt.Println("[svc] 正在停止下载服务…")
-	e.rt.pauseAllTasks()
+	e.rt.stopOrPauseAllTasks()
 	if !e.rt.waitTasksSettled(3 * time.Second) {
 		// 超时：仍有 pipeline 没收尾。断点安全（persist 用的是"已落盘"计数，
 		// 见 swFlushBytes），但缓冲里可能还有没写出的小尾巴，提示一下。
@@ -130,6 +166,13 @@ func (e *Engine) Port() int {
 	return e.rt.configuredPort()
 }
 
+// EmbedKey 返回本引擎的内嵌豁免键：GUI 外壳把它拼进 iframe 地址，服务端据此
+// 放行外壳自己的嵌套（点击劫持防护的例外，理由见 auth.go 与 routeDef.frameGuard）。
+//
+// 同一 Engine 反复 Stop/Start 键不变（键在 newRuntime 时定型），因此"设置里改端口
+// → 托盘重启服务 → 外壳把 iframe 切到新地址"这条路径上不需要重新取键。
+func (e *Engine) EmbedKey() string { return e.rt.embedKey }
+
 // Done 在服务停止后可读（无头模式 select 它决定进程退出）。未 Start 过时为 nil。
 func (e *Engine) Done() <-chan struct{} {
 	e.mu.Lock()
@@ -137,10 +180,15 @@ func (e *Engine) Done() <-chan struct{} {
 	return e.done
 }
 
-// pauseAllTasks 把所有进行中/排队中的任务转为「已暂停」。
-// 与单个任务的 /pause 语义一致：intent=pause + cancel ctx，
-// pipeline 的 finishInterrupt 收尾并保留 .part 断点。
-func (r *Runtime) pauseAllTasks() {
+// stopOrPauseAllTasks 退出前把所有进行中/排队中的任务推向终态，按类型分流：
+//
+//   - 直播 → intentStop：结束录制并把已录部分收尾成正式文件。
+//     留一个"下次接着录"的直播半成品毫无意义——程序关掉的这段时间流还在走，
+//     下次接着录只会在产物中间留一个时间轴空洞。
+//   - 点播 → intentPause：断点是有意义的（下次接着下就是完整的），保留 .part。
+//
+// 与单个任务的 /stop、/pause 语义一致，收尾细节由 pipeline 的 finishInterrupt 处理。
+func (r *Runtime) stopOrPauseAllTasks() {
 	r.tasksMu.Lock()
 	entries := make([]*taskEntry, 0, len(r.tasks))
 	for _, te := range r.tasks {
@@ -154,15 +202,112 @@ func (r *Runtime) pauseAllTasks() {
 			continue
 		}
 		if te.intent == intentNone {
-			te.intent = intentPause
+			if te.st.live {
+				te.intent = intentStop
+				te.st.stage = "停止中"
+			} else {
+				te.intent = intentPause
+				te.st.stage = "暂停中"
+			}
 		}
-		te.st.stage = "暂停中"
 		cancel := te.cancel
 		te.mu.Unlock()
 		if cancel != nil {
 			cancel()
 		}
 	}
+}
+
+// salvageInterruptedLive 补偿收尾"上次进程被强杀时没来得及收尾"的直播任务。
+//
+// 正常退出走 stopOrPauseAllTasks → 收尾；但任务管理器强杀、断电这类场景里
+// 进程没有任何机会执行收尾，已录部分留在 .part 里，载入后任务停在
+// 「录制中断（程序退出）」等用户点「停止」。这里补做一次，让"直播中断必自动
+// 收尾"这条语义不留一个只能手动操作的口子。
+//
+// 三条约束：
+//   - **不阻塞启动**：调用方以 goroutine 启动；串行处理，每个任务只读 256KB
+//     样本头 + 一次 rename，开销与"用户并发下载"不在一个量级；
+//   - **失败保留 .part**：那可能是用户仅有的内容，删掉就是把他录的东西弄丢了；
+//   - **只碰直播**：点播的 .part 是断点（续传要用），rename 成成品就把断点吃掉了。
+func (r *Runtime) salvageInterruptedLive() {
+	r.tasksMu.Lock()
+	entries := make([]*taskEntry, 0, len(r.tasks))
+	for _, te := range r.tasks {
+		entries = append(entries, te)
+	}
+	r.tasksMu.Unlock()
+
+	for _, te := range entries {
+		// 单个任务出问题不能拖垮整轮补偿（收尾要解析用户磁盘上的文件，
+		// 内容不可控），所以逐个兜住 panic。
+		func() {
+			defer func() {
+				if rec := recover(); rec != nil {
+					fmt.Printf("[disk] WARN: 补偿收尾内部错误（已拦截）: %v\n", rec)
+				}
+			}()
+			r.salvageOneInterruptedLive(te)
+		}()
+	}
+}
+
+// salvageOneInterruptedLive 补偿收尾单个任务（不满足条件时静默跳过）。
+func (r *Runtime) salvageOneInterruptedLive(te *taskEntry) {
+	te.mu.Lock()
+	st := te.st
+	te.mu.Unlock()
+	if !st.live || st.done || st.canceled {
+		return
+	}
+
+	// 用户可能同时点「停止」收尾同一个任务（handleStop → finishStoppedTask）：
+	// 并发收尾会让后到者因 .part 已被改名而校验失败，把成功保存写成「失败」。
+	te.finalizeMu.Lock()
+	defer te.finalizeMu.Unlock()
+
+	// 拿锁期间可能已经被对方收尾完了——重新判一次终态。
+	if s := snapshot(te); s.done {
+		return
+	}
+
+	job := reopenJobForFinalize(te)
+	// part 在 reopen 之后取：finalPath 为空时 reopen 会按 saveDir+filename 拼回
+	// 并回写 te.st.finalPath，拿本函数开头的旧快照算会得到 ".part"，校验读不到、
+	// moveFile 必失败 —— 磁盘上完好的 .part 被判「保存失败」（评审自审 #8）。
+	te.mu.Lock()
+	part := te.st.finalPath + ".part"
+	te.mu.Unlock()
+	if job == nil || job.segFlushedNow() == 0 {
+		// 没有可保存的内容：.part 不存在/为空，或者**只写进了 init 段**。
+		//
+		// 这条判据必须与另外两条收尾路径一致 —— 故障中断（pipeline.go 的
+		// `job.live && job.segFlushedNow() > 0`）与用户停止（finishStop 的
+		// `job.segFlushedNow() == 0`）都是这么判的。只判"job != nil"（= .part
+		// 非空）会漏掉 init 段：init 一写进 .part，文件就非空了，于是 ~1KB 的
+		// 空壳被 rename 成成品、标成「录制中断 · 已保存」，而它播不出任何画面。
+		// 体量守卫在这里帮不上忙：reopen 重建的 job 没有 initLen，validateOutput
+		// 的 MinBytes 为 0（pipeline.go 的 MinBytes 与 container.go 的下限分支），
+		// 校验会直接放行。
+		//
+		// 但补偿收尾**不删 .part**（那可能是用户仅有的内容，见本文件三条约束），
+		// 也不把任务标成任何终态：让它留在「录制中断」，用户点「停止」时由
+		// finishStop 走"无内容"分支收尾 —— 删临时文件只发生在用户明确表态之后。
+		return
+	}
+	te.mu.Lock()
+	te.job = job
+	te.mu.Unlock()
+
+	// 校验器只看内容特征，不看播放列表：加密标志传 false 只会让判定更宽松
+	// （明文直接放行），不会把完好的文件误判成损坏。宁可漏判，不可误杀。
+	if err := finalizeRecording(te, job, part, finalizeInterrupted, "程序退出导致中断"); err != nil {
+		fmt.Printf("[disk] WARN: 直播任务 %s 的补偿收尾失败（.part 已保留）: %v\n", st.id, err)
+		failTask(te, "程序退出导致录制中断，且自动收尾失败: "+err.Error())
+		r.markDirty()
+		return
+	}
+	fmt.Printf("[disk] id=%s 已补偿收尾（上次退出时中断的录制）\n", st.id)
 }
 
 // waitTasksSettled 等所有任务脱离 running/queued（最多 max）。

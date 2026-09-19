@@ -27,7 +27,7 @@ const chrome = {
     },
   },
   runtime: { onMessage: noop, getURL: (p) => p, lastError: undefined },
-  tabs: { get() {}, create() {} },
+  tabs: { get() {}, create() {}, onRemoved: noop, query: async () => [] },
   declarativeNetRequest: {
     getDynamicRules: async () => [],
     updateDynamicRules: async () => {},

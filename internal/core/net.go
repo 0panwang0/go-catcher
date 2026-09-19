@@ -1,4 +1,4 @@
-// 网络层：uTLS 指纹 / 代理 CONNECT / HTTP client 与重试。
+// 网络层：TLS 指纹伪装 / 代理 CONNECT / HTTP client 与重试。
 package core
 
 import (
@@ -28,11 +28,19 @@ func (c *bufferedConn) Read(b []byte) (int, error) {
 	return c.r.Read(b)
 }
 
-// dialTLSContext: 连接 Clash 代理 → CONNECT 隧道 → uTLS 伪造 Chrome 指纹握手
-// 代理为空 / direct / none 时不走代理，直接连接（Clash 没开或访问国内资源时用）
+// dialTLSContext: 连接代理 → CONNECT 隧道 → TLS 指纹伪装握手
+// 代理为空 / direct / none 时不走代理，直接连接（无代理或访问国内资源时用）
 //
 // proxyAddr / sharedClient / netMu 均为 Runtime 字段（见 runtime.go），
 // 访问入口是方法 getProxyAddr / setProxyAddr / getClient。
+
+// proxyConnectTimeout 读取 CONNECT 响应的兜底超时。
+//
+// 为什么必须自己设：调用方的 ctx 只在 TCP Dial 那一步起作用，隧道一旦建立，
+// 卡住的就是 http.ReadResponse 那次读。代理 accept 之后不回响应（半死代理、
+// 假代理、被防火墙吞掉响应的链路）时，这次读会永久阻塞——任务永远停在
+// "连接中"，且不响应暂停/取消。
+const proxyConnectTimeout = 15 * time.Second
 
 // dialProxyTunnel 连上配置的代理并向 addr 建立 CONNECT 隧道。
 // 返回的 *bufferedConn 复用读取 CONNECT 响应时用的 bufio.Reader —— 响应之后
@@ -43,7 +51,7 @@ func (r *Runtime) dialProxyTunnel(ctx context.Context, addr string) (*bufferedCo
 		return nil, err
 	}
 
-	// 1. TCP 连接到 Clash 代理
+	// 1. TCP 连接到代理
 	conn, err := (&net.Dialer{Timeout: 30 * time.Second}).DialContext(ctx, "tcp", proxyURL.Host)
 	if err != nil {
 		return nil, fmt.Errorf("连接代理失败: %w", err)
@@ -56,12 +64,30 @@ func (r *Runtime) dialProxyTunnel(ctx context.Context, addr string) (*bufferedCo
 		return nil, fmt.Errorf("发送 CONNECT 失败: %w", err)
 	}
 
-	// 3. 读取 CONNECT 响应
+	// 3. 读取 CONNECT 响应：先设读超时，再读完清掉（见 proxyConnectTimeout）
+	readDeadline := time.Now().Add(proxyConnectTimeout)
+	if d, ok := ctx.Deadline(); ok && d.Before(readDeadline) {
+		readDeadline = d // 调用方给了更紧的期限就依它
+	}
+	if err := conn.SetReadDeadline(readDeadline); err != nil {
+		conn.Close()
+		return nil, fmt.Errorf("设置 CONNECT 读超时失败: %w", err)
+	}
 	br := bufio.NewReader(conn)
 	resp, err := http.ReadResponse(br, &http.Request{Method: "CONNECT"})
 	if err != nil {
 		conn.Close()
+		var ne net.Error
+		if errors.As(err, &ne) && ne.Timeout() {
+			return nil, fmt.Errorf("代理未在 %s 内回应 CONNECT: %w", proxyConnectTimeout, err)
+		}
 		return nil, fmt.Errorf("读取 CONNECT 响应失败: %w", err)
+	}
+	// 隧道已建立：必须清掉读超时。这条连接接着要承载 TLS 握手与整个下载，
+	// 留着 deadline 会在长时间无数据的传输中途由我们自己把连接掐断。
+	if err := conn.SetReadDeadline(time.Time{}); err != nil {
+		conn.Close()
+		return nil, fmt.Errorf("清除 CONNECT 读超时失败: %w", err)
 	}
 	if resp.StatusCode != http.StatusOK {
 		conn.Close()
@@ -93,27 +119,13 @@ func (r *Runtime) dialTLSContext(ctx context.Context, network, addr string) (net
 		return nil, err
 	}
 
-	// 4. uTLS 握手 — 伪造 Chrome 指纹
+	// 4. TLS 握手 — 伪造浏览器指纹
 	host, _, _ := net.SplitHostPort(addr)
 
-	uConn := utls.UClient(bConn, &utls.Config{
-		ServerName: host,
-	}, utls.HelloCustom)
-
-	// 获取 Chrome 指纹 spec，覆盖 ALPN 为 http/1.1 避免 HTTP/2 问题
-	spec, err := utls.UTLSIdToSpec(utls.HelloChrome_Auto)
+	uConn, err := newUTLSConn(bConn, host)
 	if err != nil {
 		bConn.Close()
-		return nil, fmt.Errorf("构建 TLS spec 失败: %w", err)
-	}
-	for _, ext := range spec.Extensions {
-		if alpn, ok := ext.(*utls.ALPNExtension); ok {
-			alpn.AlpnProtocols = []string{"http/1.1"}
-		}
-	}
-	if err := uConn.ApplyPreset(&spec); err != nil {
-		bConn.Close()
-		return nil, fmt.Errorf("应用 TLS spec 失败: %w", err)
+		return nil, err
 	}
 
 	if err := uConn.HandshakeContext(ctx); err != nil {
@@ -125,7 +137,7 @@ func (r *Runtime) dialTLSContext(ctx context.Context, network, addr string) (net
 }
 
 // effectiveProxy 返回本次连接实际使用的代理地址（空 = 直连）。
-// "system" 模式每次建连现读注册表：Clash 开关系统代理、改端口即时跟随。
+// "system" 模式每次建连现读注册表：系统代理开关、改端口即时跟随。
 func (r *Runtime) effectiveProxy() string {
 	p := strings.TrimSpace(r.getProxyAddr())
 	if strings.EqualFold(p, "system") {
@@ -145,7 +157,7 @@ func isDirectStr(p string) bool {
 	return p == "" || p == "direct" || p == "none" || p == "off"
 }
 
-// 不走代理时的直连 + uTLS 握手（指纹照旧伪造）
+// 不走代理时的直连 + 指纹伪装握手（指纹照旧伪造）
 
 func dialDirect(ctx context.Context, addr string) (net.Conn, error) {
 	conn, err := (&net.Dialer{Timeout: 30 * time.Second}).DialContext(ctx, "tcp", addr)
@@ -153,10 +165,43 @@ func dialDirect(ctx context.Context, addr string) (net.Conn, error) {
 		return nil, fmt.Errorf("直连失败: %w", err)
 	}
 	host, _, _ := net.SplitHostPort(addr)
-	uConn := utls.UClient(conn, &utls.Config{ServerName: host}, utls.HelloChrome_Auto)
+	uConn, err := newUTLSConn(conn, host)
+	if err != nil {
+		conn.Close()
+		return nil, err
+	}
 	if err := uConn.HandshakeContext(ctx); err != nil {
 		conn.Close()
 		return nil, fmt.Errorf("TLS 握手失败: %w", err)
+	}
+	return uConn, nil
+}
+
+// newUTLSConn 建立「伪造浏览器指纹」的 uTLS 连接，并把 ALPN 收窄为 http/1.1。
+//
+// 为什么必须收窄：Transport 自定义了 DialTLSContext（经代理与直连都走这里），
+// Go 不会为这类 Transport 启用 HTTP/2 —— 请求一律按 HTTP/1.1 编码。而
+// 所用指纹预设的 ALPN 是 ["h2","http/1.1"]，支持 h2 的 CDN 会选中 h2，
+// 服务器于是按 HTTP/2 回帧（SETTINGS/GOAWAY），Transport 侧抛
+// "malformed HTTP response" 加一串二进制 —— 真实错误被完全盖住。
+// 只声明 http/1.1，服务器就只能按 HTTP/1.1 应答。
+//
+// 两条拨号路径（经代理 / 直连）必须共用本函数：曾经直连路径直接用未收窄的
+// 指纹预设，某视频站点的 CDN 选中 h2 后表现为一堆乱码报错
+// （实测复现，见 net_alpn_test.go）。
+func newUTLSConn(conn net.Conn, serverName string) (*utls.UConn, error) {
+	spec, err := utls.UTLSIdToSpec(utls.HelloChrome_Auto)
+	if err != nil {
+		return nil, fmt.Errorf("构建 TLS spec 失败: %w", err)
+	}
+	for _, ext := range spec.Extensions {
+		if alpn, ok := ext.(*utls.ALPNExtension); ok {
+			alpn.AlpnProtocols = []string{"http/1.1"}
+		}
+	}
+	uConn := utls.UClient(conn, &utls.Config{ServerName: serverName}, utls.HelloCustom)
+	if err := uConn.ApplyPreset(&spec); err != nil {
+		return nil, fmt.Errorf("应用 TLS spec 失败: %w", err)
 	}
 	return uConn, nil
 }
@@ -166,12 +211,19 @@ func (r *Runtime) newRequest(target, ref string) (*http.Request, error) {
 	if err != nil {
 		return nil, err
 	}
-	// 伪造浏览器请求头。Origin 从 Referer 的同源推导（浏览器里真实播放时就是这么发的）；
-	// Referer 为空则不设 Origin。
+	// 伪造浏览器请求头。Origin 从 Referer 的同源推导（浏览器里真实播放时就是这么发的）。
+	//
+	// ref == "" 的语义是「浏览器对该 URL 根本没带 Referer 头」（页面声明 no-referrer
+	// 时就是这样），所以这里**整头不设**：真机上量过 —— 页面带
+	// `<meta name="referrer" content="no-referrer">` 时，Chrome 发往跨源子资源的请求
+	// 里连 referer 键都没有（对照组默认策略 3/3 带 Referer）；浏览器不发空值头，
+	// 我们也不发。无 Referer 也就没有 Origin。
 	req.Header.Set("User-Agent", r.userAgent)
-	req.Header.Set("Referer", ref)
-	if u, err := url.Parse(ref); err == nil && u.Scheme != "" && u.Host != "" {
-		req.Header.Set("Origin", u.Scheme+"://"+u.Host)
+	if ref != "" {
+		req.Header.Set("Referer", ref)
+		if u, err := url.Parse(ref); err == nil && u.Scheme != "" && u.Host != "" {
+			req.Header.Set("Origin", u.Scheme+"://"+u.Host)
+		}
 	}
 	req.Header.Set("Accept", "*/*")
 	req.Header.Set("Accept-Language", "zh-CN,zh;q=0.9,en;q=0.8")
@@ -218,18 +270,27 @@ func cleanURLParseErr(err error, target string) error {
 
 // 带重试的 HTTP GET
 
-func (r *Runtime) httpGetWithRetry(target, ref string) ([]byte, int, error) {
+func (r *Runtime) httpGetWithRetry(ctx context.Context, target, ref string) ([]byte, int, error) {
 	var lastErr error
 	var lastStatus int
 	for attempt := 1; attempt <= r.maxRetriesNow(); attempt++ {
+		if err := ctx.Err(); err != nil {
+			return nil, lastStatus, err
+		}
 		req, err := r.newRequest(target, ref)
 		if err != nil {
 			return nil, 0, cleanURLParseErr(err, target)
 		}
+		req = req.WithContext(ctx)
 		resp, err := r.getClient().Do(req)
 		if err != nil {
+			if ctx.Err() != nil {
+				return nil, lastStatus, ctx.Err()
+			}
 			lastErr = fmt.Errorf("attempt %d: %w", attempt, err)
-			time.Sleep(time.Duration(attempt*2) * time.Second)
+			if !sleepCtx(ctx, time.Duration(attempt*2)*time.Second) {
+				return nil, lastStatus, ctx.Err()
+			}
 			continue
 		}
 		if resp.StatusCode != http.StatusOK {
@@ -243,17 +304,24 @@ func (r *Runtime) httpGetWithRetry(target, ref string) ([]byte, int, error) {
 			}
 			resp.Body.Close()
 			lastErr = fmt.Errorf("attempt %d: HTTP %d", attempt, resp.StatusCode)
-			time.Sleep(time.Duration(attempt*2) * time.Second)
+			if !sleepCtx(ctx, time.Duration(attempt*2)*time.Second) {
+				return nil, lastStatus, ctx.Err()
+			}
 			continue
 		}
-		body, err := io.ReadAll(resp.Body)
+		// 读体带空闲超时（与分片下载同一套）：只设 ResponseHeaderTimeout 时，
+		// 服务端把响应头发完就停住会让读取永久挂住。
+		body, err := readAllWithIdleTimeout(resp.Body, transferIdleTimeout)
 		resp.Body.Close()
 		if err != nil {
 			lastErr = fmt.Errorf("attempt %d: read body: %w", attempt, err)
+			if ctx.Err() != nil {
+				return nil, lastStatus, ctx.Err()
+			}
 			continue
 		}
 		// 显式解压：Go 在请求未显式声明 Accept-Encoding 时会自动解压 gzip，
-		// 但自定义 Transport + uTLS 握手下个别 CDN 仍可能把压缩流原样返回。
+		// 但自定义 Transport + 指纹伪装握手下个别 CDN 仍可能把压缩流原样返回。
 		// 此处按 Content-Encoding 兜底（若 Go 已解压，该头会被移除，不会二次解压）。
 		if enc := resp.Header.Get("Content-Encoding"); strings.Contains(enc, "gzip") {
 			if gz, gerr := gzip.NewReader(bytes.NewReader(body)); gerr == nil {
@@ -288,24 +356,35 @@ func isM3U8Playlist(body []byte) bool {
 // httpGetPlaylist 获取 m3u8 播放列表；若响应是直链媒体文件（MP4 等），
 // 只读取开头一小段识别后即返回（isDirect=true），由上层改为流式整体下载，
 // 避免把整个大文件读进内存。文本播放列表则读完剩余部分一并返回。
-func (r *Runtime) httpGetPlaylist(target, ref string) (body []byte, isDirect bool, status int, err error) {
+func (r *Runtime) httpGetPlaylist(ctx context.Context, target, ref string) (body []byte, isDirect bool, status int, err error) {
 	const peekLen = 32 << 10 // 32KB：足够判断文本播放列表与二进制媒体头
 	var lastErr error
 	for attempt := 1; attempt <= r.maxRetriesNow(); attempt++ {
+		if err := ctx.Err(); err != nil {
+			return nil, false, 0, err
+		}
 		req, rerr := r.newRequest(target, ref)
 		if rerr != nil {
 			return nil, false, 0, cleanURLParseErr(rerr, target)
 		}
+		req = req.WithContext(ctx)
 		resp, rerr := r.getClient().Do(req)
 		if rerr != nil {
+			if ctx.Err() != nil {
+				return nil, false, 0, ctx.Err()
+			}
 			lastErr = fmt.Errorf("attempt %d: %w", attempt, rerr)
-			time.Sleep(time.Duration(attempt*2) * time.Second)
+			if !sleepCtx(ctx, time.Duration(attempt*2)*time.Second) {
+				return nil, false, 0, ctx.Err()
+			}
 			continue
 		}
 		if resp.StatusCode != http.StatusOK {
 			resp.Body.Close()
 			lastErr = fmt.Errorf("attempt %d: HTTP %d", attempt, resp.StatusCode)
-			time.Sleep(time.Duration(attempt*2) * time.Second)
+			if !sleepCtx(ctx, time.Duration(attempt*2)*time.Second) {
+				return nil, false, 0, ctx.Err()
+			}
 			continue
 		}
 
@@ -318,8 +397,10 @@ func (r *Runtime) httpGetPlaylist(target, ref string) (body []byte, isDirect boo
 				gz = nil // 解压失败就按原样读（极少见）
 			}
 		}
-		peek, rerr := io.ReadAll(io.LimitReader(rd, peekLen))
-		if rerr != nil {
+		// peek/rest 都带空闲超时，closer 恒为 resp.Body：gzip.Reader.Close 不关
+		// 底层连接，而空闲超时靠 Close 从另一 goroutine 中断阻塞读。
+		var peekBuf bytes.Buffer
+		if _, rerr = copyWithIdleTimeout(&peekBuf, limitReadCloser(rd, peekLen, resp.Body), transferIdleTimeout); rerr != nil {
 			if gz != nil {
 				gz.Close()
 			}
@@ -327,6 +408,7 @@ func (r *Runtime) httpGetPlaylist(target, ref string) (body []byte, isDirect boo
 			lastErr = fmt.Errorf("attempt %d: read body: %w", attempt, rerr)
 			continue
 		}
+		peek := peekBuf.Bytes()
 		if isDirectMediaFile(peek, resp.Header.Get("Content-Type")) {
 			if gz != nil {
 				gz.Close()
@@ -334,7 +416,7 @@ func (r *Runtime) httpGetPlaylist(target, ref string) (body []byte, isDirect boo
 			resp.Body.Close()
 			return peek, true, http.StatusOK, nil
 		}
-		rest, rerr := io.ReadAll(rd)
+		rest, rerr := readAllWithIdleTimeout(&limitedReadCloser{Reader: rd, Closer: resp.Body}, transferIdleTimeout)
 		if gz != nil {
 			gz.Close()
 		}
@@ -414,7 +496,7 @@ func (r *Runtime) getClient() *http.Client {
 				// 不走环境 HTTP(S)_PROXY——代理只由设置页 / --proxy 控制（经 DialTLSContext）
 				Proxy:                 nil,
 				DialContext:           r.dialContext,    // 明文 http://（Transport 不会为它调 DialTLSContext）
-				DialTLSContext:        r.dialTLSContext, // https:// 走 uTLS 指纹
+				DialTLSContext:        r.dialTLSContext, // https:// 走指纹伪装
 				MaxIdleConns:          200,
 				MaxIdleConnsPerHost:   50,
 				IdleConnTimeout:       90 * time.Second,
@@ -485,6 +567,38 @@ func readAllWithIdleTimeout(body io.ReadCloser, idle time.Duration) ([]byte, err
 		return nil, err
 	}
 	return buf.Bytes(), nil
+}
+
+// sleepCtx 可中断的退避等待：ctx 结束立刻返回 false，调用方据此提前退出，
+// 而不是把一轮最长数秒的 sleep 白等完（暂停/取消要等好几秒才生效）。
+func sleepCtx(ctx context.Context, d time.Duration) bool {
+	if d <= 0 {
+		return ctx.Err() == nil
+	}
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-t.C:
+		return true
+	}
+}
+
+// limitedReadCloser 限制读取上限，Close 作用于指定的 closer。
+//
+// 为什么不是 io.NopCloser(io.LimitReader(...))：copyWithIdleTimeout 靠 body.Close()
+// 从另一 goroutine 中断阻塞读（关闭后阻塞中的 Read 会立刻返回错误）。NopCloser 的
+// Close 是空操作，空闲超时会因此失效、连接卡死时读永久阻塞。closer 传底层
+// resp.Body 即可——即便上层套了 gzip.Reader，中断底层连接同样能让 gzip 读报错。
+type limitedReadCloser struct {
+	io.Reader
+	io.Closer
+}
+
+// limitReadCloser 把 r 截断为最多可读 n 字节，Close 关闭 closer。
+func limitReadCloser(r io.Reader, n int64, closer io.Closer) io.ReadCloser {
+	return &limitedReadCloser{Reader: io.LimitReader(r, n), Closer: closer}
 }
 
 // dlJob：单个下载任务的全部状态。同一时刻可存在多个 dlJob 并行跑。

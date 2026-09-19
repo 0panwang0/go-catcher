@@ -1,6 +1,6 @@
 // fMP4 init 段处理：确保 moov 声明 fragment 总时长（mehd）。
 //
-// B 站等直播平台的 init 段（#EXT-X-MAP）通常只有 ftyp+moov，moov 内
+// 直播平台的 init 段（#EXT-X-MAP）通常只有 ftyp+moov，moov 内
 // mvex 只带 trex 而没有 mehd（movie extends header）。播放器（如 Windows
 // Media Player）打开文件时无法预知总时长，只能按「直播流」处理：
 // 不显示结束时间、禁止拖动进度条。
@@ -15,13 +15,17 @@ package fmp4
 
 import (
 	"encoding/binary"
-	"fmt"
 	"math"
 	"os"
 	"strconv"
 )
 
 // fmp4InitInfo init 段解析结果：电影/轨道 timescale 与 mehd/mvhd 可写位置。
+//
+// ⚠️ mehdOff / mvhdOff 的"无"哨兵是 **-1，不是零值**：0 是合法偏移（box 就在文件
+// 开头）。所以这个结构体**不能靠 var info fmp4InitInfo 得到可用零值**，必须经
+// prepareInit（或 restore）构造——它俩都显式写 -1。手工构造时漏给 -1 的后果不是
+// 编译错误，而是回填时对一个不存在的位置做校验并打一堆 WARN。
 type fmp4InitInfo struct {
 	movieTS    uint32            // mvhd timescale（mehd duration 的单位）
 	trackTS    map[uint32]uint32 // trackID -> mdhd timescale
@@ -78,6 +82,20 @@ func bytesEqual(a, b []byte) bool {
 	return true
 }
 
+// mehdWide 读 mehd 的 version 位，并确认该盒声明的长度真的装得下 duration 字段。
+// 不可解析或长度不足时 ok=false（调用方按"没有可回填位置"处理）。
+func mehdWide(moov []byte, off int) (wide, ok bool) {
+	sz, _, _, bok := boxHeader(moov, off)
+	if !bok || !boxFitsWrite(sz, 12, 4) {
+		return false, false
+	}
+	w := moov[off+8] == 1
+	if !boxFitsWrite(sz, 12, durationWidth(w)) {
+		return false, false
+	}
+	return w, true
+}
+
 // patchMoov 检查 moov 内 mvex 是否含 mehd；无则插入占位 mehd。
 // 返回重建的 moov、mehd 在 moov 内的偏移（-1=无）以及 mehd 是否 64 位。
 func patchMoov(moov []byte, insert bool) ([]byte, int, bool) {
@@ -114,7 +132,12 @@ func patchMoov(moov []byte, insert bool) ([]byte, int, bool) {
 		q += sz
 	}
 	if mehdOff >= 0 {
-		wide := moov[mehdOff+8] == 1
+		// 畸形 mehd（声明长度装不下 version/duration 字段）当"没有可回填位置"处理：
+		// 不猜偏移，猜错会把时长写进别的 box 字段，静默损坏 init 段。
+		wide, ok := mehdWide(moov, mehdOff)
+		if !ok {
+			return moov, -1, false
+		}
 		return moov, mehdOff, wide
 	}
 	if !insert {
@@ -499,7 +522,9 @@ func backfillDurations(path string, info *fmp4InitInfo, n *normState) error {
 	defer f.Close()
 	if info.mehdOff >= 0 {
 		if !boxTypeAt(f, info.mehdOff, "mehd") {
-			fmt.Printf("[disk] WARN: mehd 回填位置校验失败（偏移 %d），跳过\n", info.mehdOff)
+			n.logDiagnostic("[disk] WARN: mehd 回填位置校验失败（偏移 %d），跳过", info.mehdOff)
+		} else if sz, ok := boxDeclaredSize(f, info.mehdOff); !ok || !boxFitsWrite(sz, 12, durationWidth(info.mehdWide)) {
+			n.logDiagnostic("[disk] WARN: mehd 声明长度装不下 duration 字段（偏移 %d），跳过", info.mehdOff)
 		} else if err := writeDuration(f, info.mehdOff+12, dur, info.mehdWide); err != nil {
 			return err
 		}
@@ -513,12 +538,38 @@ func backfillDurations(path string, info *fmp4InitInfo, n *normState) error {
 			off += 16 // v0：verflags(4)+creation(4)+modification(4)+timescale(4)
 		}
 		if !boxTypeAt(f, info.mvhdOff, "mvhd") {
-			fmt.Printf("[disk] WARN: mvhd 回填位置校验失败（偏移 %d），跳过\n", info.mvhdOff)
+			n.logDiagnostic("[disk] WARN: mvhd 回填位置校验失败（偏移 %d），跳过", info.mvhdOff)
+		} else if sz, ok := boxDeclaredSize(f, info.mvhdOff); !ok || !boxFitsWrite(sz, off-info.mvhdOff, durationWidth(info.mvhdWide)) {
+			n.logDiagnostic("[disk] WARN: mvhd 声明长度装不下 duration 字段（偏移 %d），跳过", info.mvhdOff)
 		} else if err := writeDuration(f, off, dur, info.mvhdWide); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+// durationWidth duration 字段的字节数（version 1 为 8 字节）。
+func durationWidth(wide bool) int {
+	if wide {
+		return 8
+	}
+	return 4
+}
+
+// boxFitsWrite 校验一个 box 声明的长度 sz 容得下 [at, at+n) 这段写入。
+// 回填前只校验类型不校验长度是不够的：声明长度不足的畸形盒会让时长写到盒外，
+// 破坏后面 box 的字节（boxTypeAt 注释里担心的正是这件事）。
+func boxFitsWrite(sz, at, n int) bool {
+	return sz >= 8 && at >= 0 && at+n <= sz
+}
+
+// boxDeclaredSize 读文件 off 处 box 的声明长度（类型校验由调用方负责）。
+func boxDeclaredSize(f *os.File, off int) (int, bool) {
+	var b [8]byte
+	if m, err := f.ReadAt(b[:], int64(off)); err != nil || m < 8 {
+		return 0, false
+	}
+	return int(binary.BigEndian.Uint32(b[:])), true
 }
 
 // boxTypeAt 校验文件 off 处确实是指定类型的 box（读 size+type 头）。

@@ -6,11 +6,12 @@ package core
 import (
 	"context"
 	"encoding/json"
-	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
+
+	"github.com/0panwang0/go-catcher/internal/platform"
 )
 
 // ============================================================
@@ -124,7 +125,7 @@ func defaultConfig() appConfig {
 		MaxRetries:     3,
 		Port:           DefaultPort,
 		UIView:         "detail",
-		Proxy:          "system", // 跟随 Windows 系统代理（Clash 等开箱即用），与包级默认一致
+		Proxy:          "system", // 跟随 Windows 系统代理，与包级默认一致
 	}
 }
 
@@ -143,6 +144,14 @@ func defaultConfig() appConfig {
 // concurrencyNow / maxRetriesNow 是下载热路径的读取入口（无锁）。
 func (r *Runtime) concurrencyNow() int { return int(r.segConcurrency.Load()) }
 func (r *Runtime) maxRetriesNow() int  { return int(r.retryLimit.Load()) }
+
+// chunkSizeNow 本次直链分片使用的片长（0 视为默认，测试可调小）。
+func (r *Runtime) chunkSizeNow() int64 {
+	if r.chunkSizeBytes > 0 {
+		return r.chunkSizeBytes
+	}
+	return chunkSizeFixed
+}
 
 // setDownloadTuning 写入运行时下载调参。CLI 初始化与 /config 热更新都走这里。
 // conc<=0 表示不改分片并发；retries<0 表示不改重试次数（CLI 未暴露该参数）。
@@ -193,7 +202,7 @@ func (r *Runtime) loadConfig() {
 			fileC.Proxy = strings.TrimSpace(fileC.Proxy)
 			if strings.EqualFold(fileC.Proxy, "system") {
 				fileC.Proxy = "system"
-			} else if fileC.Proxy == "" || (!isDirectStr(fileC.Proxy) && !validProxyAddr(fileC.Proxy)) {
+			} else if fileC.Proxy == "" || (!isDirectStr(fileC.Proxy) && !platform.ValidProxyAddr(fileC.Proxy)) {
 				fileC.Proxy = c.Proxy
 			}
 			c = fileC
@@ -203,7 +212,12 @@ func (r *Runtime) loadConfig() {
 	r.applyConfigLocked() // 无论默认还是读盘，都写入限制器与运行时变量
 }
 
-// clamp 把 v 约束到 [lo,hi]，越界返回 true（表示需采用默认）
+// clamp 把 v 夹取到 [lo,hi]，并报告原值是否本来就合法：
+// 返回 true = 原值落在区间内（v 未被改动）；false = 越界、已夹到边界。
+//
+// 调用方一律按 !clamp(...) 识别"给的值越界了"（见 /config 的 clamped 提示）。
+// 返回值**与"是否采用默认值"无关**：两条调用路径都是夹取而非回退默认
+// （读盘见 loadConfig，端口/uiView 那两处才是回退默认，故不走本函数）。
 func clamp(v *int, lo, hi int) bool {
 	ok := true
 	if *v < lo {
@@ -215,13 +229,6 @@ func clamp(v *int, lo, hi int) bool {
 		ok = false
 	}
 	return ok
-}
-
-// validProxyAddr 校验代理地址：仅支持 http://host[:port]（dialTLSContext 走
-// HTTP CONNECT 隧道，socks5/https 代理无法工作）。
-func validProxyAddr(p string) bool {
-	u, err := url.Parse(p)
-	return err == nil && u.Scheme == "http" && u.Host != ""
 }
 
 // applyConfigLocked 把 cfg 写入运行时变量（调用方须持 cfgMu）。

@@ -69,16 +69,17 @@ func TestNormStateInterfaceRoundTrip(t *testing.T) {
 	}
 }
 
-// TestNormStateRestoreTolerant Restore 对空/损坏/非法键/坏 init 一律静默忽略。
+// TestNormStateRestoreTolerant Restore 对空/损坏/非法键/坏 init 一律静默忽略，
+// 版本不符（含旧格式的无 v 字节）整份丢弃。
 func TestNormStateRestoreTolerant(t *testing.T) {
 	st := NewState()
-	st.Restore(nil)                                     // 空字节
-	st.Restore([]byte("{broken"))                       // 非 JSON
-	st.Restore([]byte(`{"baseline":{"abc":1,"1":50}}`)) // 非法键忽略、合法键生效
+	st.Restore(nil)                                           // 空字节
+	st.Restore([]byte("{broken"))                             // 非 JSON
+	st.Restore([]byte(`{"v":1,"baseline":{"abc":1,"1":50}}`)) // 非法键忽略、合法键生效
 	if st.baselineStrings()["1"] != 50 {
 		t.Fatalf("非法键应忽略、合法键生效: %v", st.baselineStrings())
 	}
-	st.Restore([]byte(`{"baseline":{"1":60},"init":"not-an-object"}`)) // 坏 init 忽略
+	st.Restore([]byte(`{"v":1,"baseline":{"1":60},"init":"not-an-object"}`)) // 坏 init 忽略
 	if st.init != nil {
 		t.Fatal("坏 init 字节不应被恢复")
 	}
@@ -92,6 +93,50 @@ func TestNormStateRestoreTolerant(t *testing.T) {
 	infos, _ := parseMoof(moofs[0], 0)
 	if v := binary.BigEndian.Uint32(moofs[0][infos[0].tfdtOff:]); v != 940 {
 		t.Fatalf("容错后 tfdt=%d want 940", v)
+	}
+}
+
+// TestNormStateRestoreRejectsUnknownVersion 快照版本不匹配时整份丢弃。
+//
+// 快照里是回填偏移与 tfdt 基准：按错结构解读不会报错，只会写出"能播但时间轴坏"
+// 的成品。所以宁可让续传基准重算（时间轴可能跳变），也不接受尽力解析。
+func TestNormStateRestoreRejectsUnknownVersion(t *testing.T) {
+	// 旧格式：没有 v 字段（V 解码为 0）
+	stOld := NewState()
+	stOld.Restore([]byte(`{"baseline":{"1":70},"end":{"1":18000}}`))
+	if got := stOld.baselineStrings(); len(got) != 0 {
+		t.Fatalf("无版本号的旧格式快照应被丢弃，实际恢复了 %v", got)
+	}
+	if got := stOld.endSnapshot(); len(got) != 0 {
+		t.Fatalf("旧格式快照的 end 也应被丢弃，实际恢复了 %v", got)
+	}
+
+	// 未来版本：结构可能已变，同样不认
+	stFuture := NewState()
+	stFuture.Restore([]byte(`{"v":99,"baseline":{"1":70}}`))
+	if got := stFuture.baselineStrings(); len(got) != 0 {
+		t.Fatalf("未知版本快照应被丢弃，实际恢复了 %v", got)
+	}
+}
+
+// TestRestoreFalseLeavesStateUntouched Restore 返回 false 时状态必须未被改动。
+//
+// false 的合同是「这份快照没被采纳」。三支拒绝（空字节 / 损坏 / 版本不符）原本
+// 都在写入前返回，唯独「有版本号但无 baseline」（init-only 快照）先写 end/init
+// 再返回 false —— 调用方（restoreContainer）按合同把 false 当"未采纳"处理，
+// 对象却被污染了。现在无 baseline 在写入前就拒绝。
+// 扰动点：把 Restore 里 `len(p.Baseline) == 0` 的提前返回删掉，本条会红。
+func TestRestoreFalseLeavesStateUntouched(t *testing.T) {
+	st := NewState()
+	// init-only 快照：有 v、只有 end、没有 baseline（真机形态是只带 init，同构）
+	if st.Restore([]byte(`{"v":1,"end":{"1":18000}}`)) {
+		t.Fatal("无 baseline 的快照应被拒绝（续传会让新分片从头计时）")
+	}
+	if got := st.endSnapshot(); len(got) != 0 {
+		t.Fatalf("Restore=false 却写入了 end: %v（违反「false ⇒ 未改动」合同）", got)
+	}
+	if got := st.baselineStrings(); len(got) != 0 {
+		t.Fatalf("Restore=false 却写入了 baseline: %v", got)
 	}
 }
 
@@ -113,6 +158,9 @@ func TestNormStateSnapshotIncludesInit(t *testing.T) {
 	var p normPersist
 	if err := json.Unmarshal(snap, &p); err != nil {
 		t.Fatalf("snapshot 非 JSON: %v", err)
+	}
+	if p.V != normPersistVersion {
+		t.Fatalf("snapshot 必须带当前版本号: got %d want %d", p.V, normPersistVersion)
 	}
 	if len(p.Init) == 0 {
 		t.Fatal("snapshot 应包含 init 解析结果")

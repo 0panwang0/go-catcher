@@ -10,7 +10,7 @@
   body{
     font-family:"Segoe UI Variable","Segoe UI","Microsoft YaHei UI","Microsoft YaHei",-apple-system,Roboto,sans-serif;
     background:var(--bg);color:var(--txt);
-    min-height:100vh;padding:28px 20px 80px;
+    min-height:100vh;padding:0 20px 40px;
     font-feature-settings:"ss01","cv02";
     -webkit-font-smoothing:antialiased;
     -moz-osx-font-smoothing:grayscale;
@@ -24,10 +24,13 @@
   *{scrollbar-color:#334155 transparent;scrollbar-width:thin}
   .wrap{max-width:640px;margin:0 auto}
 
-  .top{display:flex;align-items:center;gap:12px;margin-bottom:6px}
-  .top h1{font-size:20px}
+  /* 顶部操作条：返回与保存同排，滚动时吸附在窗口顶部常驻。
+     原来是「返回在最上、保存在最下」，内容一长就得先滚到底才能点保存。 */
+  .top{position:sticky;top:0;z-index:10;display:flex;align-items:center;justify-content:space-between;
+       gap:12px;padding:18px 0 14px;margin-bottom:18px;background:var(--bg);border-bottom:1px solid var(--line)}
+  h1{font-size:20px;margin-bottom:6px}
   .back{display:inline-flex;align-items:center;gap:6px;background:transparent;border:1px solid var(--line);
-        color:var(--muted);border-radius:9px;padding:6px 12px;font-size:13px;cursor:pointer;transition:all .15s}
+        color:var(--muted);border-radius:9px;padding:7px 12px;font-size:13px;cursor:pointer;transition:all .15s}
   .back:hover{color:var(--txt);border-color:#64748b}
   .sub{color:var(--muted);font-size:13px;margin-bottom:20px}
 
@@ -42,8 +45,19 @@
   .field input{width:100%;background:#0b1220;border:1px solid var(--line);color:var(--txt);
                border-radius:8px;padding:9px 12px;font-size:14px;box-sizing:border-box}
   .field input:focus{outline:none;border-color:#3b82f6}
+
+  /* 数值输入只留输入框本身：浏览器原生 spinner 是块浅色方框、不随主题变色，隐藏掉；
+     数值直接键入（曾试过自绘 − / + 步进器，与页面风格不搭，已移除）。 */
+  .field input[type=number]{-moz-appearance:textfield;appearance:textfield}
+  .field input[type=number]::-webkit-outer-spin-button,
+  .field input[type=number]::-webkit-inner-spin-button{-webkit-appearance:none;margin:0}
   .field .desc{color:var(--muted);font-size:12px;line-height:1.6;margin-top:6px}
   .field .desc em{font-style:normal;color:#7dd3fc}
+  /* 系统代理不可用时的字段内警示（琥珀，与页脚 .note 同色系）：
+     「跟随系统」静默降级成直连必须看得见，否则用户以为走了代理、其实暴露真实 IP。 */
+  .field .desc.warnhint{display:flex;gap:8px;align-items:flex-start;
+        background:rgba(245,158,11,.08);border:1px solid rgba(245,158,11,.35);
+        border-radius:8px;padding:8px 11px;color:#fcd34d;font-size:12px;line-height:1.65}
 
   .segrow{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap}
   .segrow .lb{font-size:13px;font-weight:600}
@@ -58,9 +72,8 @@
         color:#fcd34d;font-size:12.5px;line-height:1.7}
   .note b{font-weight:600}
 
-  .savebar{display:flex;align-items:center;justify-content:flex-end;gap:12px;margin-top:6px}
-  button.save{background:#3b82f6;color:#fff;border:none;padding:9px 26px;border-radius:9px;font-size:13.5px;
-              font-weight:600;cursor:pointer;transition:filter .15s}
+  button.save{background:#3b82f6;color:#fff;border:none;padding:8px 22px;border-radius:9px;font-size:13.5px;
+              font-weight:600;cursor:pointer;transition:filter .15s;flex:none}
   button.save:hover{filter:brightness(1.15)}
 
   #toast{position:fixed;left:50%;bottom:22px;transform:translateX(-50%);z-index:999;
@@ -75,9 +88,12 @@
 <body>
 <div class="wrap">
   <div class="top">
-    <button class="back" onclick="location.href='/'">← 返回监控</button>
-    <h1>下载设置</h1>
+    <!-- 带上 location.search：本页在 GUI 客户端里是嵌在外壳 iframe 中的，
+         监控页/设置页默认发 X-Frame-Options: DENY，不带键的框架内跳转会被拦成白屏 -->
+    <button class="back" onclick="location.href='/'+location.search">← 返回监控</button>
+    <button class="save" onclick="save()">保存</button>
   </div>
+  <h1>下载设置</h1>
   <div class="sub">调整后立即生效，无需重启；正在下载的不受影响，新任务按新配置调度。</div>
 
   <div class="card">
@@ -110,8 +126,8 @@
     </div>
     <div class="field" id="proxyaddr" style="display:none">
       <label><b>代理地址</b><span>http://host:port</span></label>
-      <input id="f_proxy" type="text" placeholder="http://127.0.0.1:7890" spellcheck="false">
-      <div class="desc">HTTP 代理（CONNECT 隧道），如 Clash 默认 <em>http://127.0.0.1:7890</em>。保存后所有新请求（含进行中任务的后续分片）立即走新代理，正在传输的请求在旧代理收尾。</div>
+      <input id="f_proxy" type="text" placeholder="http://127.0.0.1:8080" spellcheck="false">
+      <div class="desc">HTTP 代理（CONNECT 隧道），例如 <em>http://127.0.0.1:8080</em>。保存后所有新请求（含进行中任务的后续分片）立即走新代理，正在传输的请求在旧代理收尾。</div>
     </div>
   </div>
 
@@ -128,10 +144,6 @@
   <div class="note">
     <span>⚠</span>
     <span><b>改动端口需重启服务生效</b>：托盘右键「启动 / 停止服务」切换一次，或重启客户端；浏览器扩展需同步改为新端口。</span>
-  </div>
-
-  <div class="savebar">
-    <button class="save" onclick="save()">保存</button>
   </div>
 </div>
 <div id="toast"></div>
@@ -160,13 +172,36 @@ el('viewseg').addEventListener('click', function(e){
 });
 // —— 代理模式（跟随系统 / 直连 / 手动）——
 var proxyMode = 'system';
+var sysProxyAddr = '';  // 服务端读到的系统代理（空 = 没读到可用的）
+var sysProxyWarn = '';  // 系统代理启用了但协议不受支持时的说明（空 = 无话可说）
 function syncProxySeg(){
   var bs = el('proxyseg').querySelectorAll('button');
   for (var i=0;i<bs.length;i++) bs[i].className = (bs[i].getAttribute('data-v')===proxyMode) ? 'on' : '';
   el('proxyaddr').style.display = (proxyMode === 'manual') ? '' : 'none';
+  syncSysHint();
 }
-function syncSysHint(sysProxy){
-  el('syshint').textContent = '';
+// 提示只在「跟随系统」下出现：另两种模式走哪儿由代理地址栏自己说明，再加一行是噪音。
+// 文案一律经 textContent / createElement 落 DOM——注册表里的 ProxyServer 是不可信
+// 输入，拼 innerHTML 等于给自己挖 XSS。
+function syncSysHint(){
+  var h = el('syshint');
+  h.className = 'desc';
+  h.textContent = '';
+  if (proxyMode !== 'system') return;
+  if (sysProxyWarn){
+    h.className = 'desc warnhint';
+    var ic = document.createElement('span'); ic.textContent = '⚠';
+    var tx = document.createElement('span'); tx.textContent = sysProxyWarn;
+    h.appendChild(ic); h.appendChild(tx);
+    return;
+  }
+  if (!sysProxyAddr){
+    h.textContent = '跟随系统：系统未启用代理，当前等价于直连';
+    return;
+  }
+  h.appendChild(document.createTextNode('跟随系统：当前系统代理 '));
+  var a = document.createElement('em'); a.textContent = sysProxyAddr;
+  h.appendChild(a);
 }
 el('proxyseg').addEventListener('click', function(e){
   var b = e.target.closest('button');
@@ -189,8 +224,9 @@ async function load(){
     el('f_port').value = d.port;
     el('f_proxy').value = (proxyModeOf(d.proxy) === 'manual') ? d.proxy : '';
     proxyMode = proxyModeOf(d.proxy);
+    sysProxyAddr = d.systemProxy || '';
+    sysProxyWarn = d.systemProxyWarning || '';
     syncProxySeg();
-    syncSysHint(d.systemProxy || '');
     segVal = (d.uiView === 'compact') ? 'compact' : 'detail';
     syncSeg(segVal);
   }catch(e){ toast('无法读取服务端配置', true); }
@@ -228,7 +264,8 @@ async function save(){
     }else{
       toast('设置已保存并生效');
     }
-    setTimeout(function(){ location.href = '/'; }, 800);
+    // 同上方「返回监控」：框架内跳转必须带着 location.search，否则被 DENY 拦成白屏
+    setTimeout(function(){ location.href = '/'+location.search; }, 800);
   }catch(e){ toast('保存失败：'+e.message, true); }
 }
 load();

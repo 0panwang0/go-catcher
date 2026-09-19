@@ -28,12 +28,76 @@ var __m3u8catcher = (() => {
   var MAX_SNIFF_AGE_MS = 7 * 24 * 60 * 60 * 1e3;
 
   // src/background/list-store.js
+  var LIST_KEYS = ["m3u8_list", "mp4_list"];
   var storageWriteChain = Promise.resolve();
+  var listCache = null;
+  var dirtyKeys = /* @__PURE__ */ new Set();
+  var flushing = false;
+  var queued = 0;
+  async function loadLists() {
+    if (!listCache) {
+      const got = await chrome.storage.local.get(LIST_KEYS);
+      listCache = {};
+      for (const k of LIST_KEYS) {
+        listCache[k] = Array.isArray(got[k]) ? got[k] : [];
+      }
+    }
+    return listCache;
+  }
+  async function readLists() {
+    const c = await loadLists();
+    return { m3u8_list: c.m3u8_list.slice(), mp4_list: c.mp4_list.slice() };
+  }
+  function resetListCache() {
+    listCache = null;
+    dirtyKeys.clear();
+  }
+  function updateBadge() {
+    if (!listCache) return;
+    const n = listCache.m3u8_list.length;
+    chrome.action.setBadgeText({ text: n ? String(n) : "" });
+    chrome.action.setBadgeBackgroundColor({ color: "#e74c3c" });
+  }
+  function flushDirty() {
+    if (flushing || !dirtyKeys.size) return Promise.resolve();
+    flushing = true;
+    const keys = [...dirtyKeys];
+    dirtyKeys.clear();
+    const patch = {};
+    for (const k of keys) patch[k] = listCache[k];
+    return chrome.storage.local.set(patch).then(
+      () => {
+        flushing = false;
+        if (keys.includes("m3u8_list")) updateBadge();
+        if (dirtyKeys.size) return flushDirty();
+      },
+      (e) => {
+        flushing = false;
+        for (const k of keys) dirtyKeys.add(k);
+        throw e;
+      }
+    );
+  }
   function withListLock(fn) {
+    queued++;
     const run = storageWriteChain.then(fn, fn);
     storageWriteChain = run.catch(() => {
     });
-    return run;
+    const settle = async (v) => {
+      queued--;
+      if (queued === 0) {
+        try {
+          await flushDirty();
+        } catch (e) {
+          console.error("[M3U8 Video Catcher] \u55C5\u63A2\u5217\u8868\u843D\u76D8\u5931\u8D25\uFF08\u5DF2\u4FDD\u7559\u5F85\u91CD\u8BD5\uFF09:", e);
+          throw e;
+        }
+      }
+      return v;
+    };
+    return run.then(settle, (e) => settle(void 0).then(() => {
+      throw e;
+    }));
   }
   function pickEvictionIndex(list, currentTabId) {
     let pick = -1;
@@ -58,8 +122,8 @@ var __m3u8catcher = (() => {
   function recordMedia(url, pageUrl, frameUrl, title, type, size = 0, tabId = null) {
     const key = type === "mp4" ? "mp4_list" : "m3u8_list";
     return withListLock(async () => {
-      const { [key]: stored = [] } = await chrome.storage.local.get(key);
-      const list = pruneExpired(stored);
+      const cache2 = await loadLists();
+      const list = pruneExpired(cache2[key]);
       const existing = list.find((it) => it.url === url);
       if (existing) {
         existing.pageUrl = pageUrl || existing.pageUrl;
@@ -86,25 +150,33 @@ var __m3u8catcher = (() => {
           list.splice(idx, 1);
         }
       }
-      await chrome.storage.local.set({ [key]: list });
-      if (type === "m3u8") {
-        chrome.action.setBadgeText({ text: String(list.length) });
-        chrome.action.setBadgeBackgroundColor({ color: "#e74c3c" });
-      }
+      cache2[key] = list;
+      dirtyKeys.add(key);
+    }).catch(() => {
     });
   }
   function updateMediaItem(key, url, patch) {
+    if (!LIST_KEYS.includes(key)) {
+      return Promise.resolve({ ok: false, error: `\u672A\u77E5\u5217\u8868 ${key}` });
+    }
     return withListLock(async () => {
-      const { [key]: list = [] } = await chrome.storage.local.get(key);
+      const cache2 = await loadLists();
+      const list = cache2[key];
       const cur = list.find((it) => it.url === url);
       if (!cur) return { ok: false, error: "\u8BB0\u5F55\u5DF2\u4E0D\u5B58\u5728" };
       Object.assign(cur, patch || {});
-      await chrome.storage.local.set({ [key]: list });
+      dirtyKeys.add(key);
       return { ok: true };
     });
   }
   function clearLists() {
-    return withListLock(() => chrome.storage.local.set({ m3u8_list: [], mp4_list: [] }));
+    return withListLock(async () => {
+      const cache2 = await loadLists();
+      cache2.m3u8_list = [];
+      cache2.mp4_list = [];
+      dirtyKeys.add("m3u8_list");
+      dirtyKeys.add("mp4_list");
+    });
   }
 
   // src/background/sniff-probes.js
@@ -125,7 +197,7 @@ var __m3u8catcher = (() => {
     },
     {
       name: "webRequest-mp4",
-      // MP4 直链（IDM 也常提供 MP4 格式选项）
+      // MP4 直链通道
       install() {
         chrome.webRequest.onCompleted.addListener(
           (details) => {
@@ -209,91 +281,15 @@ var __m3u8catcher = (() => {
   }
 
   // src/background/m3u8-parse.js
-  function sleep(ms) {
-    return new Promise((r) => setTimeout(r, ms));
-  }
-  async function fetchText(url) {
-    for (let a = 1; a <= 3; a++) {
-      try {
-        const resp = await fetch(url, { credentials: "omit" });
-        if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
-        return await resp.text();
-      } catch (e) {
-        if (a === 3) throw e;
-        await sleep(500 * a);
-      }
-    }
-  }
-  function parseDuration(text) {
-    let total = 0;
-    for (const m of text.matchAll(/#EXTINF:([\d.]+)/g)) {
-      total += parseFloat(m[1]);
-    }
-    return total;
-  }
-  function parseSegments(text, baseURL) {
-    const list = [];
-    for (const raw of text.split("\n")) {
-      const line = raw.trim();
-      if (!line || line.startsWith("#")) continue;
-      list.push(new URL(line, baseURL).href);
-    }
-    return list;
-  }
-  function parseVariants(text, baseURL) {
-    const lines = text.split("\n");
-    const list = [];
-    for (let i = 0; i < lines.length; i++) {
-      if (!lines[i].startsWith("#EXT-X-STREAM-INF")) continue;
-      const info = lines[i];
-      const next = (lines[i + 1] || "").trim();
-      if (!next || next.startsWith("#")) continue;
-      const bw = parseInt((info.match(/BANDWIDTH=(\d+)/) || [])[1] || "0", 10);
-      const res = (info.match(/RESOLUTION=(\d+x\d+)/) || [])[1] || "";
-      list.push({
-        url: new URL(next, baseURL).href,
-        bandwidth: bw,
-        resolution: res,
-        label: variantLabel(res, bw, next)
-      });
-    }
-    list.sort((a, b) => b.bandwidth - a.bandwidth);
-    return list;
-  }
-  function variantLabel(resolution, bandwidth, uri) {
-    let q = "";
-    const m = String(uri).match(/(2160p|1440p|1080p|720p|480p|360p|240p)/i);
-    if (m) {
-      q = m[1].toUpperCase();
-    } else if (resolution) {
-      const h = parseInt(resolution.split("x")[1], 10);
-      q = {
-        2160: "4K",
-        1440: "2K",
-        1080: "1080P",
-        720: "720P",
-        480: "480P",
-        360: "360P",
-        240: "240P"
-      }[h] || resolution;
-    } else if (bandwidth) {
-      q = (bandwidth / 1e6).toFixed(1) + " Mbps";
-    }
-    const parts = [q || "\u672A\u77E5\u753B\u8D28"];
-    if (resolution) parts.push(resolution);
-    if (bandwidth) parts.push(`${(bandwidth / 1e3).toFixed(0)} kbps`);
-    return parts.join(" \xB7 ");
-  }
-  function shortQuality(variant) {
-    return String(variant.label || "").split(" \xB7 ")[0] || "";
-  }
   function qualityFromURL(u) {
+    if (!u) return "";
     try {
-      const m = decodeURIComponent(new URL(u).pathname).match(
+      const p = new URL(u);
+      const m = decodeURIComponent(p.pathname).match(
         /(2160p|1440p|1080p|720p|480p|360p|240p)/i
       );
       if (m) return m[1].toUpperCase();
-      const q = new URL(u).searchParams.get("quality");
+      const q = p.searchParams.get("quality");
       if (q) return q;
     } catch {
     }
@@ -322,6 +318,16 @@ var __m3u8catcher = (() => {
     return (b.time || 0) - (a.time || 0);
   }
 
+  // src/background/media-url.js
+  function isCandidateURL(u) {
+    try {
+      const p = new URL(u);
+      return /\.(m3u8|mp4)$/i.test(p.pathname) || !p.searchParams.has("url");
+    } catch {
+      return false;
+    }
+  }
+
   // src/background/page-match.js
   function hostOf(u) {
     try {
@@ -330,27 +336,16 @@ var __m3u8catcher = (() => {
       return "";
     }
   }
-  function sameSite2(it, pageUrl) {
+  function sameSite(it, pageUrl) {
     if (!it.pageUrl || !pageUrl) return false;
     const h = hostOf(pageUrl);
     if (!h) return false;
     return hostOf(it.pageUrl) === h || hostOf(it.frameUrl) === h;
   }
-  function isCandidateURL2(u) {
-    try {
-      const p = new URL(u);
-      return /\.(m3u8|mp4)$/i.test(p.pathname) || !p.searchParams.has("url");
-    } catch {
-      return false;
-    }
-  }
   async function hostCandidates(pageUrl) {
-    const { m3u8_list = [], mp4_list = [] } = await chrome.storage.local.get([
-      "m3u8_list",
-      "mp4_list"
-    ]);
-    const hostM3U8 = m3u8_list.filter((it) => sameSite2(it, pageUrl) && isCandidateURL2(it.url));
-    const hostMP4 = mp4_list.filter((it) => sameSite2(it, pageUrl) && isCandidateURL2(it.url));
+    const { m3u8_list, mp4_list } = await readLists();
+    const hostM3U8 = m3u8_list.filter((it) => sameSite(it, pageUrl) && isCandidateURL(it.url));
+    const hostMP4 = mp4_list.filter((it) => sameSite(it, pageUrl) && isCandidateURL(it.url));
     hostM3U8.sort(masterFirst);
     hostMP4.sort(masterFirst);
     return { hostM3U8, hostMP4 };
@@ -363,28 +358,42 @@ var __m3u8catcher = (() => {
     if (frameM3U8.length || frameMP4.length) {
       return { hostM3U8: frameM3U8, hostMP4: frameMP4 };
     }
-    const samePath = (it) => {
-      if (!it.pageUrl || !pageUrl) return false;
-      try {
-        return new URL(it.pageUrl).pathname === new URL(pageUrl).pathname;
-      } catch {
-        return false;
-      }
+    const samePath = (it) => isSamePageURL(it.pageUrl, pageUrl);
+    return { hostM3U8: hostM3U8.filter(samePath), hostMP4: hostMP4.filter(samePath) };
+  }
+  async function listCandidates(pageUrl) {
+    const { hostM3U8, hostMP4 } = await hostCandidates(pageUrl);
+    const h = hostOf(pageUrl);
+    const keep = (it) => {
+      if (it.frameUrl && it.frameUrl === pageUrl) return true;
+      if (h && it.frameUrl && hostOf(it.frameUrl) === h) return true;
+      return isSamePageURL(it.pageUrl, pageUrl);
     };
-    const pageM3U8 = hostM3U8.filter(samePath);
-    const pageMP4 = hostMP4.filter(samePath);
-    if (pageM3U8.length || pageMP4.length) {
-      return { hostM3U8: pageM3U8, hostMP4: pageMP4 };
+    return { hostM3U8: hostM3U8.filter(keep), hostMP4: hostMP4.filter(keep) };
+  }
+  async function uniqueTabCandidate(tabUrl) {
+    if (!tabUrl) return null;
+    const { hostM3U8, hostMP4 } = await pageCandidates(tabUrl);
+    const all = [...hostM3U8, ...hostMP4];
+    return all.length === 1 ? all[0] : null;
+  }
+  function isSamePageURL(a, b) {
+    if (!a || !b) return false;
+    try {
+      const ua = new URL(a);
+      const ub = new URL(b);
+      return ua.hostname === ub.hostname && normalizePath(ua.pathname) === normalizePath(ub.pathname);
+    } catch {
+      return false;
     }
-    return { hostM3U8, hostMP4 };
+  }
+  function normalizePath(p) {
+    return p.replace(/\/+$/, "") || "/";
   }
   async function findSniffedByURL(target) {
     if (!target) return null;
-    const { m3u8_list = [], mp4_list = [] } = await chrome.storage.local.get([
-      "m3u8_list",
-      "mp4_list"
-    ]);
-    const all = [...m3u8_list, ...mp4_list].filter((it) => isCandidateURL2(it.url));
+    const { m3u8_list, mp4_list } = await readLists();
+    const all = [...m3u8_list, ...mp4_list].filter((it) => isCandidateURL(it.url));
     const norm = (u) => {
       try {
         const p = new URL(u);
@@ -405,115 +414,18 @@ var __m3u8catcher = (() => {
   }
 
   // src/background/video-source.js
-  async function getVideoOptions(tab) {
-    if (!tab) throw new Error("\u65E0\u6CD5\u83B7\u53D6\u5F53\u524D\u6807\u7B7E\u9875");
-    const pageUrl = tab.url || "";
-    const title = tab.title || "";
-    const { m3u8_list = [], mp4_list = [] } = await chrome.storage.local.get([
-      "m3u8_list",
-      "mp4_list"
-    ]);
-    const m3u8Items = m3u8_list.filter((it) => sameSite(it, pageUrl) && isCandidateURL(it.url));
-    const mp4Items = mp4_list.filter((it) => sameSite(it, pageUrl) && isCandidateURL(it.url));
-    const options = [];
-    let seq = 1;
-    for (const it of m3u8Items) {
-      try {
-        const text = await fetchText(it.url);
-        if (text.includes("#EXT-X-STREAM-INF")) {
-          const variants = parseVariants(text, it.url);
-          for (const v of variants) {
-            const subText = await fetchText(v.url);
-            const duration = parseDuration(subText);
-            const segments = parseSegments(subText, v.url).length;
-            options.push({
-              id: seq++,
-              type: "ts",
-              url: v.url,
-              pageUrl: it.pageUrl,
-              title: it.title || title,
-              quality: shortQuality(v),
-              resolution: v.resolution,
-              bandwidth: v.bandwidth,
-              duration,
-              segments,
-              label: v.label
-            });
-          }
-        } else {
-          const duration = parseDuration(text);
-          const segments = parseSegments(text, it.url).length;
-          options.push({
-            id: seq++,
-            type: "ts",
-            url: it.url,
-            pageUrl: it.pageUrl,
-            title: it.title || title,
-            quality: qualityFromURL(it.url),
-            resolution: "",
-            bandwidth: 0,
-            duration,
-            segments,
-            label: "\u672A\u77E5\u753B\u8D28"
-          });
-        }
-      } catch (e) {
-        console.error("\u89E3\u6790 m3u8 \u5931\u8D25:", it.url, e);
-      }
-    }
-    for (const it of mp4Items) {
-      options.push({
-        id: seq++,
-        type: "mp4",
-        url: it.url,
-        pageUrl: it.pageUrl,
-        title: it.title || title,
-        quality: qualityFromURL(it.url),
-        resolution: "",
-        bandwidth: 0,
-        duration: 0,
-        segments: 0,
-        size: it.size || 0,
-        label: it.size ? `${(it.size / 1024 / 1024).toFixed(1)} MB` : ""
-      });
-    }
-    const MAIN_VIDEO_MIN = 60;
-    const filtered = options.filter(
-      (o) => o.type === "mp4" || o.duration >= MAIN_VIDEO_MIN
-    );
-    const qualityRank = (q) => ({
-      "4K": 8,
-      "2K": 7,
-      "1080P": 6,
-      "720P": 5,
-      "480P": 4,
-      "360P": 3,
-      "240P": 2,
-      "\u672A\u77E5\u753B\u8D28": 1,
-      "": 0
-    })[String(q).toUpperCase()] || 0;
-    filtered.sort((a, b) => {
-      if (a.type !== b.type) return a.type === "ts" ? -1 : 1;
-      const rankDiff = qualityRank(a.quality) - qualityRank(b.quality);
-      if (rankDiff !== 0) return -rankDiff;
-      return b.bandwidth - a.bandwidth;
-    });
-    filtered.forEach((o, i) => o.id = i + 1);
-    return filtered;
-  }
   function openDownloader(item) {
     const params = new URLSearchParams();
     params.set("url", item.url);
     params.set("title", item.title || "");
     params.set("pageUrl", item.pageUrl || "");
     params.set("quality", item.quality || "");
-    params.set("format", item.type || "ts");
     chrome.tabs.create({
       url: chrome.runtime.getURL("downloader.html?" + params.toString())
     });
   }
-  async function getVideoSources({ src = "", pageUrl = "", embedUrl = "" }) {
-    const { hostM3U8, hostMP4 } = await pageCandidates(pageUrl);
+  async function getVideoSources({ src = "", pageUrl = "", embedUrl = "" }, sender = {}) {
+    const { hostM3U8, hostMP4 } = await listCandidates(pageUrl);
     const sources = [];
     if (/^https?:/i.test(src)) {
       sources.push({ type: "mp4", url: src, title: "", pageUrl, fromSrc: true });
@@ -547,9 +459,22 @@ var __m3u8catcher = (() => {
         size: it.size || 0
       });
     }
+    const tabAuth = tabAuthority(sender);
+    if (tabAuth.isTop && tabAuth.tabUrl && tabAuth.tabUrl !== pageUrl) {
+      const only = await uniqueTabCandidate(tabAuth.tabUrl);
+      if (only) {
+        sources.push({
+          type: only.type === "mp4" ? "mp4" : "ts",
+          url: only.url,
+          title: only.title || "",
+          pageUrl: only.pageUrl || pageUrl,
+          size: only.size || 0
+        });
+      }
+    }
     return sources.filter((s, i, arr) => arr.findIndex((o) => o.url === s.url) === i);
   }
-  async function getVideoSource({ src = "", pageUrl = "", embedUrl = "", segmentDir = "", title = "" }) {
+  async function getVideoSource({ src = "", pageUrl = "", embedUrl = "", segmentDir = "", title = "" }, sender = {}) {
     if (embedUrl) {
       const hit = await findSniffedByURL(embedUrl);
       if (hit) return makeSourceFor(hit, title, pageUrl);
@@ -576,8 +501,16 @@ var __m3u8catcher = (() => {
       return makeM3U8Source(hostM3U8[0], title, pageUrl);
     }
     const realMP4 = hostMP4.filter((it) => (it.size || 0) > 1024 * 1024).sort((a, b) => (b.size || 0) - (a.size || 0));
-    if (realMP4.length) {
+    if (segmentDir) {
+      const playingMP4 = realMP4.filter((it) => it.url.startsWith(segmentDir));
+      if (playingMP4.length) return makeMP4Source(playingMP4[0], title, pageUrl);
+    } else if (realMP4.length === 1) {
       return makeMP4Source(realMP4[0], title, pageUrl);
+    }
+    const tabAuth = tabAuthority(sender);
+    if (tabAuth.isTop && tabAuth.tabUrl && tabAuth.tabUrl !== pageUrl) {
+      const only = await uniqueTabCandidate(tabAuth.tabUrl);
+      if (only) return makeSourceFor(only, title, tabAuth.tabUrl);
     }
     throw new Error("\u6682\u672A\u55C5\u63A2\u5230\u8BE5\u89C6\u9891\uFF0C\u8BF7\u5148\u64AD\u653E\u51E0\u79D2\u518D\u8BD5\u3002");
   }
@@ -608,6 +541,154 @@ var __m3u8catcher = (() => {
   }
   function makeSourceFor(item, title, pageUrl) {
     return item && item.type === "mp4" ? makeMP4Source(item, title, pageUrl) : makeM3U8Source(item, title, pageUrl);
+  }
+  function tabAuthority(sender) {
+    const tabUrl = sender && sender.tab && sender.tab.url || "";
+    const isTop = !!(sender && sender.frameId === 0);
+    return { tabUrl, isTop };
+  }
+
+  // src/background/native-host.js
+  var NATIVE_HOST_NAME = "com.gocatcher.browser_host";
+  var WAKE_TIMEOUT_MS = 25e3;
+  var waking = null;
+  function requestWake(timeoutMs = WAKE_TIMEOUT_MS) {
+    if (waking) return waking;
+    waking = doRequestWake(timeoutMs).finally(() => {
+      waking = null;
+    });
+    return waking;
+  }
+  function reasonOf(e) {
+    if (!e) return "";
+    if (typeof e === "string") return e;
+    return e.message || String(e);
+  }
+  function doRequestWake(timeoutMs) {
+    return new Promise((resolve) => {
+      let port = null;
+      let settled = false;
+      const finish = (value) => {
+        if (settled) return;
+        settled = true;
+        try {
+          if (port) port.disconnect();
+        } catch {
+        }
+        resolve(value);
+      };
+      const timer = setTimeout(() => finish(null), timeoutMs);
+      try {
+        port = chrome.runtime.connectNative(NATIVE_HOST_NAME);
+      } catch (e) {
+        clearTimeout(timer);
+        console.warn("[go-catcher] connectNative \u5931\u8D25:", reasonOf(e));
+        resolve(null);
+        return;
+      }
+      port.onMessage.addListener((msg) => {
+        clearTimeout(timer);
+        finish(msg && typeof msg === "object" ? msg : null);
+      });
+      port.onDisconnect.addListener(() => {
+        clearTimeout(timer);
+        const why = reasonOf(chrome.runtime.lastError);
+        if (why) console.warn("[go-catcher] \u539F\u751F\u6D88\u606F\u5BBF\u4E3B\u4E0D\u53EF\u7528:", why);
+        finish(null);
+      });
+      try {
+        port.postMessage({ type: "ensure-server" });
+      } catch {
+        clearTimeout(timer);
+        finish(null);
+      }
+    });
+  }
+
+  // src/background/referer-capture.js
+  var KEY = "segRefByHost";
+  var MAX_ENTRIES = 256;
+  var cache = null;
+  function sessionArea() {
+    return chrome && chrome.storage && chrome.storage.session ? chrome.storage.session : null;
+  }
+  async function loadCache() {
+    if (cache) return cache;
+    cache = /* @__PURE__ */ new Map();
+    const area = sessionArea();
+    if (!area) return cache;
+    try {
+      const got = await area.get(KEY);
+      const obj = got && got[KEY];
+      if (obj && typeof obj === "object") {
+        for (const [h, r] of Object.entries(obj)) {
+          if (typeof r === "string" && h) cache.set(h, r);
+        }
+      }
+    } catch {
+    }
+    return cache;
+  }
+  async function flush() {
+    const area = sessionArea();
+    if (!area || !cache) return;
+    try {
+      const obj = {};
+      for (const [h, r] of cache) obj[h] = r;
+      await area.set({ [KEY]: obj });
+    } catch {
+    }
+  }
+  function refererFromDetails(details) {
+    if (!details || details.tabId < 0) return null;
+    const type = details.type;
+    if (type !== "xmlhttprequest" && type !== "media") return null;
+    let referer = "";
+    for (const h of details.requestHeaders || []) {
+      if (h && h.name && h.name.toLowerCase() === "referer") {
+        referer = h.value || "";
+        break;
+      }
+    }
+    let host = "";
+    try {
+      host = new URL(details.url).host;
+    } catch {
+      return null;
+    }
+    if (!host) return null;
+    return { host, referer };
+  }
+  async function captureSegmentReferer(host, referer) {
+    if (!host) return;
+    const m = await loadCache();
+    if (m.get(host) === referer) return;
+    while (m.size >= MAX_ENTRIES && !m.has(host)) {
+      const oldest = m.keys().next().value;
+      m.delete(oldest);
+    }
+    m.delete(host);
+    m.set(host, referer);
+    await flush();
+  }
+  async function segmentReferers() {
+    const m = await loadCache();
+    const out = {};
+    for (const [h, r] of m) out[h] = r;
+    return out;
+  }
+  function installRefererCapture() {
+    const wreq = chrome && chrome.webRequest;
+    if (!wreq || !wreq.onSendHeaders) return;
+    wreq.onSendHeaders.addListener(
+      (details) => {
+        const hit = refererFromDetails(details);
+        if (hit) captureSegmentReferer(hit.host, hit.referer).catch(() => {
+        });
+      },
+      { urls: ["http://*/*", "https://*/*"] },
+      ["requestHeaders", "extraHeaders"]
+    );
   }
 
   // src/background/server-api.js
@@ -681,16 +762,30 @@ var __m3u8catcher = (() => {
       return false;
     }
   }
+  async function ensureServerRunning() {
+    if (await pingServer()) return true;
+    const resp = await requestWake();
+    if (resp && resp.ok) return true;
+    return waitForServer(2e3);
+  }
+  async function waitForServer(totalMs) {
+    const deadline = Date.now() + totalMs;
+    for (; ; ) {
+      if (await pingServer(1e3)) return true;
+      if (Date.now() >= deadline) return false;
+      await new Promise((r) => setTimeout(r, 300));
+    }
+  }
   async function detectExePath() {
     await getApiToken(true);
   }
   async function downloadViaServer({ m3u8Url, referer, title, filename } = {}) {
     if (!m3u8Url) return { ok: false, error: "\u7F3A\u5C11 m3u8Url" };
-    const healthy = await pingServer();
+    const healthy = await ensureServerRunning();
     if (!healthy) {
       return {
         ok: false,
-        error: "\u672C\u5730\u4E0B\u8F7D\u670D\u52A1\u672A\u542F\u52A8\u3002\u8BF7\u6253\u5F00 go-catcher.exe\uFF08GoCatcher \u5BA2\u6237\u7AEF\uFF0C\u6253\u5F00\u5373\u81EA\u52A8\u542F\u52A8\u4E0B\u8F7D\u670D\u52A1\uFF09\uFF0C\u7136\u540E\u91CD\u8BD5\u3002",
+        error: "\u672C\u5730\u4E0B\u8F7D\u670D\u52A1\u672A\u542F\u52A8\uFF0C\u81EA\u52A8\u5524\u8D77\u4E5F\u6CA1\u6210\u529F\u3002\u8BF7\u624B\u52A8\u6253\u5F00 go-catcher.exe\uFF08GoCatcher \u5BA2\u6237\u7AEF\uFF0C\u6253\u5F00\u5373\u81EA\u52A8\u542F\u52A8\u4E0B\u8F7D\u670D\u52A1\uFF09\uFF0C\u7136\u540E\u91CD\u8BD5\u3002",
         code: "SERVER_DOWN"
       };
     }
@@ -712,6 +807,10 @@ var __m3u8catcher = (() => {
       }
       const params = new URLSearchParams({ m3u8: m3u8Url, mode: "disk", dir });
       if (referer) params.set("referer", referer);
+      const segRefs = await segmentReferers();
+      if (segRefs && Object.keys(segRefs).length) {
+        params.set("segrefs", JSON.stringify(segRefs));
+      }
       const safeFn = filename || `${title || "video"}.ts`;
       params.set("filename", safeFn);
       const dlRes = await apiFetch(`/download?${params.toString()}`, {
@@ -781,7 +880,13 @@ var __m3u8catcher = (() => {
         exists: true,
         id: t.id,
         state: t.paused ? "paused" : "inProgress",
-        stage: t.queued ? "\u6392\u961F\u4E2D" : t.paused ? "\u5DF2\u6682\u505C" : t.stage || "\u4E0B\u8F7D\u4E2D",
+        // 直播任务没有"暂停"语义：它的 paused 只可能来自"程序退出时还没录完"，
+        // 那是"中断待处理"而不是"可继续的暂停"。直说后端的 stage，别覆盖成
+        // "已暂停"——面板据此显示「停止」，用户才不会去找不存在的「继续」。
+        stage: t.queued ? "\u6392\u961F\u4E2D" : t.live ? t.stage || "\u5F55\u5236\u4E2D" : t.paused ? "\u5DF2\u6682\u505C" : t.stage || "\u4E0B\u8F7D\u4E2D",
+        // live 是控制按钮分流的判据（content.js 的 activeLive）：服务端说了算，
+        // 嗅探侧的 live 只是启发式。
+        live: !!t.live,
         pct: t.pct || 0,
         segDone: t.segDone || 0,
         segTot: t.segTot || 0,
@@ -794,19 +899,24 @@ var __m3u8catcher = (() => {
       return { exists: false, error: String(e) };
     }
   }
+  var actionMap = {
+    pause: { path: "pause", method: "GET" },
+    resume: { path: "resume", method: "POST" },
+    stop: { path: "stop", method: "POST" },
+    cancel: { path: "cancel", method: "GET" }
+  };
   async function controlTask({ taskId, action } = {}) {
     if (!taskId) return { ok: false, error: "\u7F3A\u5C11 taskId" };
-    const actionMap = { pause: "pause", resume: "resume", cancel: "cancel" };
-    const path = actionMap[action];
-    if (!path) return { ok: false, error: `\u672A\u77E5\u52A8\u4F5C: ${action}` };
+    const act = actionMap[action];
+    if (!act) return { ok: false, error: `\u672A\u77E5\u52A8\u4F5C: ${action}` };
     const healthy = await pingServer();
     if (!healthy) {
       return { ok: false, error: "\u672C\u5730 Go \u4E0B\u8F7D\u670D\u52A1\u672A\u542F\u52A8", code: "SERVER_DOWN" };
     }
     try {
       const resp = await apiFetch(
-        `/${path}?id=${encodeURIComponent(taskId)}`,
-        { cache: "no-store" }
+        `/${act.path}?id=${encodeURIComponent(taskId)}`,
+        { method: act.method, cache: "no-store" }
       );
       const body = await resp.json().catch(() => ({}));
       if (!resp.ok) {
@@ -819,18 +929,60 @@ var __m3u8catcher = (() => {
   }
 
   // src/background/referer-rules.js
-  async function setRefererRules(tabId, pairs) {
-    const existing = await chrome.declarativeNetRequest.getDynamicRules();
-    const ids = existing.filter((r) => r.id >= 1e3 && r.id < 1e4).map((r) => r.id);
-    if (ids.length) {
-      await chrome.declarativeNetRequest.updateDynamicRules({
-        removeRuleIds: ids
-      });
+  var RULE_ID_MIN = 1e3;
+  var RULE_ID_MAX = 5e3;
+  var dnrChain = Promise.resolve();
+  function enqueueDnr(job) {
+    const run = dnrChain.then(job);
+    dnrChain = run.catch(() => {
+    });
+    return run;
+  }
+  function oursInSegment(rules) {
+    return rules.filter((r) => r.id >= RULE_ID_MIN);
+  }
+  function ruleIdsForTab(rules, tabId) {
+    return oursInSegment(rules).filter((r) => (r.condition?.tabIds || []).includes(tabId)).map((r) => r.id);
+  }
+  function allocRuleIds(rules, count) {
+    const used = new Set(oursInSegment(rules).map((r) => r.id));
+    const ids = [];
+    for (let id = RULE_ID_MIN; ids.length < count && id < RULE_ID_MAX; id++) {
+      if (!used.has(id)) ids.push(id);
     }
+    return ids;
+  }
+  function setRefererRules(tabId, pairs) {
+    return enqueueDnr(() => applyRefererRules(tabId, pairs));
+  }
+  function clearRefererRules(tabId) {
+    return enqueueDnr(() => removeRules((rules) => ruleIdsForTab(rules, tabId)));
+  }
+  function sweepStaleRules() {
+    return enqueueDnr(async () => {
+      const tabs = await chrome.tabs.query({});
+      const alive = new Set(tabs.map((t) => t.id));
+      await removeRules(
+        (rules) => oursInSegment(rules).filter((r) => {
+          const ids = r.condition?.tabIds || [];
+          return ids.length > 0 && ids.every((id) => !alive.has(id));
+        }).map((r) => r.id)
+      );
+    });
+  }
+  async function removeRules(pickIds) {
+    const rules = await chrome.declarativeNetRequest.getDynamicRules();
+    const removeRuleIds = pickIds(rules);
+    if (removeRuleIds.length) {
+      await chrome.declarativeNetRequest.updateDynamicRules({ removeRuleIds });
+    }
+  }
+  async function applyRefererRules(tabId, pairs) {
+    const rules = await chrome.declarativeNetRequest.getDynamicRules();
+    const removeRuleIds = ruleIdsForTab(rules, tabId);
     const seen = /* @__PURE__ */ new Set();
-    const rules = [];
-    let id = 1e3;
-    for (const { host, referer } of pairs) {
+    const specs = [];
+    for (const { host, referer } of pairs || []) {
       if (!host || !referer) continue;
       const key = `${host}|${referer}`;
       if (seen.has(key)) continue;
@@ -841,28 +993,32 @@ var __m3u8catcher = (() => {
       } catch {
       }
       if (!origin) continue;
-      rules.push({
-        id: id++,
-        priority: 1,
-        action: {
-          type: "modifyHeaders",
-          requestHeaders: [
-            { header: "Referer", operation: "set", value: referer },
-            { header: "Origin", operation: "set", value: origin }
-          ]
-        },
-        condition: {
-          urlFilter: `||${host}`,
-          resourceTypes: ["xmlhttprequest"],
-          tabIds: [tabId]
-        }
-      });
+      specs.push({ host, referer, origin });
     }
-    if (rules.length) {
-      await chrome.declarativeNetRequest.updateDynamicRules({
-        addRules: rules
-      });
+    const ids = allocRuleIds(rules, specs.length);
+    if (ids.length < specs.length) {
+      throw new Error(
+        `DNR \u52A8\u6001\u89C4\u5219\u914D\u989D\u4E0D\u8DB3\uFF1A\u9700\u8981 ${specs.length} \u6761\uFF0C\u53F7\u6BB5\u5185\u4EC5\u5269 ${ids.length} \u6761\u53EF\u7528`
+      );
     }
+    const addRules = specs.map((s, i) => ({
+      id: ids[i],
+      priority: 1,
+      action: {
+        type: "modifyHeaders",
+        requestHeaders: [
+          { header: "Referer", operation: "set", value: s.referer },
+          { header: "Origin", operation: "set", value: s.origin }
+        ]
+      },
+      condition: {
+        urlFilter: `||${s.host}`,
+        resourceTypes: ["xmlhttprequest"],
+        tabIds: [tabId]
+      }
+    }));
+    if (!removeRuleIds.length && !addRules.length) return;
+    await chrome.declarativeNetRequest.updateDynamicRules({ removeRuleIds, addRules });
   }
 
   // src/background/main.js
@@ -874,16 +1030,12 @@ var __m3u8catcher = (() => {
       setRefererRules(msg.tabId, msg.pairs).then(() => sendResponse({ ok: true })).catch((e) => sendResponse({ ok: false, error: String(e) }));
       return true;
     }
-    if (msg.type === "getVideoOptions") {
-      getVideoOptions(sender.tab).then((res) => sendResponse({ ok: true, options: res })).catch((e) => sendResponse({ ok: false, error: String(e) }));
-      return true;
-    }
     if (msg.type === "getVideoSource") {
-      getVideoSource(msg).then((res) => sendResponse({ ok: true, source: res })).catch((e) => sendResponse({ ok: false, error: String(e && e.message ? e.message : e) }));
+      getVideoSource(msg, sender).then((res) => sendResponse({ ok: true, source: res })).catch((e) => sendResponse({ ok: false, error: String(e && e.message ? e.message : e) }));
       return true;
     }
     if (msg.type === "getVideoSources") {
-      getVideoSources(msg).then((res) => sendResponse({ ok: true, sources: res })).catch((e) => sendResponse({ ok: false, error: String(e && e.message ? e.message : e) }));
+      getVideoSources(msg, sender).then((res) => sendResponse({ ok: true, sources: res })).catch((e) => sendResponse({ ok: false, error: String(e && e.message ? e.message : e) }));
       return true;
     }
     if (msg.type === "openDownloader") {
@@ -891,11 +1043,12 @@ var __m3u8catcher = (() => {
       sendResponse({ ok: true });
       return true;
     }
+    if (msg.type === "getList") {
+      readLists().then((all) => sendResponse({ ok: true, list: all[msg.key] || [] })).catch((e) => sendResponse({ ok: false, error: String(e) }));
+      return true;
+    }
     if (msg.type === "clearList") {
-      clearLists().then(() => {
-        chrome.action.setBadgeText({ text: "" });
-        sendResponse({ ok: true });
-      }).catch((e) => sendResponse({ ok: false, error: String(e) }));
+      clearLists().then(() => sendResponse({ ok: true })).catch((e) => sendResponse({ ok: false, error: String(e) }));
       return true;
     }
     if (msg.type === "updateMediaItem") {
@@ -924,21 +1077,44 @@ var __m3u8catcher = (() => {
     }
   });
   installSniffProbes();
+  installRefererCapture();
+  chrome.tabs.onRemoved.addListener((tabId) => {
+    clearRefererRules(tabId).catch(() => {
+    });
+  });
   detectExePath();
+  sweepStaleRules().catch(() => {
+  });
   var __test__ = {
     recordMedia,
     updateMediaItem,
+    readLists,
+    // 测试专用：丢弃内存权威副本（用例直接重置 storage 桩造场景时必须先调它）
+    resetListCache,
     pickEvictionIndex,
     pruneExpired,
     clearLists,
     findSniffedByURL,
     getVideoSource,
     getVideoSources,
-    isCandidateURL: isCandidateURL2,
-    sameSite: sameSite2,
+    isCandidateURL,
+    sameSite,
     // 探测器判据（纯函数，供 tests/probes.test.js 直接断言）
     contentTypeMediaType,
-    isLikelyFullFile
+    isLikelyFullFile,
+    // DNR Referer 规则管理（tests/refererrules.test.js）
+    setRefererRules,
+    clearRefererRules,
+    sweepStaleRules,
+    allocRuleIds,
+    // 原生消息唤起（tests/nativehost.test.js）
+    requestWake,
+    NATIVE_HOST_NAME,
+    // 分片 Referer 捕获（tests/referercapture.test.js）
+    refererFromDetails,
+    captureSegmentReferer,
+    segmentReferers,
+    downloadViaServer
   };
   return __toCommonJS(main_exports);
 })();

@@ -3,8 +3,10 @@ package core
 
 import (
 	"bytes"
+	"context"
 	"encoding/hex"
 	"fmt"
+	"math"
 	"net/url"
 	"path/filepath"
 	"regexp"
@@ -85,13 +87,21 @@ func directExtFromURL(raw string) string {
 
 // playlistInfo 一次媒体播放列表解析结果（含分段、init 段与直播/点播标记）。
 type playlistInfo struct {
-	segments   []string // 分片绝对 URL（播放列表内顺序）
-	hasMap     bool     // 存在 #EXT-X-MAP（fMP4 init 段声明）
-	mapURI     string   // init 段绝对 URL（hasMap 时有效）
-	hasEndList bool     // 存在 #EXT-X-ENDLIST（点播；缺失 = 直播/事件流）
-	totalDur   float64  // EXTINF 时长累加（点播总时长 / 直播已见时长）
-	mediaSeq   uint64   // #EXT-X-MEDIA-SEQUENCE（缺省 0；密钥无显式 IV 时派生 IV 用）
-	key        *KeyInfo // #EXT-X-KEY（nil = 明文流；METHOD=NONE 同样为 nil）
+	segments   []string  // 分片绝对 URL（播放列表内顺序）
+	durs       []float64 // 各分片对应的 #EXTINF 时长（与 segments 一一对应，缺失为 0）
+	hasMap     bool      // 存在 #EXT-X-MAP（fMP4 init 段声明）
+	mapURI     string    // init 段绝对 URL（hasMap 时有效）
+	hasEndList bool      // 存在 #EXT-X-ENDLIST（点播；缺失 = 直播/事件流）
+	totalDur   float64   // EXTINF 时长累加（点播总时长 / 直播已见时长）
+	mediaSeq   uint64    // #EXT-X-MEDIA-SEQUENCE（缺省 0；密钥无显式 IV 时派生 IV 用）
+	key        *KeyInfo  // #EXT-X-KEY（nil = 明文流；METHOD=NONE 同样为 nil）
+	// keyMalformed 播放列表声明了加密（METHOD 不是 NONE），但 URI 属性缺失/为空。
+	// 这种行绝不能让 pl.key 停在 nil —— nil 与「明文流」在后续每条判断里完全
+	// 不可区分：validatePlaylist 放行、ensureDecryptor(nil) 清空解密器、落盘校验的
+	// ProbeInfo.Encrypted=false 让 generic 守卫也不设防。结果是密文被当明文拼进
+	// 成品、全链路日志正常 —— 本项目反复出现的头号缺陷形态。用这个标记让
+	// validatePlaylist 显式失败，而不是静默降级到明文管线。
+	keyMalformed bool
 	// multiKey 播放列表在"已经下过分片之后"换了另一组 KEY（key rotation）。
 	// 当前管线只保留最后一条 key，前面的分片会被解成随机字节且毫无提示 ——
 	// 用这个标记让调用方显式失败，而不是静默产出损坏文件。
@@ -99,14 +109,67 @@ type playlistInfo struct {
 	// segSeenForKey 当前 key 生效期间已见分片数：只有"用过之后才换 key"才算轮换，
 	// 播放列表里每个分片前重复同一条 key 是合法且常见的写法。
 	segSeenForKey int
+	// hasByteRange 播放列表用了 #EXT-X-BYTERANGE（同一个文件按字节区间切成多段，
+	// 单文件 HLS 的常见做法）。当前管线的语义是"一行分片 = 一个完整 URL"，
+	// N 行会解析出同一个 URL 并各下一遍再顺序 append —— 体积放大 N 倍、时间轴
+	// 完全错位，而且不会有任何报错。用这个标记让调用方显式失败。
+	hasByteRange bool
 }
 
-// sameKey 判定两条 #EXT-X-KEY 是否等价（METHOD/URI/IV 全同）。
+// sameKey 判定两条 #EXT-X-KEY 是否等价（METHOD/URI/IV/KEYFORMAT 全同）。
 func sameKey(a, b *KeyInfo) bool {
 	if a == nil || b == nil {
 		return a == nil && b == nil
 	}
-	return a.Method == b.Method && a.URI == b.URI && bytes.Equal(a.IV, b.IV)
+	return a.Method == b.Method && a.URI == b.URI && bytes.Equal(a.IV, b.IV) &&
+		normKeyFormat(a.KeyFormat) == normKeyFormat(b.KeyFormat)
+}
+
+// validatePlaylist 播放列表语义校验的唯一入口。
+//
+// 这里收的都是「当前实现不支持、但按错误语义硬跑会静默产出损坏文件」的 HLS 特性。
+// 之所以合成一个入口而不是让调用方逐个调：管线与 CLI 两处调用点必须保持同步，
+// 分成多个函数时新增一条校验就多一次「漏加一个调用点」的机会，而漏掉的后果
+// 恰恰是这类静默损坏。新增校验请加在这个函数里，别加在调用点。
+func validatePlaylist(pl playlistInfo) error {
+	if err := ensureKeyDeclared(pl); err != nil {
+		return err
+	}
+	if err := ensureSingleKey(pl); err != nil {
+		return err
+	}
+	if err := ensureNoByteRange(pl); err != nil {
+		return err
+	}
+	return ensureIdentityKeyFormat(pl)
+}
+
+// ensureKeyDeclared 校验「声明了加密就必须给出可解析的 URI」。
+//
+// parseKeyLine 对「METHOD 非 NONE 但 URI 缺失/为空」的行返回 nil，若直接拿这个
+// nil 当 pl.key，畸形声明与明文流在后续每条判断里都不可区分（validatePlaylist
+// 放行、ensureDecryptor(nil) 清空解密器、ProbeInfo.Encrypted=false 让 generic
+// 守卫也不设防），密文会被当明文拼进成品且全程无报错。因此畸形声明必须显式失败。
+func ensureKeyDeclared(pl playlistInfo) error {
+	if pl.keyMalformed {
+		return fmt.Errorf("播放列表声明了加密（#EXT-X-KEY 的 METHOD 不是 NONE）但没有给出可用的 URI 属性：" +
+			"无法获取密钥，拒绝下载（若该流实为明文，请让源站修正这条声明）")
+	}
+	return nil
+}
+
+// ensureIdentityKeyFormat 校验密钥格式是 identity（或缺省）。
+//
+// 非 identity 的 KEYFORMAT 表示 URI 指向的是密钥系统而不是裸密钥：商业 DRM 的
+// 许可端点都属这种形态。此时 METHOD 往往仍写着
+// AES-128，所以单看 METHOD 会一路放行——拉回来的东西被当作 16 字节 key 用，
+// 产物是"能播但花屏/无声"的损坏文件，而日志一切正常。
+func ensureIdentityKeyFormat(pl playlistInfo) error {
+	if pl.key == nil || isIdentityKeyFormat(pl.key.KeyFormat) {
+		return nil
+	}
+	return fmt.Errorf("播放列表声明了非 identity 的密钥格式（KEYFORMAT=%q）："+
+		"该 URI 指向的是密钥系统而不是裸密钥，本工具无法解密，拒绝下载", pl.key.KeyFormat)
 }
 
 // ensureSingleKey 校验播放列表没有中途换 key。key rotation 需要按分片选择
@@ -118,18 +181,40 @@ func ensureSingleKey(pl playlistInfo) error {
 	return nil
 }
 
+// ensureNoByteRange 校验播放列表没有使用字节范围分片。
+//
+// #EXT-X-BYTERANGE 让多个分片行指向同一个 URL 的不同字节区间。当前管线把每行
+// 当成独立文件整份下载，结果是同一个文件被下 N 遍再顺序拼接：体积放大 N 倍、
+// 时间轴错位，且 validateOutput 的同步字节判据发现不了（每一份都是合法 TS）。
+// 完整支持需要给分片附上 Range 语义，属于较大的改动；定版前先显式拒绝。
+func ensureNoByteRange(pl playlistInfo) error {
+	if pl.hasByteRange {
+		return fmt.Errorf("播放列表使用了 #EXT-X-BYTERANGE（单文件按字节区间切片），当前版本不支持字节范围分片，无法正确下载该流")
+	}
+	return nil
+}
+
 // KeyInfo 一条 #EXT-X-KEY 声明（URI 已按播放列表 base 解析为绝对地址）。
 type KeyInfo struct {
 	Method string // AES-128 / SAMPLE-AES …（大写）
 	URI    string // 密钥绝对 URL
 	IV     []byte // 显式 IV（16 字节）；nil = 按 media sequence 派生
+	// KeyFormat #EXT-X-KEY 的 KEYFORMAT 属性（缺省 = "identity"）。
+	// 非 identity 表示 URI 指向的是「密钥系统」（商业 DRM 的许可服务），而不是
+	// 16 字节裸密钥 —— 拿它当 AES-128 的 key 用，运气好是长度不合法报错，
+	// 运气不好是静默解出随机字节。
+	KeyFormat string
 }
 
 // fetchPlaylist 获取并返回媒体播放列表内容与其基准 URL。
 // 返回的 base 是真正承载分片的那份播放列表的 URL：
 // master playlist 会先选最高码率子流，base 即子流 URL（相对分片按其解析）。
-func (j *dlJob) fetchPlaylist() (content, base string, isDirect bool, err error) {
-	body, isDirect, status, err := j.rt.httpGetPlaylist(j.m3u8URL, j.referer)
+//
+// ctx 一路传到两次网络请求（含重试退避）：暂停/取消时不必等一轮重试跑完。
+func (j *dlJob) fetchPlaylist(ctx context.Context) (content, base string, isDirect bool, err error) {
+	// playlist 与分片一样经 segmentReferer 按 host 选用 Referer：有的站把 m3u8 也
+	// 放在白名单型 CDN 上，一律用页面 Referer 会被 403（见 dlJob.segmentReferer）。
+	body, isDirect, status, err := j.rt.httpGetPlaylist(ctx, j.m3u8URL, j.segmentReferer(j.m3u8URL))
 	if err != nil {
 		if status != 0 {
 			return "", "", false, fmt.Errorf("HTTP %d: %w", status, err)
@@ -149,7 +234,9 @@ func (j *dlJob) fetchPlaylist() (content, base string, isDirect bool, err error)
 			return "", "", false, err
 		}
 		fmt.Printf("发现 master playlist，选择最高码率: %s\n", subURL)
-		subBody, _, err := j.rt.httpGetWithRetry(subURL, j.referer)
+		// 第二跳（master → 子播放列表）同样按 host 选用：子流可能落在与 m3u8
+		// 不同的 CDN 上，用页面 Referer 同样可能被白名单型防盗链 403。
+		subBody, _, err := j.rt.httpGetWithRetry(ctx, subURL, j.segmentReferer(subURL))
 		if err != nil {
 			return "", "", false, err
 		}
@@ -167,6 +254,8 @@ func (j *dlJob) fetchPlaylist() (content, base string, isDirect bool, err error)
 // 不返回错误：未知标签与非法行一律跳过，由调用方检查 segments 是否为空。
 func parsePlaylist(m3u8Text, base string) playlistInfo {
 	var pl playlistInfo
+	// pendingDur 暂存最近一条 #EXTINF 的时长，等它对应的分片 URL 行出现时一并记入 durs
+	pendingDur := 0.0
 	// 剥 BOM：带 BOM 的播放列表首行 "\ufeff#EXTM3U" 不以 # 开头，
 	// 会被当成分片 URL 产出一条垃圾条目
 	m3u8Text = strings.TrimPrefix(m3u8Text, "\ufeff")
@@ -187,7 +276,12 @@ func parsePlaylist(m3u8Text, base string) playlistInfo {
 			// 后一条 key 行覆盖前一条（含 METHOD=NONE 显式转为明文）。
 			// 但"已经按旧 key 下过分片之后"再换 key 就是 key rotation：管线只
 			// 保留最后一条，前面的分片会被解错。这里记录，交给 ensureSingleKey 报错。
-			nk := parseKeyLine(line, base)
+			nk, malformed := parseKeyLine(line, base)
+			if malformed {
+				// 记录畸形：即便后面还有正常的 key 行，这份播放列表已经声明过
+				// 一条无法解析的加密，整条流都不能按明文处理（见 keyMalformed 注释）。
+				pl.keyMalformed = true
+			}
 			if !sameKey(pl.key, nk) {
 				if pl.segSeenForKey > 0 {
 					pl.multiKey = true
@@ -196,18 +290,25 @@ func parsePlaylist(m3u8Text, base string) playlistInfo {
 			}
 			pl.key = nk
 		case strings.HasPrefix(line, "#EXT-X-MAP:"):
-			if m := mapURIRe.FindStringSubmatch(line); len(m) == 2 && m[1] != "" {
+			if u := mapURIAttr(line); u != "" {
 				pl.hasMap = true
-				pl.mapURI = resolveURL(base, m[1])
+				pl.mapURI = resolveURL(base, u)
 			}
 		case strings.HasPrefix(line, "#EXTINF:"):
-			pl.totalDur += parseEXTINFDuration(line)
+			// EXTINF 行在它对应的分片 URL 行之前出现，先记下等 URL 行配对
+			pendingDur = parseEXTINFDuration(line)
+			pl.totalDur += pendingDur
+		case strings.HasPrefix(line, "#EXT-X-BYTERANGE:"):
+			// 不解析区间，只记录"见过"——由 ensureNoByteRange 显式失败（见该函数注释）
+			pl.hasByteRange = true
 		case strings.HasPrefix(line, "#"):
 			// 其它标签（EXT-X-TARGETDURATION 等）无需处理
 		default:
 			// 防御：含控制字符的行不是合法 URL（二进制响应切碎后的残片），跳过
 			if !looksBinary(line) {
 				pl.segments = append(pl.segments, resolveURL(base, line))
+				pl.durs = append(pl.durs, pendingDur)
+				pendingDur = 0
 				pl.segSeenForKey++
 			}
 		}
@@ -215,14 +316,19 @@ func parsePlaylist(m3u8Text, base string) playlistInfo {
 	return pl
 }
 
-// parseEXTINFDuration 解析 "#EXTINF:10.0," 中的秒数；解析失败返回 0。
+// parseEXTINFDuration 解析 "#EXTINF:10.0," 中的秒数；解析失败或产生非有限值
+// （如 "#EXTINF:NaN," / "#EXTINF:+Inf,"：strconv.ParseFloat 会成功返回但结果是
+// NaN/+Inf，污染 totalDur 与 durs 令下游净时长比较失效）返回 0。
 func parseEXTINFDuration(line string) float64 {
 	rest := strings.TrimPrefix(line, "#EXTINF:")
 	rest = strings.TrimSpace(rest)
 	if i := strings.IndexAny(rest, ",\t "); i >= 0 {
 		rest = rest[:i]
 	}
-	d, _ := strconv.ParseFloat(rest, 64)
+	d, err := strconv.ParseFloat(rest, 64)
+	if err != nil || math.IsNaN(d) || math.IsInf(d, 0) {
+		return 0
+	}
 	return d
 }
 
@@ -230,34 +336,86 @@ func parseEXTINFDuration(line string) float64 {
 // 属性名按大小写不敏感匹配，容忍非规范播放列表）。
 var (
 	keyMethodRe = regexp.MustCompile(`(?i)METHOD=([A-Za-z0-9-]+)`)
-	keyURIRe    = regexp.MustCompile(`(?i)URI="([^"]*)"`)
-	keyIVRe     = regexp.MustCompile(`(?i)IV=0[xX]([0-9A-Fa-f]{32})`)
-	// mapURIRe #EXT-X-MAP 的 URI 属性（模块级编译，别在逐行循环里反复编译）
-	mapURIRe = regexp.MustCompile(`URI="([^"]*)"`)
+	// keyURIRe URI 属性：规范要求 quoted-string，但非规范播放列表会写成裸值
+	// （URI=k.ts,IV=…），两种都认——与下面 keyFormatRe 的宽容度对齐。旧实现只认
+	// 带引号形态，裸值时 URI 取不到、整条声明被当成明文流（见 ensureKeyDeclared）。
+	// 第 1 组是带引号形态，第 2 组是裸值（止于逗号/空白）。
+	keyURIRe = regexp.MustCompile(`(?i)URI=(?:"([^"]*)"|([^",\s]*))`)
+	keyIVRe  = regexp.MustCompile(`(?i)IV=0[xX]([0-9A-Fa-f]{32})`)
+	// keyFormatRe KEYFORMAT 属性：规范要求 quoted-string，但非规范播放列表会写成
+	// 裸值（KEYFORMAT=identity,），两种都认。第 1 组是带引号形态，第 2 组是裸值。
+	keyFormatRe = regexp.MustCompile(`(?i)KEYFORMAT=(?:"([^"]*)"|([^",]*))`)
+	// mapURIRe #EXT-X-MAP 的 URI 属性：与 keyURIRe 逐字对齐 —— 规范要求
+	// quoted-string，但非规范播放列表会写成裸值（URI=init.mp4,BYTERANGE=…）。
+	// 旧实现只认带引号形态，裸值时 hasMap/mapURI 取不到 ⇒ 容器判不出 fMP4，
+	// 任务以「识别为 fMP4 分片流，但播放列表没有 #EXT-X-MAP 初始化段」失败：
+	// 明明有 init 段却报"没有"（见 m3u8_mapuri_test.go）。
+	// 第 1 组是带引号形态，第 2 组是裸值（止于逗号/空白）。
+	mapURIRe = regexp.MustCompile(`(?i)URI=(?:"([^"]*)"|([^",\s]*))`)
 )
 
-// parseKeyLine 解析 #EXT-X-KEY 行：METHOD、URI（相对路径按 base 解析）与
-// 十六进制 IV。METHOD=NONE（明文）或缺 URI 返回 nil。
-func parseKeyLine(line, base string) *KeyInfo {
+// mapURIAttr 提取 #EXT-X-MAP 行的 URI 属性值，带引号与裸值两种形态都认。
+// 属性缺失或值为空返回 ""（调用方据此判"没有 init 段"）。
+func mapURIAttr(line string) string {
+	m := mapURIRe.FindStringSubmatch(line)
+	if len(m) != 3 {
+		return ""
+	}
+	if m[1] != "" {
+		return m[1]
+	}
+	return strings.TrimSpace(m[2])
+}
+
+// parseKeyLine 解析 #EXT-X-KEY 行：METHOD、URI（相对路径按 base 解析）、
+// 十六进制 IV 与 KEYFORMAT。
+//
+// 返回值刻意做成三态，调用方必须区分（把后两者不加区分地当成 nil = 明文，
+// 正是「加密声明解析失败后静默按明文跑」的成因）：
+//   - (nil, false)：行里没有 METHOD 属性（不是有效 KEY 声明），或 METHOD=NONE
+//     （显式明文）——两者都该按明文处理；
+//   - (key, false)：解析成功；
+//   - (nil, true)：声明了加密 METHOD，但 URI 缺失/为空 —— 畸形，必须显式失败。
+func parseKeyLine(line, base string) (*KeyInfo, bool) {
 	m := keyMethodRe.FindStringSubmatch(line)
 	if len(m) != 2 {
-		return nil
+		return nil, false
 	}
 	method := strings.ToUpper(m[1])
 	if method == "NONE" {
-		return nil
+		return nil, false
 	}
-	um := keyURIRe.FindStringSubmatch(line)
-	if len(um) != 2 || um[1] == "" {
-		return nil
+	uri := keyURIAttr(line)
+	if uri == "" {
+		return nil, true
 	}
-	k := &KeyInfo{Method: method, URI: resolveURL(base, um[1])}
+	k := &KeyInfo{Method: method, URI: resolveURL(base, uri)}
 	if iv := keyIVRe.FindStringSubmatch(line); len(iv) == 2 {
 		if b, err := hex.DecodeString(iv[1]); err == nil {
 			k.IV = b
 		}
 	}
-	return k
+	if fm := keyFormatRe.FindStringSubmatch(line); len(fm) == 3 {
+		if fm[1] != "" {
+			k.KeyFormat = fm[1]
+		} else {
+			k.KeyFormat = strings.TrimSpace(fm[2])
+		}
+	}
+	return k, false
+}
+
+// keyURIAttr 提取 #EXT-X-KEY 行的 URI 属性值：带引号（规范）与裸值（非规范）
+// 两种形态都认。属性缺失或值为空返回 ""。
+func keyURIAttr(line string) string {
+	m := keyURIRe.FindStringSubmatch(line)
+	if len(m) != 3 {
+		return ""
+	}
+	if m[1] != "" {
+		return m[1]
+	}
+	return strings.TrimSpace(m[2])
 }
 
 func (j *dlJob) pickHighestBitrateM3U8(content string) (string, error) {

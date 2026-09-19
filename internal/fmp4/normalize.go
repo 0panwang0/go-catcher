@@ -1,6 +1,6 @@
 // fMP4 分片规范化：时间戳归一化 + 裸 NAL→AVCC 封装转换。
 //
-// 直播流（如 B 站）的 fMP4 分片有两个会导致播放黑屏的已知问题：
+// 直播流的 fMP4 分片有两个会导致播放黑屏的已知问题：
 //  1. tfdt 携带绝对时间（直播已进行时长，如 7792 秒），拼接后首帧 PTS 高达
 //     数千秒，播放器会一直等待从 0 开始、实际不存在的帧 → 黑屏。
 //  2. mdat 内视频样本是 Annex-B 裸 NAL（start code 分隔），不符合 MP4 的
@@ -36,22 +36,53 @@ type normState struct {
 	end        map[uint32]uint64 // trackID -> 该轨累计最大相对结束时间（track timescale 单位）
 	trackVideo map[uint32]bool   // trackID -> 是否视频轨（未知轨道默认按视频处理）
 	init       *fmp4InitInfo     // init 段解析结果（mehd/mvhd 回填位置；finish 收尾用）
+	// logf 诊断出口，由调用方注入（见 NewStateWithLogger）。库不碰进程 stdout：
+	// 那条流在原生消息宿主模式下是协议通道。nil = 丢弃诊断（纯库使用方不需要）。
+	logf func(format string, args ...any)
 }
 
-// NewState 创建 fMP4 规范化状态（core 容器注册表的状态工厂）。
+// NewState 创建 fMP4 规范化状态（core 容器注册表的状态工厂，不接日志出口）。
 // 返回具体类型：core 侧经 func() NormState 包装装配进注册表，
 // 编译期即验证方法集满足 core.NormState 接口。
-func NewState() *normState {
+func NewState() *normState { return NewStateWithLogger(nil) }
+
+// NewStateWithLogger 同上，但把诊断输出接到调用方给的出口。
+// 服务端传 platform.Logf（进统一日志文件）；测试传捕获函数即可断言诊断内容。
+func NewStateWithLogger(logf func(format string, args ...any)) *normState {
 	return &normState{
 		baseline:   make(map[uint32]uint64),
 		end:        make(map[uint32]uint64),
 		trackVideo: make(map[uint32]bool),
+		logf:       logf,
 	}
 }
+
+// logDiagnostic 输出一条诊断（nil 接收者与 nil 出口都安全）。
+//
+// nil 安全是必须的：normalizeFMP4Segment 的 recover 兜底里就要用它，而那时
+// n 可能本身就是 nil（调用方传了空状态）。
+func (n *normState) logDiagnostic(format string, args ...any) {
+	if n == nil || n.logf == nil {
+		return
+	}
+	n.logf(format, args...)
+}
+
+// normPersistVersion 快照格式版本。
+//
+// 快照里存的是**回填位置**（init 段 mehd/mvhd 的字节偏移）与各轨 tfdt 基准，
+// 一旦按错位的结构解读，写出的成品会"能播但时间轴/时长是坏的"——正是本项目
+// 反复出现的头号缺陷形态。所以版本不认识就整份丢弃，不接受"尽力解析"。
+//
+// 副作用如实记：升级后**旧的未完成任务**其快照没有 v 字段（V=0）会被拒，
+// 该任务续传时基准与回填位置重算，已录部分与新分段之间可能出现时间轴跳变。
+// 这个代价比静默按错偏移回填小，且只影响跨越格式变更的在途任务。
+const normPersistVersion = 1
 
 // normPersist snapshot/restore 的持久化字节格式（JSON）：全部跨分片状态。
 // Init 字段复用 fmp4InitInfo.persist() 的字节。
 type normPersist struct {
+	V        int               `json:"v"`                  // 格式版本，不匹配即整份丢弃
 	Baseline map[string]uint64 `json:"baseline,omitempty"` // trackID -> tfdt 基准
 	End      map[string]uint64 `json:"end,omitempty"`      // trackID -> 累计结束时间
 	Init     json.RawMessage   `json:"init,omitempty"`     // init 段解析结果（mehd/mvhd 回填位置）
@@ -67,7 +98,7 @@ func (n *normState) Normalize(data []byte) ([]byte, error) {
 func (n *normState) Snapshot() []byte {
 	n.mu.Lock()
 	defer n.mu.Unlock()
-	p := normPersist{Baseline: n.baselineStrings(), End: n.endStrings()}
+	p := normPersist{V: normPersistVersion, Baseline: n.baselineStrings(), End: n.endStrings()}
 	if n.init != nil {
 		if b, err := json.Marshal(n.init.persist()); err == nil {
 			p.Init = b
@@ -80,14 +111,30 @@ func (n *normState) Snapshot() []byte {
 	return out
 }
 
-// Restore 载入持久化的全部状态（断点续传）；未知/损坏字节静默忽略。
-func (n *normState) Restore(b []byte) {
+// Restore 载入持久化的全部状态（断点续传），返回是否采用了这份状态。
+//
+// 返回 false 的合同是「这份状态没被采纳」：**保证 n 未被改动**。因此所有拒绝
+// 判据（空字节 / 非 JSON / 版本不符 / 有版本号但无 baseline）都必须在写入前
+// 判掉 —— 三支 false 里曾有一支（init-only 快照）先写 end/init 再返回 false，
+// 调用方按合同处理却拿到被污染的对象（评审自审 #12）。
+// 快照里的偏移与基准错了不会立刻报错，而是写进成品才暴露，宁可让调用方
+// 显式拒绝续传（tfdt 基准丢了会让新分片从头计时、与已录内容重叠），
+// 也不按错结构解析。
+func (n *normState) Restore(b []byte) bool {
 	if len(b) == 0 {
-		return
+		return false
 	}
 	var p normPersist
 	if err := json.Unmarshal(b, &p); err != nil {
-		return
+		return false
+	}
+	if p.V != normPersistVersion {
+		return false
+	}
+	if len(p.Baseline) == 0 {
+		// 有版本号但没有 tfdt 基准：init-only 快照（只写完 init 段就退出）。
+		// 拿它续传同样会让新分片从头计时，照样拒绝 —— 与版本不符同语义。
+		return false
 	}
 	n.mu.Lock()
 	defer n.mu.Unlock()
@@ -112,6 +159,7 @@ func (n *normState) Restore(b []byte) {
 			}
 		}
 	}
+	return true
 }
 
 // baselineStrings 导出基准（持久化，续传恢复用）。
@@ -201,6 +249,43 @@ type trafInfo struct {
 	sizeOffs    []int // trun 内逐样本 size 字段在 moof 内的偏移（空 = trun 无逐样本 size）
 }
 
+// readU32 读取 b[off:off+4] 的 big-endian uint32；字段必须完整落在 end 之前，
+// 否则 ok=false。
+//
+// tfhd/tfdt/trun 的字段是"按 flag 位声明存在"的可选字段流，box 声明长度与实际
+// 布局不符时裸读有两种后果，都不能接受：
+//   - 越出缓冲 → panic，在下载 goroutine 里就是整个进程消失（P1-2）；
+//   - 读到紧邻下一个 box 的字节当字段值 → 静默错值（时长/样本表全错，但日志正常）。
+func readU32(b []byte, off, end int) (uint32, bool) {
+	if off < 0 || end > len(b) || off+4 > end {
+		return 0, false
+	}
+	return binary.BigEndian.Uint32(b[off:]), true
+}
+
+// readU64 同 readU32，读 8 字节（tfdt version==1 的 64 位 baseMediaDecodeTime）。
+func readU64(b []byte, off, end int) (uint64, bool) {
+	if off < 0 || end > len(b) || off+8 > end {
+		return 0, false
+	}
+	return binary.BigEndian.Uint64(b[off:]), true
+}
+
+// maxTrafSamples 单个 traf 的样本数上限（畸形输入防线）。
+//
+// trun.sample_count 是 32 位裸值，而"trun 不带逐样本字段、全靠 tfhd 默认值"
+// 是合法形态，所以没法用 box 剩余字节数卡住它：一个 28 字节的 trun 声明
+// sample_count=2.7e9 就能让逐样本循环跑 27 亿次，进程被拖死（fuzz 30 秒
+// 就撞出来了）。真流一个分片的样本数在千级（30fps × 6 秒 = 180），
+// 一百万已是三个数量级的余量；超出只会让该分片按畸形放行，不会误伤正常流。
+const maxTrafSamples = 1 << 20
+
+// trafFieldErr 构造"字段越界"错误：box 声明的长度装不下按 flag 位声明存在的字段。
+// 由 parseMoof 的错误分支原样放行该分片（不归一化，也不崩）。
+func trafFieldErr(typ string, boxSize int) error {
+	return fmt.Errorf("traf 字段越界: %s (box 声明 %d 字节)", typ, boxSize)
+}
+
 // boxHeader 解析 b[pos:] 处的一个 box 头，返回总大小、payload 偏移、类型。
 func boxHeader(b []byte, pos int) (size, payload int, typ string, ok bool) {
 	if pos+8 > len(b) {
@@ -269,12 +354,21 @@ func parseTraf(moof []byte, pos, size int, moofAbs int, prevDataEnd int, firstTr
 		if !ok || q+sz > end {
 			break
 		}
+		// 字段只能落在本子盒声明的范围内：声明的长度装不下 flag 位里点名的字段
+		// 就是畸形输入，报错放行（见 readU32 注释）。
+		boxEnd := q + sz
 		switch typ {
 		case "tfhd":
 			hasTfhd = true
-			flags := binary.BigEndian.Uint32(moof[payload:]) & 0xFFFFFF
+			fl, ok := readU32(moof, payload, boxEnd)
+			if !ok {
+				return nil, trafFieldErr(typ, sz)
+			}
+			flags := fl & 0xFFFFFF
 			defaultBaseIsMoof = flags&0x020000 != 0
-			ti.trackID = binary.BigEndian.Uint32(moof[payload+4:])
+			if ti.trackID, ok = readU32(moof, payload+4, boxEnd); !ok {
+				return nil, trafFieldErr(typ, sz)
+			}
 			r := payload + 8
 			if flags&0x1 != 0 {
 				r += 8 // base_data_offset
@@ -283,12 +377,16 @@ func parseTraf(moof []byte, pos, size int, moofAbs int, prevDataEnd int, firstTr
 				r += 4 // sample_description_index
 			}
 			if flags&0x8 != 0 { // default_sample_duration
-				defaultDur = binary.BigEndian.Uint32(moof[r:])
+				if defaultDur, ok = readU32(moof, r, boxEnd); !ok {
+					return nil, trafFieldErr(typ, sz)
+				}
 				hasDefaultDur = true
 				r += 4
 			}
 			if flags&0x10 != 0 { // default_sample_size
-				defaultSampleSize = binary.BigEndian.Uint32(moof[r:])
+				if defaultSampleSize, ok = readU32(moof, r, boxEnd); !ok {
+					return nil, trafFieldErr(typ, sz)
+				}
 				hasDefaultSize = true
 				r += 4
 			}
@@ -296,20 +394,46 @@ func parseTraf(moof []byte, pos, size int, moofAbs int, prevDataEnd int, firstTr
 				r += 4 // default_sample_flags
 			}
 		case "tfdt":
+			if payload >= boxEnd {
+				return nil, trafFieldErr(typ, sz)
+			}
 			ti.tfdtWide = moof[payload] == 1
 			ti.tfdtOff = payload + 4
 			if ti.tfdtWide {
-				ti.tfdtVal = binary.BigEndian.Uint64(moof[payload+4:])
+				v, ok := readU64(moof, payload+4, boxEnd)
+				if !ok {
+					return nil, trafFieldErr(typ, sz)
+				}
+				ti.tfdtVal = v
 			} else {
-				ti.tfdtVal = uint64(binary.BigEndian.Uint32(moof[payload+4:]))
+				v, ok := readU32(moof, payload+4, boxEnd)
+				if !ok {
+					return nil, trafFieldErr(typ, sz)
+				}
+				ti.tfdtVal = uint64(v)
 			}
 		case "trun":
-			flags := binary.BigEndian.Uint32(moof[payload:]) & 0xFFFFFF
-			nc := int(binary.BigEndian.Uint32(moof[payload+4:]))
+			fl, ok := readU32(moof, payload, boxEnd)
+			if !ok {
+				return nil, trafFieldErr(typ, sz)
+			}
+			flags := fl & 0xFFFFFF
+			ncRaw, ok := readU32(moof, payload+4, boxEnd)
+			if !ok {
+				return nil, trafFieldErr(typ, sz)
+			}
+			nc := int(ncRaw)
+			if nc < 0 || nc > maxTrafSamples {
+				return nil, fmt.Errorf("traf 样本数不合理: trun 声明 %d（上限 %d）", ncRaw, maxTrafSamples)
+			}
 			ti.sampleCount += nc
 			r := payload + 8
 			if flags&0x1 != 0 {
-				dataOff = int32(binary.BigEndian.Uint32(moof[r:]))
+				v, ok := readU32(moof, r, boxEnd)
+				if !ok {
+					return nil, trafFieldErr(typ, sz)
+				}
+				dataOff = int32(v)
 				ti.dataOffOff = r
 				hasDataOff = true
 				r += 4
@@ -317,16 +441,42 @@ func parseTraf(moof []byte, pos, size int, moofAbs int, prevDataEnd int, firstTr
 			if flags&0x4 != 0 {
 				r += 4 // first_sample_flags
 			}
+			// 逐样本字段按 box 剩余字节数一次校验：nc 个样本的字段放不下就是畸形，
+			// 不必等逐项读越界（也避免把"装不下"错当成"刚好读完"）。
+			per := 0
+			if flags&0x100 != 0 {
+				per += 4
+			}
+			if flags&0x200 != 0 {
+				per += 4
+			}
+			if flags&0x400 != 0 {
+				per += 4
+			}
+			if flags&0x800 != 0 {
+				per += 4
+			}
+			if per > 0 && nc > (boxEnd-r)/per {
+				return nil, trafFieldErr(typ, sz)
+			}
 			// 逐样本字段按固定顺序交错出现（只含置位了的 flag）：
 			// duration(0x100) → size(0x200) → flags(0x400) → cto(0x800)
 			var dsum uint64
 			for i := 0; i < nc; i++ {
 				if flags&0x100 != 0 {
-					dsum += uint64(binary.BigEndian.Uint32(moof[r:]))
+					v, ok := readU32(moof, r, boxEnd)
+					if !ok {
+						return nil, trafFieldErr(typ, sz)
+					}
+					dsum += uint64(v)
 					r += 4
 				}
 				if flags&0x200 != 0 {
-					ti.sizes = append(ti.sizes, binary.BigEndian.Uint32(moof[r:]))
+					v, ok := readU32(moof, r, boxEnd)
+					if !ok {
+						return nil, trafFieldErr(typ, sz)
+					}
+					ti.sizes = append(ti.sizes, v)
 					ti.sizeOffs = append(ti.sizeOffs, r)
 					r += 4
 				}
@@ -374,11 +524,16 @@ func parseTraf(moof []byte, pos, size int, moofAbs int, prevDataEnd int, firstTr
 // normalizeTraf 用跨分片基准把 tfdt 归零并原位写回 moof 字节，
 // 同时把该轨相对结束时间（归一化 tfdt + 样本总时长）累计进状态。
 func normalizeTraf(moof []byte, ti *trafInfo, n *normState) {
-	if ti.tfdtOff < 0 {
+	// 纵深防御：偏移由 parseTraf 给出、正常路径必然在界内，
+	// 但这里是"往字节里写"的位置，越界写比读更不可挽回。
+	if ti.tfdtOff < 0 || ti.tfdtOff+4 > len(moof) {
 		return
 	}
 	nv := n.normTfdt(ti.trackID, ti.tfdtVal, ti.durTotal)
 	if ti.tfdtWide {
+		if ti.tfdtOff+8 > len(moof) {
+			return
+		}
 		binary.BigEndian.PutUint64(moof[ti.tfdtOff:], nv)
 	} else {
 		binary.BigEndian.PutUint32(moof[ti.tfdtOff:], uint32(nv))
@@ -641,7 +796,21 @@ func rebuildMdat(mdat []byte, mdatAbs int, infos []*trafInfo, n *normState) ([]b
 // 分片开头若内联 init（ftyp/moov）则先经 consumeInit 补 mehd 占位、解析轨道类型
 // 与回填位置；非 fMP4 / 结构异常的数据原样返回（不报错），保证下载管线不受影响。
 // 由 normState.Normalize 调用（接口入口），内部直接访问具体字段。
-func normalizeFMP4Segment(data []byte, n *normState) ([]byte, error) {
+func normalizeFMP4Segment(data []byte, n *normState) (out []byte, err error) {
+	// 兜底（P1-2）：这个函数跑在下载 goroutine 与 pipeline goroutine 里，
+	// 漏网 panic 的后果是整个进程消失（GUI、其它任务一起没）。降级为原样放行，
+	// 兑现上面那句契约。
+	//
+	// 返回的必须是"当时最好的输入"而不是半构造的 out：consumeInit 可能已插入
+	// mehd 占位并让 n.init 记下对应偏移，漏掉占位会让收尾回填写到错误位置。
+	defer func() {
+		if r := recover(); r != nil {
+			n.logDiagnostic("[norm] 规范化内部错误（已拦截，原样放行）: %v", r)
+			out = data
+			err = nil
+		}
+	}()
+
 	if len(data) < 16 || n == nil {
 		return data, nil
 	}
@@ -651,7 +820,7 @@ func normalizeFMP4Segment(data []byte, n *normState) ([]byte, error) {
 	if len(data) < 16 {
 		return data, nil
 	}
-	out := make([]byte, 0, len(data)+len(data)/16)
+	out = make([]byte, 0, len(data)+len(data)/16)
 	var pending *pendingMoof
 	pos := 0
 	for pos+8 <= len(data) {
@@ -667,6 +836,10 @@ func normalizeFMP4Segment(data []byte, n *normState) ([]byte, error) {
 			}
 			infos, perr := parseMoof(data[pos:pos+sz], pos)
 			if perr != nil {
+				// 不归一化就原样放行：畸形结构不该拖垮管线，但必须留痕——
+				// 这个分片的时间轴不会被修正（播放端可能表现为跳变/黑屏），
+				// 静默吞掉错误正是本项目反复出现的头号缺陷形态。
+				n.logDiagnostic("[norm] 分片结构异常，原样放行（未做时间轴归一化）: %v", perr)
 				out = append(out, data[pos:]...)
 				return out, nil
 			}

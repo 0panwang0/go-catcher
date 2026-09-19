@@ -22,6 +22,13 @@ type CLIOptions struct {
 	Limit       int
 	ServerMode  bool
 	Port        int
+
+	// 进程角色（互斥；root main.go 按固定顺序分发）。
+	NativeHostMode      bool // 浏览器原生消息宿主：stdin/stdout 走帧协议，被浏览器拉起
+	TrayMode            bool // 托盘常驻：起服务 + 托盘就位，不弹主窗（由宿主拉起）
+	InstallNativeHost   bool // 登记原生消息宿主
+	UninstallNativeHost bool // 注销原生消息宿主
+	NativeHostStatus    bool // 打印原生消息宿主登记状态
 }
 
 // CLI 运行参数（userAgent/outputFile/limit/bindAddr/referer）现为 Runtime
@@ -47,8 +54,37 @@ func ParseCLI(args []string) CLIOptions {
 	fs.IntVar(&o.Limit, "limit", 0, "只下载前 N 个分片（0 = 全部，用于试片）")
 	fs.BoolVar(&o.ServerMode, "server", false, "无头 HTTP 服务模式（监听 127.0.0.1，供浏览器扩展调用）")
 	fs.IntVar(&o.Port, "port", 0, "服务模式监听端口（仅 --server 时有效；不指定则用设置里配置的端口）")
+	fs.BoolVar(&o.NativeHostMode, "native-host", false, "以浏览器原生消息宿主形态运行（由浏览器按注册表清单拉起，正常无需手动调用）")
+	fs.BoolVar(&o.TrayMode, "tray", false, "启动客户端并只驻留系统托盘（不弹主窗口）")
+	fs.BoolVar(&o.InstallNativeHost, "install-native-host", false, "登记本程序为浏览器原生消息宿主（写入当前用户注册表）")
+	fs.BoolVar(&o.UninstallNativeHost, "uninstall-native-host", false, "注销浏览器原生消息宿主登记")
+	fs.BoolVar(&o.NativeHostStatus, "native-host-status", false, "打印原生消息宿主登记状态")
 	_ = fs.Parse(args)
+	// 浏览器按宿主清单拉起本程序时，命令行长这样：
+	//     go-catcher.exe chrome-extension://<扩展ID>/
+	// 清单的 path 只能写可执行文件本身——Chrome/Edge 用 CreateProcess 起进程，
+	// 不接受"带参数的命令行"，转而把调用方 origin 作为第一个参数传进来。
+	// 所以这个"裸 origin"必须识别成宿主模式：漏掉它，进程会落到下面的"未知模式"
+	// 分支打印用法后立刻退出，浏览器侧只看到"宿主已退出"，用户看到的是
+	// "点了没反应、程序起不来"——而这恰恰是安装清单正确、注册表正确时才发生的
+	// 情形（2026-09-14 实测踩到）。
+	if !o.NativeHostMode {
+		for _, a := range fs.Args() {
+			if isBrowserExtensionOrigin(a) {
+				o.NativeHostMode = true
+				break
+			}
+		}
+	}
 	return o
+}
+
+// isBrowserExtensionOrigin 判断某个参数是否为浏览器传入的扩展来源。
+//
+// 兼容大小写与两侧空白；不校验扩展 ID 是否在我们的允许名单里——那是宿主清单
+// allowed_origins 的职责（浏览器已经按它拦过一道），这里只做形态识别。
+func isBrowserExtensionOrigin(arg string) bool {
+	return strings.HasPrefix(strings.ToLower(strings.TrimSpace(arg)), "chrome-extension://")
 }
 
 // PrintUsage 打印 CLI 用法（无参数 GUI 启动的说明一并给出）。
@@ -57,7 +93,9 @@ func PrintUsage() {
 	fmt.Println("示例: go-catcher.exe --url=https://cdn.example.com/xxx/1080p/video.m3u8 --referer=https://example.com/watch/123 -o \"视频名.ts\"")
 	fmt.Println("可选: --limit=N 只下前 N 片试片")
 	fmt.Println("代理: --proxy=system 跟随系统代理（默认）| http://host:port 手动 | direct 直连")
+	fmt.Println("注意: CLI 不做断点续传；若输出文件旁存在 .part 半成品，会被丢弃后重下（需续传请用 GUI 客户端）")
 	fmt.Println("其它: --server [--port=端口] 无头服务模式 | 不带任何参数启动 GUI 客户端")
+	fmt.Println("浏览器联动: --install-native-host 登记宿主（让扩展能唤起本程序）| --native-host-status 查看登记状态 | --uninstall-native-host 注销")
 }
 
 // describeProxy 启动横幅用的代理描述：system 模式展开为注册表实际读数。
@@ -94,17 +132,17 @@ func RunCLI(o CLIOptions) int {
 
 	start := time.Now()
 	fmt.Println("========================================")
-	fmt.Println("  m3u8 视频下载器 (uTLS + Clash)")
+	fmt.Println("  m3u8 视频下载器")
 	fmt.Println("  URL:     ", job.m3u8URL)
 	fmt.Println("  代理:    ", rt.describeProxy())
 	fmt.Println("  Referer: ", job.referer)
 	fmt.Println("  输出:    ", rt.outputFile)
-	fmt.Println("  TLS指纹: Chrome Auto")
+	fmt.Println("  TLS指纹: 浏览器指纹伪装")
 	fmt.Println("========================================")
 
 	// 1. 获取 m3u8 / 直链识别
 	fmt.Println("\n[1/4] 获取 m3u8 索引...")
-	m3u8Content, baseURL, isDirect, err := job.fetchPlaylist()
+	m3u8Content, baseURL, isDirect, err := job.fetchPlaylist(context.Background())
 	if err != nil {
 		fmt.Printf("获取 m3u8 失败: %v\n", err)
 		return 1
@@ -131,8 +169,8 @@ func RunCLI(o CLIOptions) int {
 		fmt.Println("播放列表中没有找到任何媒体分片（响应可能被加密或压缩）")
 		return 1
 	}
-	if kerr := ensureSingleKey(pl); kerr != nil {
-		fmt.Printf("%v\n", kerr)
+	if verr := validatePlaylist(pl); verr != nil {
+		fmt.Printf("%v\n", verr)
 		return 1
 	}
 	segURLs := pl.segments
@@ -169,6 +207,10 @@ func RunCLI(o CLIOptions) int {
 		partPath = outAbs + ".part"
 		fmt.Printf("识别为 %s 容器，输出扩展名修正为 %s\n", container.ID, finalOut)
 	}
+	if resetErr := resetPartForRerun(partPath); resetErr != nil {
+		fmt.Printf("%v\n", resetErr)
+		return 1
+	}
 	if werr := writeInitSegmentFor(dlCtx, job, &pl, partPath); werr != nil {
 		fmt.Printf("%v\n", werr)
 		return 1
@@ -182,7 +224,6 @@ func RunCLI(o CLIOptions) int {
 		defer stop()
 		dlCtx = ctx
 		job.live = true
-		job.seen = make(map[string]bool)
 		written, err = job.liveDownload(dlCtx, partPath, 0)
 	} else {
 		written, err = streamDownload(dlCtx, job, segURLs, 0, pl.mediaSeq, partPath)
@@ -216,4 +257,55 @@ func RunCLI(o CLIOptions) int {
 
 	fmt.Printf("\n全部完成，耗时 %s\n", time.Since(start).Round(time.Second))
 	return 0
+}
+
+// resetPartForRerun CLI 的 HLS 路径不做断点续传：`<输出>.part` 一旦存在，
+// 必须丢弃后重下。
+//
+// 为什么不能直接续跑（2026-09-11 评审 P1-2）：streamWriter 以 O_APPEND 打开
+// 目标文件、startIdx 恒为 0（见 newStreamWriter），而磁盘上可能还留着上一次失败
+// 写下的几百 MB。旧代码既不截断也不推进 startIdx，新一轮内容会从文件末尾再写
+// 一遍 —— 产物是一个"视频播两遍"的合法 TS，validateOutput 的同步字节判据发现
+// 不了，用户拿到的是静默损坏、体积翻倍的文件。
+//
+// 选择"丢弃"而不是"按长度反推断点"：分片边界在字节层面不可复原（没有持久化
+// 已写分片数），猜错就是错位。清掉至少是确定的正确。
+//
+// GUI 路径无此问题：新任务经 uniquePath 拿到不冲突的文件名，不会复用旧 .part。
+func resetPartForRerun(partPath string) error {
+	info, err := os.Stat(partPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return fmt.Errorf("检查临时文件失败: %w", err)
+	}
+	if info.IsDir() {
+		return nil
+	}
+	if info.Size() > 0 {
+		fmt.Printf("检测到上次未完成的临时文件（%s，%s）——CLI 不做断点续传，已丢弃并重新下载\n",
+			partPath, humanBytes(info.Size()))
+	}
+	// 删除失败必须中止：留着旧内容继续写就是"内容写两遍"那个 bug。
+	if rmErr := os.Remove(partPath); rmErr != nil && !os.IsNotExist(rmErr) {
+		return fmt.Errorf("丢弃临时文件失败（请手动删除后重试）: %s: %w", partPath, rmErr)
+	}
+	// 分片位图是直链分片续传的元数据，与本次全新下载无关，一并清掉避免误用
+	if rmErr := os.Remove(chunkMetaPath(partPath)); rmErr != nil && !os.IsNotExist(rmErr) {
+		fmt.Printf("[warn] 清理分片位图失败 %s: %v\n", chunkMetaPath(partPath), rmErr)
+	}
+	return nil
+}
+
+// humanBytes 把字节数格式化成便于阅读的 GB/MB（仅用于提示信息）。
+func humanBytes(n int64) string {
+	switch {
+	case n >= 1<<30:
+		return fmt.Sprintf("%.2f GB", float64(n)/float64(int64(1)<<30))
+	case n >= 1<<20:
+		return fmt.Sprintf("%.1f MB", float64(n)/float64(int64(1)<<20))
+	default:
+		return fmt.Sprintf("%d KB", n/(1<<10))
+	}
 }

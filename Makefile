@@ -14,7 +14,8 @@
 #   make all TMP="$TMP" TEMP="$TEMP" USERPROFILE="$USERPROFILE" \
 #     LOCALAPPDATA="$LOCALAPPDATA" GOCACHE="$LOCALAPPDATA/go-build" \
 #     GOPATH="$HOME/go" GOPROXY=https://goproxy.cn,direct
-# 例外：ext / ext-check 只用到 Node 与 git、不碰 go，任意 shell 下都能正常跑。
+# 例外：ext / ext-check 只用到 Node 与 git、不碰 go，任意 shell 下都能正常跑
+# （打包与校验逻辑都在 Node 脚本里，Makefile 侧只有 sh/cmd 通用的 && 链）。
 
 EXE       := go-catcher.exe
 MAIN_PKG  := ./cmd/go-catcher
@@ -50,7 +51,7 @@ cover:
 	go test ./... -coverprofile=cover.out -count=1
 	go tool cover -func=cover.out
 
-# 与 CI 对齐的本地质量门（Go job）：格式 → 静态检查 → 测试（含竞态）。
+# 与 CI 对齐的本地质量门（Go job）：格式 → 断言纪律 → 静态检查 → 测试（含竞态）。
 # 提交前跑这个，和 .github/workflows/ci.yml 的 go job 是同一套判定。
 # 扩展侧的等价物是 ext-check；两边都跑用 check-all。
 check:
@@ -59,42 +60,37 @@ check:
 		echo "以下文件未格式化，请执行 gofmt -w："; echo "$$unformatted"; exit 1; \
 	fi; \
 	echo "gofmt OK"
+	node tools/assert-lint.mjs
 	go vet ./...
 	go test ./... -race -count=1
 
 # ============================================================
 # Edge 扩展（与 CI 的 extension job 同一套判定）
-# 源码是 src/background/ 下的 ES 模块，esbuild 打包成单文件 background.js；
-# bundle 提交进仓库（用户"解压即加载"无需构建），所以改了 src/ 必须重新打包。
-# 需要 Node 18+；首次会自动 npm install。
+# 源码是 src/background/ 下的 ES 模块，esbuild 打包成两个产物：
+#   background.js      —— service worker（src/background/main.js）
+#   content-shared.js  —— content script 侧的共享实现（src/content-shared-entry.js）
+# 两者都提交进仓库（用户"解压即加载"无需构建），所以改了 src/ 必须重新打包。
+# 需要 Node 22+：downloader.js 是 ES 模块（import 共享解析源码），
+# `node --check` 对 .js 的模块语法探测要 22.7+，Node 18 会误报语法错误。
+# 首次会自动 npm install。
 # ============================================================
 
-# 打包：src/background/*.js → edge_extension/background.js
+# 打包：src/background/*.js → edge_extension/background.js + edge_extension/content-shared.js
+# 依赖自举在 build.mjs 里（node_modules 缺失才 npm install），这里不写任何
+# sh 专属语法（`{ ... }` / `$$(...)`），cmd 与 sh 都能跑（&& 两种 shell 通用）。
 ext:
-	@cd $(EXT_DIR) && { [ -d node_modules ] || npm install --no-audit --no-fund; } && node build.mjs
+	cd $(EXT_DIR) && node build.mjs
 
-# 扩展侧完整校验：打包 → bundle 一致性 → 语法 → 回归测试
-# 一致性判据用「打包前后 sha1 是否变化」，而不是 git diff：
+# 扩展侧完整校验：打包 → bundle 一致性 → 语法 → 回归测试。
+# 校验逻辑在 scripts/check.mjs（Node 实现，跨 shell），一致性判据是
+# 「打包前后 sha1 是否变化」而非 git diff：
 #   本地改了 src/ 还没提交时 git diff 必然非空（那是正常的，不该报错）；
-#   hash 判据只在"改了 src 却没重新打包"时命中，两种场景都对。
+#   sha1 只在「改了 src/ 却忘了重新打包」时命中，两种场景都对。
 #   CI 那边用的是 git diff --exit-code（对已提交的 blob 比对），fresh checkout 下等价。
+# manifest.json 用同一判据：build.mjs 会把 package.json 版本注入 manifest，
+# 改了版本没跑 build 时在这里被拦下（版本单一来源）。
 ext-check:
-	@cd $(EXT_DIR) && \
-	before=$$(sha1sum background.js 2>/dev/null | cut -d' ' -f1); \
-	{ [ -d node_modules ] || npm install --no-audit --no-fund >/dev/null; } || exit 1; \
-	node build.mjs || exit 1; \
-	after=$$(sha1sum background.js | cut -d' ' -f1); \
-	if [ "$$before" != "$$after" ]; then \
-		echo "background.js 与 src/ 不一致（重新打包后内容有变），请提交更新后的 bundle"; \
-		exit 1; \
-	fi; \
-	echo "bundle 一致性 OK"; \
-	for f in content.js background.js content-main.js downloader.js tests/*.js; do \
-		node --check "$$f" || exit 1; \
-	done; \
-	node -e "JSON.parse(require('fs').readFileSync('manifest.json','utf8'))" || exit 1; \
-	for t in tests/*.test.js; do echo "---- $$t"; node "$$t" || exit 1; done; \
-	echo "extension OK"
+	cd $(EXT_DIR) && node scripts/check.mjs
 
 # 两边一起跑（等价于 CI 的两个 job）
 check-all: check ext-check

@@ -50,6 +50,28 @@ func findKeyMethod(method string) *keyMethodEntry {
 	return nil
 }
 
+// normKeyFormat 归一化 KEYFORMAT 用于比较：缺省（空串）与显式 "identity" 是
+// 同一件事（RFC 8216 规定缺省即 identity），大小写也不敏感。
+//
+// 必须走归一化再比：一条把首条 key 裸写、后续重复时写了 KEYFORMAT="identity"
+// 的播放列表完全合法，按原始字符串比较会被误判成 key rotation 而拒绝下载。
+func normKeyFormat(f string) string {
+	f = strings.ToLower(strings.TrimSpace(f))
+	if f == "" {
+		return "identity"
+	}
+	return f
+}
+
+// isIdentityKeyFormat 报告 KEYFORMAT 是否为 identity（含缺省）。
+//
+// 只有 identity 形态（URI 直接返回裸密钥字节）才是本工具能处理的；其余
+// （com.apple.streamingkeydelivery、urn:uuid:edef8ba9-… 等）代表 DRM 密钥系统，
+// 需要许可证才能拿到真密钥。
+func isIdentityKeyFormat(f string) bool {
+	return normKeyFormat(f) == "identity"
+}
+
 // ensureDecryptor 按播放列表声明的密钥装配分片解密器。
 // 幂等：key 指纹不变不重建（直播每轮轮询重复调用也只拉一次 key）；
 // 明文播放列表（key 为 nil）清空现有解密器。
@@ -114,7 +136,7 @@ func newAES128Decryptor(spec KeySpec) (SegDecryptor, error) {
 }
 
 // DecryptSegment 每个分片独立 CBC 解密（HLS 语义：分片间不链式，各自以 IV 起块）。
-// PKCS7 尾部填充不剥离：hls.js/ffmpeg 同样保留，TS/MP4 解复用器会忽略尾部残片；
+// PKCS7 尾部填充不剥离：主流播放器实现同样保留，TS/MP4 解复用器会忽略尾部残片；
 // 猜测式剥离反而可能吃掉合法数据（明文恰好以 0x01 结尾的 TS 包）。
 func (d *aes128Decryptor) DecryptSegment(seq uint64, data []byte) ([]byte, error) {
 	if len(data) == 0 {
@@ -142,5 +164,5 @@ func mediaSeqIV(seq uint64) []byte {
 
 // fingerprint key 指纹（方法+URI+IV），ensureDecryptor 幂等去重用。
 func (k *KeyInfo) fingerprint() string {
-	return k.Method + "|" + k.URI + "|" + hex.EncodeToString(k.IV)
+	return k.Method + "|" + k.URI + "|" + hex.EncodeToString(k.IV) + "|" + normKeyFormat(k.KeyFormat)
 }

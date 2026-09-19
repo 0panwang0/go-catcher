@@ -66,16 +66,86 @@ func TestClipFilenameForDir(t *testing.T) {
 	}
 }
 
-// TestIsExecutableExt 落盘前拒绝可执行扩展名（与 /openfile 组合即代码执行）。
-func TestIsExecutableExt(t *testing.T) {
-	for _, e := range []string{".exe", ".BAT", ".ps1", ".lnk", ".scr"} {
-		if !isExecutableExt(e) {
-			t.Errorf("%s 应被判定为可执行", e)
+// TestIsAllowedDownloadExt 落盘前只放行白名单内的扩展名（可执行扩展名与 /openfile
+// 组合即是本机代码执行；黑名单列不完，所以反过来列白名单）。
+func TestIsAllowedDownloadExt(t *testing.T) {
+	// 白名单：本服务会产出的媒体/字幕类型，含容器修正后的结果（.mp4 等）
+	for _, e := range []string{".ts", ".mp4", ".mkv", ".webm", ".m4s", ".AAC", ".srt", ".vtt"} {
+		if !isAllowedDownloadExt(e) {
+			t.Errorf("%s 应被放行", e)
 		}
 	}
-	for _, e := range []string{".mp4", ".ts", ".m3u8", ""} {
-		if isExecutableExt(e) {
-			t.Errorf("%s 不应被判定为可执行", e)
+	// 可执行类一律拒绝；空扩展名由调用方单独处理（补 .ts），这里也必须为 false
+	for _, e := range []string{
+		".exe", ".BAT", ".ps1", ".lnk", ".scr", ".msi", ".dll", ".sys", ".js",
+		// 黑名单容易漏掉的这几类，白名单天然覆盖
+		".pif", ".msc", ".inf", ".settingcontent-ms", ".search-ms", ".diagcab", ".url", ".reg",
+		"", ".txt",
+	} {
+		if isAllowedDownloadExt(e) {
+			t.Errorf("%s 不应被放行", e)
 		}
+	}
+}
+
+// TestSanitizeFilenameStripsBidiControls 显示欺骗类控制符必须被剔除。
+//
+// 形态：U+202E（RLO）之后的文本整段反向显示，于是 "video_4pm.mp4" 在界面上
+// 显示成 "video_mp4.exe" 之类；它们不可见，靠肉眼看名字发现不了。扩展名白名单
+// 限制了真正的危害，但"看着叫 A 实际叫 B"这一半得在名字里堵掉。
+// 扰动点：删掉 sanitizeFilename 里的 isBidiControl 分支，本条会红。
+func TestSanitizeFilenameStripsBidiControls(t *testing.T) {
+	for _, r := range []rune{
+		0x202A, 0x202B, 0x202C, 0x202D, 0x202E, // LRE/RLE/PDF/LRO/RLO
+		0x2066, 0x2067, 0x2068, 0x2069, // LRI/RLI/FSI/PDI
+		0x200E, 0x200F, 0x061C, // LRM/RLM/ALM
+	} {
+		in := "a" + string(r) + "b.mp4"
+		if got := sanitizeFilename(in); got != "ab.mp4" {
+			t.Errorf("U+%04X 应被剔除：sanitizeFilename(%q)=%q want %q", r, in, got, "ab.mp4")
+		}
+	}
+
+	// 对抗场景：反向覆盖让末尾看起来是 .mp4，真实扩展名被藏起来
+	spoofed := "video_4pm\u202Eexe.mp4"
+	if got := sanitizeFilename(spoofed); strings.ContainsAny(got, "\u202A\u202E") {
+		t.Fatalf("欺骗名未被清理: %q", got)
+	}
+}
+
+// TestSanitizeFilenameKeepsEmojiJoiners 不能一刀切删所有 Cf（格式）类字符：
+// 零宽连接符 U+200D 是 emoji 组合序列的一部分，剔掉会把正常标题拆坏
+// ——那属于"为了安全把正常功能也弄坏"。
+func TestSanitizeFilenameKeepsEmojiJoiners(t *testing.T) {
+	const family = "👨\u200d👩\u200d👧"
+	if got := sanitizeFilename(family + ".mp4"); got != family+".mp4" {
+		t.Fatalf("含零宽连接符的标题被改坏：got %q want %q", got, family+".mp4")
+	}
+}
+
+// TestNormalizeOutputStripsBidiControls CLI 的 -o 路径也要滤 bidi 控制符。
+//
+// sanitizeFilename 只有 server 一个调用点，CLI 的 -o 走 normalizeOutput —— 若这层
+// 不滤，浮层兜底命令（-o 由页面标题派生、站点可控）的 U+202E 能一路进到文件名。
+// 但只滤 bidi、**不做** sanitizeFilename 的整套清洗：带目录的 -o 会被毁掉。
+// 扰动点：删掉 normalizeOutput 里的 isBidiControl 分支，本条会红。
+func TestNormalizeOutputStripsBidiControls(t *testing.T) {
+	rt := &Runtime{outputFile: "out/vid\u202Eeo.ts"}
+	if got := rt.normalizeOutput(); got != "out/video.ts" {
+		t.Fatalf("路径里的 bidi 控制符未被剔除: %q want %q", got, "out/video.ts")
+	}
+	rt = &Runtime{outputFile: "a\u202Ab.mp4"}
+	if got := rt.normalizeOutput(); got != "ab.mp4" {
+		t.Fatalf("U+202A 应被剔除: %q want %q", got, "ab.mp4")
+	}
+	// 零宽连接符不是 bidi 控制符，必须保留（防"顺手改成整体删 Cf"）
+	rt = &Runtime{outputFile: "a\u200Db.mp4"}
+	if got := rt.normalizeOutput(); got != "a\u200Db.mp4" {
+		t.Fatalf("非 bidi 的 Cf 字符不应被删: %q", got)
+	}
+	// 无扩展名的原行为不回归
+	rt = &Runtime{outputFile: "out/video"}
+	if got := rt.normalizeOutput(); got != "out/video.ts" {
+		t.Fatalf("无扩展名应补 .ts: %q", got)
 	}
 }

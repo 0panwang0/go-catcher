@@ -2,33 +2,113 @@
 package core
 
 import (
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"path/filepath"
 	"strings"
 	"time"
+
+	"github.com/0panwang0/go-catcher/internal/platform"
 )
 
-// newMux 装配全部路由；传入 Engine 供 /svc/stop 触发停机与端点访问运行时状态。
+// routeDef 一条路由表项：路径、允许的方法、是否要求令牌、是否防嵌套、handler 工厂。
+// 端点的一切约束都收敛在这里——新增端点 = 加一行表项，不再需要同时改
+// mux 装配、handler 内的方法检查、auth 的免令牌白名单三处（评审 P2-3）。
+// needToken 默认语义为要求令牌；false 仅限响应体不含秘密的端点。
+//
+// frameGuard 表示该端点返回「注入令牌的 HTML 页面」，默认禁止被 iframe 嵌套
+// （点击劫持防护，见 auth.go）。它必须和路径写在同一条表项里：防护集合若另立
+// 一份硬编码名单，与路由表脱钩时漏项就是**静默放行**（fail-open）——这正是把
+// 它收进表里的理由（早期版本栽过一次）。
+type routeDef struct {
+	path       string
+	methods    []string
+	needToken  bool
+	frameGuard bool
+	new        func(*Engine) http.HandlerFunc
+}
+
+// routeDefs 全部端点一览表。免令牌端点只有 4 个：探活 / 握手 / 两个页面。
+// 新增免令牌端点前必须想清楚：它的响应体是否含秘密（令牌）、是否会被 CORS
+// 读到（豁免成立的前提见 auth.go 的说明）；若返回 HTML，还要把 frameGuard 置 true
+// （有测试遍历本表兜底，见 auth_test.go）。
+var routeDefs = []routeDef{
+	{"/health", []string{http.MethodGet}, false, false, func(*Engine) http.HandlerFunc { return handleHealth }},
+	{"/svc/info", []string{http.MethodGet}, false, false, func(e *Engine) http.HandlerFunc { return e.handleSvcInfo }},
+	{"/", []string{http.MethodGet}, false, true, func(e *Engine) http.HandlerFunc { return e.handleHomePage }},
+	{"/settings", []string{http.MethodGet}, false, true, func(e *Engine) http.HandlerFunc { return e.handleSettingsPage }},
+
+	{"/pickdir", []string{http.MethodGet}, true, false, func(e *Engine) http.HandlerFunc { return e.handlePickDir }},
+	{"/status", []string{http.MethodGet}, true, false, func(e *Engine) http.HandlerFunc { return e.handleStatus }},
+	// /download 用 GET 触发副作用：令牌挡住了外部调用方，但语义上它不是幂等方法，
+	// 属 CSRF 友好型接口（历史包袱）。GET 是扩展侧的既有契约（content script /
+	// downloader 页都按 GET 拼 URL），改 POST 会破坏兼容，故显式记一笔，新端点勿模仿。
+	{"/download", []string{http.MethodGet}, true, false, func(e *Engine) http.HandlerFunc { return e.handleDownload }},
+	{"/probe", []string{http.MethodGet}, true, false, func(e *Engine) http.HandlerFunc { return e.handleProbe }},
+	{"/pause", []string{http.MethodGet}, true, false, func(e *Engine) http.HandlerFunc { return e.handlePause }},
+	// /stop 只对直播任务有效（点播的"停"是可续的暂停，走 /pause）：
+	// 结束录制并把已录部分收尾成正式文件。stop/resume 都是后加的端点，
+	// 按上面"新端点勿模仿"的口径走 POST（扩展与内置界面已同步）。
+	{"/stop", []string{http.MethodPost}, true, false, func(e *Engine) http.HandlerFunc { return e.handleStop }},
+	{"/resume", []string{http.MethodPost}, true, false, func(e *Engine) http.HandlerFunc { return e.handleResume }},
+	{"/cancel", []string{http.MethodGet}, true, false, func(e *Engine) http.HandlerFunc { return e.handleCancel }},
+	{"/remove", []string{http.MethodGet}, true, false, func(e *Engine) http.HandlerFunc { return e.handleRemove }},
+	{"/openfolder", []string{http.MethodGet}, true, false, func(e *Engine) http.HandlerFunc { return e.handleOpenFolder }},
+	{"/openfile", []string{http.MethodGet}, true, false, func(e *Engine) http.HandlerFunc { return e.handleOpenFile }},
+	{"/config", []string{http.MethodGet, http.MethodPost}, true, false, func(e *Engine) http.HandlerFunc { return e.handleConfig }},
+	{"/log", []string{http.MethodGet}, true, false, func(*Engine) http.HandlerFunc { return handleLog }},
+	{"/svc/stop", []string{http.MethodPost}, true, false, func(e *Engine) http.HandlerFunc { return e.handleSvcStop }},
+}
+
+// routeFor 返回路径最终由哪个路由项处理，复现 ServeMux 的匹配语义：精确匹配
+// 优先；未命中则取最长前缀匹配的 subtree 模式（以 "/" 结尾）；都没有就是
+// catch-all "/"。抽出来是为了让「防嵌套」与「令牌豁免」共享同一张表，
+// 不再各自维护一份路径名单。
+//
+// 注意它对「未命中」的处理与 tokenFreePath 相反，这是有意的：
+//   - tokenFreePath 未命中 → 要求令牌（未知路径不可能是免令牌端点）
+//   - routeFor 未命中 → 落到 catch-all "/"，于是 frameGuard 继承 "/" 的值（设防）
+//
+// 两者都取安全侧，但方向不同；把它俩合并成一个函数会破坏其中一条的语义。
+func routeFor(p string) (routeDef, bool) {
+	var best routeDef
+	bestLen := -1
+	for _, rd := range routeDefs {
+		if rd.path == p {
+			return rd, true
+		}
+		if strings.HasSuffix(rd.path, "/") && strings.HasPrefix(p, rd.path) && len(rd.path) > bestLen {
+			best, bestLen = rd, len(rd.path)
+		}
+	}
+	return best, bestLen >= 0
+}
+
+// newMux 装配全部路由。鉴权（Host / 令牌 / CORS）由 engine.go 在 mux 外层
+// 的 guard 统一完成；方法校验在这里按路由表包一层，handler 内不再各自写。
 func newMux(e *Engine) *http.ServeMux {
 	mux := http.NewServeMux()
-	mux.HandleFunc("/health", handleHealth)
-	mux.HandleFunc("/pickdir", e.handlePickDir)
-	mux.HandleFunc("/status", e.handleStatus)
-	mux.HandleFunc("/download", e.handleDownload)
-	mux.HandleFunc("/probe", e.handleProbe) // 扩展预检：服务端代拉 m3u8 文本（绕浏览器 CORS 限制）
-	mux.HandleFunc("/pause", e.handlePause)
-	mux.HandleFunc("/resume", e.handleResume)
-	mux.HandleFunc("/cancel", e.handleCancel)
-	mux.HandleFunc("/remove", e.handleRemove)
-	mux.HandleFunc("/openfolder", e.handleOpenFolder)
-	mux.HandleFunc("/openfile", e.handleOpenFile)
-	mux.HandleFunc("/config", e.handleConfig)
-	mux.HandleFunc("/log", handleLog)                 // 最近日志（排障用；受令牌保护，可能含本机路径）
-	mux.HandleFunc("/settings", e.handleSettingsPage) // 独立设置页（监控页 ⚙ 跳转进入）
-	mux.HandleFunc("/", e.handleHomePage)             // 下载监控页
-	registerSvcRoutes(mux, e)                         // /svc/stop（工具条"停止服务"按钮 / 扩展兜底）
+	for _, rd := range routeDefs {
+		mux.HandleFunc(rd.path, methodGuard(rd, rd.new(e)))
+	}
 	return mux
+}
+
+// methodGuard 校验请求方法：不在表内的方法回 405 并带 Allow 头。
+// 方法校验本身不构成防线（真正的防线是令牌），但它能挡掉 <img src>、<form>
+// 这类不需要 CORS 就发出的噪声请求，也让端点的契约明确。
+func methodGuard(rd routeDef, h http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		for _, m := range rd.methods {
+			if r.Method == m {
+				h(w, r)
+				return
+			}
+		}
+		w.Header().Set("Allow", strings.Join(rd.methods, ", "))
+		jsonError(w, http.StatusMethodNotAllowed, "method not allowed")
+	}
 }
 
 func handleHealth(w http.ResponseWriter, r *http.Request) {
@@ -40,11 +120,7 @@ func handleHealth(w http.ResponseWriter, r *http.Request) {
 // GUI 是 windowsgui 子系统、没有控制台，这份日志是排障的唯一入口；
 // 内容含本机路径，因此走令牌鉴权（不在 guard 的免鉴权白名单里）。
 func handleLog(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-	tail, err := LogTail(logTailLines)
+	tail, err := platform.LogTail(platform.LogTailLines)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusNotFound)
 		return
@@ -54,18 +130,52 @@ func handleLog(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprint(w, tail)
 }
 
-func (e *Engine) handleDownload(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
+// parseSegRefs 解析 /download 的 segrefs 查询参数：JSON 对象 { host: referer }，
+// 记录「分片主机 → 浏览器实际发出的 Referer」。分片 CDN 防盗链可能只认解析站域名
+// 而非页面域名，抓分片时按 host 精确选用（见 dlJob.segmentReferer）。
+//
+// 返回的键统一归一小写（host 大小写不敏感，而 Go 的 url.Parse 不归一化 host）。
+// 空串 / 空 map 一律返回 (nil, nil)：segrefs 是可选参数，缺省即「不覆盖」。
+//
+// **值为空串的条目必须保留**：它表示「浏览器对该 host 根本没带 Referer」，是
+// segmentReferer 用来抑制页面 Referer 兜底的信号（丢掉它 = 回退页面 Referer ⇒
+// 白名单型防盗链必 403）。只有 host 为空 / 空白的条目才丢弃。
+func parseSegRefs(raw string) (map[string]string, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil, nil
 	}
+	var m map[string]string
+	if err := json.Unmarshal([]byte(raw), &m); err != nil {
+		return nil, fmt.Errorf("segrefs 必须是 JSON 对象（host→referer）: %w", err)
+	}
+	out := make(map[string]string, len(m))
+	for h, r := range m {
+		h = strings.ToLower(strings.TrimSpace(h))
+		if h == "" {
+			continue
+		}
+		out[h] = r
+	}
+	if len(out) == 0 {
+		return nil, nil
+	}
+	return out, nil
+}
+
+func (e *Engine) handleDownload(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 	m3u8URL := q.Get("m3u8")
 	refererParam := q.Get("referer")
+	segRefs, segRefsErr := parseSegRefs(q.Get("segrefs"))
 	filename := strings.TrimSpace(q.Get("filename"))
 	mode := strings.ToLower(q.Get("mode"))
 	if filename == "" {
 		filename = "video.ts"
+	}
+	if segRefsErr != nil {
+		jsonError(w, http.StatusBadRequest, "segrefs 参数非法: "+segRefsErr.Error())
+		return
 	}
 	if m3u8URL == "" {
 		http.Error(w, "missing required query param: m3u8", http.StatusBadRequest)
@@ -91,14 +201,17 @@ func (e *Engine) handleDownload(w http.ResponseWriter, r *http.Request) {
 	// dir 必须在「用户选过的目录」白名单内：否则配合攻击者可控的 m3u8，
 	// 这就是一个「往任意绝对路径写文件」的原语（写进启动目录 = 持久化代码执行）。
 	if !e.rt.isAllowedSaveDir(saveDir) {
-		http.Error(w, `{"error":"dir 不在允许的下载目录内，请先通过 /pickdir 选择目录"}`, http.StatusBadRequest)
+		jsonError(w, http.StatusBadRequest, "dir 不在允许的下载目录内，请先通过 /pickdir 选择目录")
 		return
 	}
 	fname := sanitizeFilename(filename)
-	// 拒绝可执行类扩展名：本服务把内容原样落盘，允许写 .exe/.bat/.ps1 就等于
+	// 扩展名白名单（P2-10）：本服务把内容原样落盘，允许写可执行类扩展名就等于
 	// 提供了一个"落盘可执行文件"的原语——与 /openfile 组合即为本机代码执行。
-	if e2 := filepath.Ext(fname); isExecutableExt(e2) {
-		http.Error(w, `{"error":"拒绝可执行文件扩展名"}`, http.StatusBadRequest)
+	// 黑名单列不完（.pif/.msc/.inf/.settingcontent-ms…），故改为白名单，
+	// 只放行本服务确实会产出的媒体/字幕类型（见 allowedDownloadExts）。
+	if ext := filepath.Ext(fname); ext != "" && !isAllowedDownloadExt(ext) {
+		jsonError(w, http.StatusBadRequest,
+			"不支持的输出扩展名（仅允许视频/音频/字幕类型）: "+ext)
 		return
 	}
 	// 不强改扩展名：调用方给什么就用什么；完全没扩展名的（TS 原始流）补 .ts
@@ -112,8 +225,14 @@ func (e *Engine) handleDownload(w http.ResponseWriter, r *http.Request) {
 
 	id := e.rt.newTaskID()
 	// 目标路径在任务创建时就定死（.part 与正式文件都基于它），
-	// 这样暂停/重启恢复后仍写回同一个文件，不会冒出 "xxx (1).mp4"
-	finalPath := uniquePath(filepath.Join(saveDir, fname))
+	// 这样暂停/重启恢复后仍写回同一个文件，不会冒出 "xxx (1).mp4"。
+	// uniquePath 会原子认领该路径（创建 0 字节 .part 占位），因此并发同名
+	// 请求拿到的一定是不同的文件名（P2-8）。
+	finalPath, err := uniquePath(filepath.Join(saveDir, fname))
+	if err != nil {
+		jsonError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
 	// 去重后可能与请求名不一致（同名已存在 -> "xxx (1).mp4"）。
 	// 用真实落盘名回填 filename，让任务卡片显示与实际文件一致，多次下载也能区分。
 	displayName := filepath.Base(finalPath)
@@ -121,7 +240,7 @@ func (e *Engine) handleDownload(w http.ResponseWriter, r *http.Request) {
 	te.mu.Lock()
 	te.st = taskState{
 		id: id, queued: true, running: false, stage: "排队中", started: time.Now(),
-		m3u8URL: m3u8URL, referer: refererParam, filename: displayName, saveDir: saveDir,
+		m3u8URL: m3u8URL, referer: refererParam, segRefs: segRefs, filename: displayName, saveDir: saveDir,
 		finalPath: finalPath,
 	}
 	te.mu.Unlock()
@@ -131,12 +250,20 @@ func (e *Engine) handleDownload(w http.ResponseWriter, r *http.Request) {
 	e.rt.tasksMu.Unlock()
 	e.rt.pruneOldTasks()
 
-	// 启动 goroutine：先排队等并发槽，拿到后真正跑 pipeline
-	go runDiskPipeline(te)
+	// 启动 goroutine：先排队等并发槽，拿到后真正跑 pipeline。
+	// 必须走 runGuarded：管线里的任何漏网 panic 都只能让这一个任务失败，
+	// 不能带走整个进程（畸形 fMP4/init 段的崩溃就是这么进来的）。
+	go runGuarded(te, func() { runDiskPipeline(te) })
 
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusAccepted)
-	fmt.Fprintf(w, `{"started":true,"id":%q,"dir":%q,"filename":%q}`, id, saveDir, fname)
+	// 统一走 writeJSON：%q 是 strconv.Quote，对控制字符会产出 \x01 这类
+	// JSON 非法转义（见 handlers.go 顶部说明）。saveDir/fname 来自调用方，
+	// 不保证不含控制字符。
+	writeJSON(w, http.StatusAccepted, struct {
+		Started  bool   `json:"started"`
+		ID       string `json:"id"`
+		Dir      string `json:"dir"`
+		Filename string `json:"filename"`
+	}{true, id, saveDir, fname})
 }
 
 // runDiskPipeline 跑单个下载任务：排队 → 解析 → 流式下载（边下边写）→ 落盘。

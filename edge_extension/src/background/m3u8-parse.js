@@ -1,5 +1,9 @@
-// m3u8 / 画质解析工具（downloader.js 侧保留一份等价实现：它是页面脚本，
-// 与 SW 无法共享模块——改动两处时务必同步语义）。
+// m3u8 / 画质解析工具 —— 全项目唯一的解析实现。
+// service worker 打包时内联它；downloader 页面（ES 模块）直接 import 同一份文件；
+// content.js 是经典 content script（非模块，无法 import），由 build.mjs 把本文件
+// 打成 content-shared.js 注入（与 background.js 同一套路：产物提交进仓库，
+// scripts/check.mjs 卡"改了源码没重新打包"）。三处共用这一份源码，
+// 所以不存在"改一处忘另一处"。新增解析逻辑请加在这里。
 
 export function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
@@ -18,6 +22,18 @@ export async function fetchText(url) {
   }
 }
 
+// resolveURL 按 base 解出绝对地址。**解析失败时原样返回**而不是抛：
+// 播放列表里的相对地址一定配得上 base，真解不出说明这条数据本身就坏，
+// 让调用方拿到原串（后续请求会自然失败并留下明确错误）远好过把整份
+// 播放列表解析炸掉——后者会让用户看到"分析失败"，却完全不知道坏在哪。
+export function resolveURL(base, rel) {
+  try {
+    return new URL(rel, base).href;
+  } catch {
+    return rel;
+  }
+}
+
 export function parseDuration(text) {
   let total = 0;
   for (const m of text.matchAll(/#EXTINF:([\d.]+)/g)) {
@@ -26,12 +42,26 @@ export function parseDuration(text) {
   return total;
 }
 
+// fmtDur 是 parseDuration 的反向：把秒数写成给人看的时长（"3:07" / "1:02:03"）。
+// 唯一实现（评审 P3-6）：浮层（content.js）与下载器页面（downloader.js）此前
+// 各有一份**逐字相同**的拷贝——同一份播放列表解析出来的时长，却在两处各写一次
+// 格式化，改动只落一处就会出现"浮层显示 3:07、扩展页显示 3:07.0"这类不一致。
+// 放在解析模块里是因为它和 parseDuration 是一对（前者的输出正是后者的输入）。
+export function fmtDur(sec) {
+  const h = Math.floor(sec / 3600);
+  const m = Math.floor((sec % 3600) / 60);
+  const s = Math.round(sec % 60);
+  return h > 0
+    ? `${h}:${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}`
+    : `${m}:${String(s).padStart(2, "0")}`;
+}
+
 export function parseSegments(text, baseURL) {
   const list = [];
   for (const raw of text.split("\n")) {
     const line = raw.trim();
     if (!line || line.startsWith("#")) continue;
-    list.push(new URL(line, baseURL).href);
+    list.push(resolveURL(baseURL, line));
   }
   return list;
 }
@@ -46,54 +76,70 @@ export function parseVariants(text, baseURL) {
     if (!next || next.startsWith("#")) continue;
     const bw = parseInt((info.match(/BANDWIDTH=(\d+)/) || [])[1] || "0", 10);
     const res = (info.match(/RESOLUTION=(\d+x\d+)/) || [])[1] || "";
+    const codec = (info.match(/CODECS="([^"]+)"/) || [])[1] || "";
     list.push({
-      url: new URL(next, baseURL).href,
+      url: resolveURL(baseURL, next),
       bandwidth: bw,
       resolution: res,
-      label: variantLabel(res, bw, next),
+      codec,
+      quality: variantQuality(next, res, bw),
+      label: variantLabel(next, res, bw),
     });
   }
   list.sort((a, b) => b.bandwidth - a.bandwidth);
   return list;
 }
 
-export function variantLabel(resolution, bandwidth, uri) {
-  let q = "";
+// variantQuality 取一个变体的短画质名（"1080P" / "4K" / "2.5 Mbps"）。
+// 参数序与 variantLabel 保持一致：**URI 在前**。这两函数历史上参数序不同
+// （同名不同序），调用点照着另一份的签名写就会静默算错画质——统一到
+// 「uri, resolution, bandwidth」并靠这个顺序消除隐患。
+export function variantQuality(uri, resolution, bandwidth) {
   const m = String(uri).match(/(2160p|1440p|1080p|720p|480p|360p|240p)/i);
-  if (m) {
-    q = m[1].toUpperCase();
-  } else if (resolution) {
+  if (m) return m[1].toUpperCase();
+  if (resolution) {
     const h = parseInt(resolution.split("x")[1], 10);
-    q =
-      {
-        2160: "4K",
-        1440: "2K",
-        1080: "1080P",
-        720: "720P",
-        480: "480P",
-        360: "360P",
-        240: "240P",
-      }[h] || resolution;
-  } else if (bandwidth) {
-    q = (bandwidth / 1e6).toFixed(1) + " Mbps";
+    const byHeight = {
+      2160: "4K",
+      1440: "2K",
+      1080: "1080P",
+      720: "720P",
+      480: "480P",
+      360: "360P",
+      240: "240P",
+    };
+    if (byHeight[h]) return byHeight[h];
   }
+  if (bandwidth) return `${(bandwidth / 1e6).toFixed(1)} Mbps`;
+  return "";
+}
+
+export function variantLabel(uri, resolution, bandwidth) {
+  const q = variantQuality(uri, resolution, bandwidth);
   const parts = [q || "未知画质"];
   if (resolution) parts.push(resolution);
   if (bandwidth) parts.push(`${(bandwidth / 1000).toFixed(0)} kbps`);
   return parts.join(" · ");
 }
 
+// shortQuality 取标签首段（"1080P · 1920x1080 · 3000 kbps" → "1080P"）。
 export function shortQuality(variant) {
   return String(variant.label || "").split(" · ")[0] || "";
 }
 
+// qualityFromURL 从 URL 推断画质：优先路径里的分辨率字样（/1080p/v.m3u8、
+// xxx_720p.m3u8 都命中），其次 ?quality= 参数。
+// 与 buildOutputName / makeFilename 共用——文件名后缀必须由这一处决定，
+// 否则同一个视频从浮层下载与从扩展页下载会得到不同的文件名。
 export function qualityFromURL(u) {
+  if (!u) return "";
   try {
-    const m = decodeURIComponent(new URL(u).pathname).match(
+    const p = new URL(u);
+    const m = decodeURIComponent(p.pathname).match(
       /(2160p|1440p|1080p|720p|480p|360p|240p)/i
     );
     if (m) return m[1].toUpperCase();
-    const q = new URL(u).searchParams.get("quality");
+    const q = p.searchParams.get("quality");
     if (q) return q;
   } catch { }
   return "";
@@ -104,7 +150,7 @@ export function qualityFromURL(u) {
 // ============================================================
 // 嗅探列表里 master 和各变体（或 ad 预热片）混在一起。
 // 按 URL 形态判断"是不是 master 候选"——变体通常带 _240p/_720p 等后缀，
-// master 则一般是 /ID.m3u8。这种启发式足够处理常见 CDN（growcdn/alibaba 等）。
+// master 则一般是 /ID.m3u8。这种启发式足够覆盖常见 CDN 的命名。
 export function isMasterCandidateM3U8(url) {
   try {
     const path = new URL(url).pathname;

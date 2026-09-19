@@ -62,16 +62,27 @@ jobs:
         run: |
           npm install --no-audit --no-fund
           node build.mjs
-          # 打包产物应与仓库中提交的 bundle 一致（防止改了 src/ 忘了重新构建）
-          git diff --exit-code -- background.js || (echo "background.js 与 src/ 不一致，请本地跑 node build.mjs 后提交" && exit 1)
+          # 打包产物应与仓库中提交的产物一致（防止改了 src/ 忘了重新构建）；
+          # background.js（service worker）与 content-shared.js（content script 侧
+          # 共享实现）都是生成物 + 入库文件，缺一不可。
+          # manifest.json 同理——build.mjs 会把 package.json 的版本注入 manifest，
+          # 只改了 package.json 没跑 build 提交时，这里同样拦下（版本单一来源）。
+          git diff --exit-code -- background.js content-shared.js manifest.json || (echo "打包产物或 manifest.json 与源不一致，请本地跑 node build.mjs 后提交" && exit 1)
 
       - name: 语法检查
         run: |
-          for f in content.js background.js content-main.js downloader.js tests/*.js; do
+          for f in content.js content-shared.js background.js content-main.js downloader.js tests/*.js; do
             node --check "$f"
             echo "OK  $f"
           done
           node -e "JSON.parse(require('fs').readFileSync('manifest.json','utf8'));console.log('OK  manifest.json')"
+
+      - name: 断言纪律（恒真断言扫描）
+        # 放在 extension job 是因为这里已经装好 Node；它扫的是**两侧**的测试文件
+        # （internal/**/*_test.go 与 edge_extension/tests/*.test.js），不是只扫扩展。
+        # 规则见 tools/assert-lint.mjs 头注释：恒真断言通过时不产生信息，是"假绿"。
+        working-directory: .
+        run: node tools/assert-lint.mjs
 
       - name: 回归测试
         run: |

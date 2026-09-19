@@ -321,8 +321,16 @@ func TestWriteDurationTruncate(t *testing.T) {
 func TestRestoreValidInit(t *testing.T) {
 	st := NewState()
 	st.consumeInit(buildInit(1000, map[uint32]uint32{1: 90000, 2: 48000}))
+	// 快照必须带 tfdt 基准（baseline）才会被采纳：init-only 快照（无任何分片）
+	// 会让续传的新分片从头计时，Restore 拒绝且保证状态未被改动（见
+	// normstate_test 的 TestRestoreFalseLeavesStateUntouched）。所以先落一片。
+	if _, err := st.Normalize(buildSegment(90000, 48000, true)); err != nil {
+		t.Fatalf("Normalize: %v", err)
+	}
 	st2 := NewState()
-	st2.Restore(st.Snapshot())
+	if !st2.Restore(st.Snapshot()) {
+		t.Fatal("带 baseline 的快照应被采纳")
+	}
 	if st2.init == nil {
 		t.Fatal("Restore 应恢复 init 解析结果")
 	}

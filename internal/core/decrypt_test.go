@@ -23,14 +23,15 @@ import (
 
 func TestParseKeyLine(t *testing.T) {
 	cases := []struct {
-		name     string
-		line     string
-		base     string
-		wantNil  bool
-		method   string
-		uri      string
-		wantIV   []byte
-		wantNoIV bool
+		name          string
+		line          string
+		base          string
+		wantNil       bool
+		wantMalformed bool
+		method        string
+		uri           string
+		wantIV        []byte
+		wantNoIV      bool
 	}{
 		{
 			name:   "显式IV大写hex",
@@ -60,10 +61,11 @@ func TestParseKeyLine(t *testing.T) {
 			wantNil: true,
 		},
 		{
-			name:    "缺URI",
-			line:    `#EXT-X-KEY:METHOD=AES-128`,
-			base:    "https://s.example.com/a.m3u8",
-			wantNil: true,
+			name:          "缺URI",
+			line:          `#EXT-X-KEY:METHOD=AES-128`,
+			base:          "https://s.example.com/a.m3u8",
+			wantNil:       true,
+			wantMalformed: true,
 		},
 		{
 			name:    "缺METHOD",
@@ -74,7 +76,11 @@ func TestParseKeyLine(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			k := parseKeyLine(tc.line, tc.base)
+			k, malformed := parseKeyLine(tc.line, tc.base)
+			if malformed != tc.wantMalformed {
+				t.Fatalf("malformed=%v want %v（声明了加密但 URI 解析不出必须报畸形，不能静默降级为明文）",
+					malformed, tc.wantMalformed)
+			}
 			if tc.wantNil {
 				if k != nil {
 					t.Fatalf("want nil, got %+v", k)
