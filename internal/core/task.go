@@ -31,6 +31,10 @@ type taskState struct {
 	// 分片下载进度（运行时由 dlJob 的原子计数刷新）
 	segDone int64
 	segTot  int64
+	// flushedBytes 已确认落盘的分片字节数（含 init 段）—— 与 segDone 的**落盘值**
+	// 语义配对持久化。HLS 分片长度由源站决定、每片不同，只凭分片序号无法确定
+	// .part 该在哪一字节处对齐；恢复时两个数都要（见 flushedMark）。
+	flushedBytes int64
 	// 直链下载进度（字节）。与分片进度**互斥**：直链任务没有分片，segTot 恒 0，
 	// 它的 pct 只能按字节算 —— 只认分片的旧实现让直链完成后仍显示 0.0%
 	// （进度条却是满的，因为条宽另有判据）。分片任务这两个字段恒 0。
@@ -51,6 +55,14 @@ type taskState struct {
 
 	// containerID 探测到的容器 ID（断点续传恢复规范化等格式相关行为）
 	containerID string
+	// restartNote 恢复时的一次性提示（如"续传信息不完整，已从头下载"）。
+	// 它让"已下的字节被重取了一遍"这件事对用户可见 —— 悄悄重来会让人以为
+	// 程序在浪费带宽。只在本次进程内有效（重下完成后即无意义），故不持久化。
+	restartNote string
+	// partMode 直链 .part 的写入模式（"chunked"/"stream"，空 = 未知的旧任务）。
+	// 它决定重启后"文件大小能不能当续传起点"：分片模式用 WriteAt 稀疏写，
+	// 文件中间可能有洞，按大小续传会把洞留在成品里（见 downloadDirect 的模式守卫）。
+	partMode string
 	// normState 跨分片规范化状态的持久化字节（NormState.snapshot 导出；
 	// 续传时 restore 恢复：tfdt 基准/结束时间/init 信息全包）
 	normState []byte
@@ -238,6 +250,7 @@ type taskStateDTO struct {
 	Live        bool    `json:"live"`
 	Interrupted bool    `json:"interrupted"`
 	GapSeconds  float64 `json:"gapSeconds"`
+	RestartNote string  `json:"restartNote"`
 	FileMissing bool    `json:"fileMissing"`
 	Pct         float64 `json:"pct"`
 	SegDone     int64   `json:"segDone"`
@@ -280,6 +293,7 @@ func toTaskStateDTO(t taskState) taskStateDTO {
 		ID: t.id, Queued: t.queued, Running: t.running, Paused: t.paused,
 		Canceled: t.canceled, Stage: t.stage, Done: t.done, Live: t.live,
 		Interrupted: t.interrupted, GapSeconds: t.gapSeconds,
+		RestartNote: t.restartNote,
 		FileMissing: fileMissing, Pct: pct, SegDone: t.segDone, SegTot: t.segTot,
 		FinalPath: t.finalPath, OpenPath: t.openPath, Error: t.errorMsg,
 		M3U8URL: t.m3u8URL, Referer: t.referer, Filename: t.filename, SaveDir: t.saveDir,

@@ -1,15 +1,26 @@
-// 按钮/图标顺序的统一约定（学徒 2026-09-16 定）。
+// 按钮/图标顺序的统一约定（学徒 2026-09-16 立；2026-09-21 三轮回合后定稿）。
 //
-// 语义：
-//   - 每个任务的操作按钮，**第一个位置固定是「主操作」**（运行中 ⏸ / 直播运行中 ⏹；
-//     已暂停 ▶继续；失败 ▶重试；已完成 ▶打开文件），
-//   - **第二个位置固定是「📂 打开文件夹」**，
-//   - 之后才是「✕ 取消」「🗑 移除记录」。
+// 语义（定稿）：
+//   - 每个任务的操作按钮，先排**全部主操作**（运行中 ⏸ / 直播运行中 ⏹；
+//     已暂停 ⏯继续；失败 ↻重试；已完成 ▶打开文件）—— 一律蓝底 `primary`，
+//     而且**可以不止一个**（直播中断态就是「▶ 打开文件」+「⏹ 停止」两个），连排在最前；
+//   - 接着是「✕ 取消」（红 danger）；
+//   - 然后是「📂 打开文件夹」—— 中性描边，它**恒在末位或次末位**：
+//     **本状态有「🗑 移除记录」⇒ 📂 排在 🗑 前面（倒数第二）；没有 🗑 ⇒ 📂 自己占末位**；
+//   - 「🗑 移除记录」—— 只要出现就**恒在最后一位**。
+//     ⇒ 一句话：**📂 一直贴着末尾走，只有 🗑 出现时它往左让一格。**
 //   - 详细模式（actions()）与简略模式（rowCard()）**必须给出同一套顺序**。
 //
-// **失败态例外**（学徒 2026-09-19 定）：次序是 ↻重试 → ✕取消 → 📂打开文件夹，
-// 且**不提供「🗑 移除记录」** —— 失败是该被修的对象，不是该被清掉的垃圾。
-// 两处实现同样必须一致，由 TestFailedRowHasNoRemoveAction 钉住。
+// ⚠️ 这条规则收敛了三轮，前两轮的中间结论都作废，别按印象改回去：
+//  1. 「把打开文件夹放到最后面就行」⇒ 📂 恒末位、✕ 倒数第二；
+//  2. 「打开文件夹要放到倒数第二个，倒数第一个是移除记录」⇒ 曾理解成"销毁类压轴"，
+//     顺手把 ✕ 也排到 📂 之后（失败 / 运行中 / 已暂停都成了 `… 📂 ✕`）；
+//  3. 定稿：「有 🗑 时 📂 倒数第二，没 🗑 时 📂 倒数第一」（学徒 2026-09-21 原话）。
+//     ⇒ 失败 / 运行中 / 已暂停 = `… ✕ 📂`；已完成 / 直播已完成 = `… 📂 🗑`。
+//
+// **失败态的唯一特殊约定**（学徒 2026-09-19 定）：**不提供「🗑 移除记录」** ——
+// 失败是该被修的对象，不是该被清掉的垃圾。它的**次序**完全服从上面的通用约定
+// （没有 🗑 ⇒ 📂 占末位），由 TestFailedRowHasNoRemoveAction 钉住。
 //
 // 为什么要有这条回归：两处原来是各自逐状态手拼的，于是 📂 在「运行中/已暂停/失败」
 // 排第 1 位、在「已完成」排第 2 位 —— 图标列宽度不一，📂 横向漂移，右对齐也救不回来。
@@ -17,6 +28,9 @@
 //
 // 页面是 HTML 字符串，前端没有运行时测试，所以用扫描把顺序钉住
 // （参照 web_live_ui_test.go）。断言只看相对次序，不管缩进与排版。
+// ⚠️ 直播终态那一支现在有**两种尾部排法**（已收尾带 🗑 / 待收尾只有 ✕），
+// 单条 markers 序列表达不了"条件性尾部"，因此拆成 3 条：主操作、「已收尾」子分支、
+// 「待收尾」子分支。子分支锚点 = `if (t.done) {` / `} else {`（rowCard 也写成同构的 if/else）。
 package core
 
 import (
@@ -49,7 +63,8 @@ func assertMarkerOrder(t *testing.T, where, reg string, markers []string) {
 			return
 		}
 		if i < prev {
-			t.Errorf("%s：%q 排在了 %q 之前 —— 约定是「① 主操作 ② 📂 打开文件夹 ③ ✕ 取消 / 🗑 移除记录」",
+			t.Errorf("%s：%q 排在了 %q 之前 —— 约定是「① 全部主操作 ② ✕ 取消 ③ 📂 打开文件夹"+
+				"（末位或次末位：有 🗑 时在它前面）④ 🗑 移除记录（末位）」",
 				where, m, prevName)
 			return
 		}
@@ -72,22 +87,30 @@ func TestActionButtonOrderIsUnified(t *testing.T) {
 	const (
 		// 详细模式（按钮带文字）
 		aMainRun    = "'⏸ 暂停','pauseTask("
-		aMainResume = "'⏯ 继续下载','resumeTask("
+		aMainResume = "'⏯ 继续','resumeTask("
 		aMainRetry  = "'↻ 重试','resumeTask("
 		aMainOpen   = "'▶ 打开文件','openFile("
-		aMainStop   = "'⏹ 停止（保存已录）'"
+		aMainStop   = "'⏹ 停止','stopTask("
 		aFolder     = "'📂 打开文件夹','openFolder("
 		aCancel     = "'✕ 取消','cancelTask("
 		aRemove     = "'🗑 移除记录','removeTask("
 		// 简略模式（图标按钮）
 		rMainRun    = "'⏸','暂停','pauseTask("
-		rMainResume = "'⏯','继续下载','resumeTask("
+		rMainResume = "'⏯','继续','resumeTask("
 		rMainRetry  = "'↻','重试','resumeTask("
 		rMainOpen   = "'▶','打开文件','openFile("
-		rMainStop   = "'⏹','停止（保存已录部分）'"
+		rMainStop   = "'⏹','停止','stopTask("
 		rFolder     = "'📂','打开文件夹','openFolder("
 		rCancel     = "'✕','取消（删除文件）','cancelTask("
 		rRemove     = "'🗑','移除记录','removeTask("
+	)
+
+	// 各分支的区间锚点（详细/简略同名，两处结构对齐）
+	const (
+		liveHead = "} else if (t.live && (t.done || t.paused || t.error)) {"
+		doneHead = "} else if (t.done && !t.error) {"
+		doneSub  = "if (t.done) {"
+		pendSub  = "} else {"
 	)
 
 	cases := []struct {
@@ -97,40 +120,37 @@ func TestActionButtonOrderIsUnified(t *testing.T) {
 		markers  []string
 	}{
 		// —— 详细模式 ——
-		{"详细模式·直播终态", actionsRegion,
-			"} else if (t.live && (t.done || t.paused || t.error)) {", "} else if (t.done && !t.error) {",
-			[]string{aMainOpen, aFolder, aMainStop}},
-		{"详细模式·已完成", actionsRegion,
-			"} else if (t.done && !t.error) {", "} else if (t.paused) {",
-			[]string{aMainOpen, aFolder, aRemove}},
-		{"详细模式·已暂停", actionsRegion,
-			"} else if (t.paused) {", "} else if (t.error) {",
-			[]string{aMainResume, aFolder, aCancel}},
-		// 失败态是通用约定的例外：打开文件夹挪到末位、且不给移除记录
-		{"详细模式·失败", actionsRegion,
-			"} else if (t.error) {", "// 下载中 / 排队中",
-			[]string{aMainRetry, aCancel, aFolder}},
-		{"详细模式·运行/排队中", actionsRegion,
-			"// 下载中 / 排队中", "return b.length",
-			[]string{aMainRun, aFolder, aCancel}},
+		// 直播终态是唯一有**两个主操作**的状态（打开文件 + 停止），其余状态的主操作都是一个。
+		{"详细模式·直播终态·主操作连排最前", actionsRegion,
+			liveHead, doneHead, []string{aMainOpen, aMainStop}},
+		{"详细模式·直播终态·已收尾（有 🗑 ⇒ 📂 倒数第二）", actionsRegion,
+			doneSub, pendSub, []string{aFolder, aRemove}},
+		{"详细模式·直播终态·待收尾（无 🗑 ⇒ 📂 占末位）", actionsRegion,
+			pendSub, doneHead, []string{aCancel, aFolder}},
+		{"详细模式·已完成（📂 倒数第二、🗑 压轴）", actionsRegion,
+			doneHead, "} else if (t.paused) {", []string{aMainOpen, aFolder, aRemove}},
+		{"详细模式·已暂停（无 🗑 ⇒ 📂 占末位）", actionsRegion,
+			"} else if (t.paused) {", "} else if (t.error) {", []string{aMainResume, aCancel, aFolder}},
+		{"详细模式·失败（无 🗑 ⇒ 📂 占末位）", actionsRegion,
+			"} else if (t.error) {", "// 下载中 / 排队中", []string{aMainRetry, aCancel, aFolder}},
+		{"详细模式·运行/排队中（无 🗑 ⇒ 📂 占末位）", actionsRegion,
+			"// 下载中 / 排队中", "return b.length", []string{aMainRun, aCancel, aFolder}},
 
 		// —— 简略模式（同状态必须与上面同序）——
-		{"简略模式·直播终态", rowRegion,
-			"} else if (t.live && (t.done || t.paused || t.error)) {", "} else if (t.done && !t.error) {",
-			[]string{rMainOpen, rFolder, rMainStop}},
-		{"简略模式·已完成", rowRegion,
-			"} else if (t.done && !t.error) {", "} else if (t.paused) {",
-			[]string{rMainOpen, rFolder, rRemove}},
-		{"简略模式·已暂停", rowRegion,
-			"} else if (t.paused) {", "} else if (t.error) {",
-			[]string{rMainResume, rFolder, rCancel}},
-		// 简略模式失败态同样服从那条例外
-		{"简略模式·失败", rowRegion,
-			"} else if (t.error) {", "acts = (t.live",
-			[]string{rMainRetry, rCancel, rFolder}},
-		{"简略模式·运行中", rowRegion,
-			"acts = (t.live", "const name = esc(fnameOf(t));",
-			[]string{rMainRun, rFolder, rCancel}},
+		{"简略模式·直播终态·主操作连排最前", rowRegion,
+			liveHead, doneHead, []string{rMainOpen, rMainStop}},
+		{"简略模式·直播终态·已收尾（有 🗑 ⇒ 📂 倒数第二）", rowRegion,
+			doneSub, pendSub, []string{rFolder, rRemove}},
+		{"简略模式·直播终态·待收尾（无 🗑 ⇒ 📂 占末位）", rowRegion,
+			pendSub, doneHead, []string{rCancel, rFolder}},
+		{"简略模式·已完成（📂 倒数第二、🗑 压轴）", rowRegion,
+			doneHead, "} else if (t.paused) {", []string{rMainOpen, rFolder, rRemove}},
+		{"简略模式·已暂停（无 🗑 ⇒ 📂 占末位）", rowRegion,
+			"} else if (t.paused) {", "} else if (t.error) {", []string{rMainResume, rCancel, rFolder}},
+		{"简略模式·失败（无 🗑 ⇒ 📂 占末位）", rowRegion,
+			"} else if (t.error) {", "acts = (t.live", []string{rMainRetry, rCancel, rFolder}},
+		{"简略模式·运行中（无 🗑 ⇒ 📂 占末位）", rowRegion,
+			"acts = (t.live", "const name = esc(fnameOf(t));", []string{rMainRun, rCancel, rFolder}},
 	}
 
 	for _, c := range cases {
@@ -214,12 +234,15 @@ func TestFailedRowHasNoRemoveAction(t *testing.T) {
 // TestActionOrderConventionIsDocumented 约定本身要写在代码里。
 //
 // 这条规矩靠"两处同步"维持，最容易的失效方式就是后来的人不知道有这条规矩。
+// 钉的是**定稿规则本身**（📂 的位置由有没有 🗑 决定），不是排版 ——
+// 把位置规则改回"📂 恒倒数第二"这类旧结论，这里要红。
 func TestActionOrderConventionIsDocumented(t *testing.T) {
 	page := homePageHTML
 	for _, frag := range []string{
-		"① 主操作",     // 约定原文
-		"② 📂 打开文件夹", // 固定位次
-		"rowCard()", // 明确点出两处同源
+		"① 主操作",          // 主操作连排最前
+		"末位或次末位",         // 📂 的位置判据（定稿）
+		"只有 🗑 出现时它往左让一格", // 一句话规则
+		"rowCard()",      // 明确点出两处同源
 	} {
 		if !strings.Contains(page, frag) {
 			t.Errorf("web/index.html 缺少顺序约定的说明片段 %q —— 后来的人会继续逐状态自由发挥", frag)
@@ -258,24 +281,24 @@ func TestControlButtonColorIsUnified(t *testing.T) {
 		{"详细模式·运行中", actionsRegion, "// 下载中 / 排队中", "return b.length",
 			[]string{"btn('primary','⏸ 暂停'", "btn('primary','⏹ 停止'"}},
 		{"详细模式·已暂停", actionsRegion, "} else if (t.paused) {", "} else if (t.error) {",
-			[]string{"btn('primary','⏯ 继续下载'"}},
+			[]string{"btn('primary','⏯ 继续'"}},
 		{"详细模式·失败", actionsRegion, "} else if (t.error) {", "// 下载中 / 排队中",
 			[]string{"btn('primary','↻ 重试'"}},
 		{"详细模式·已完成", actionsRegion, "} else if (t.done && !t.error) {", "} else if (t.paused) {",
 			[]string{"btn('primary','▶ 打开文件'"}},
 		{"详细模式·直播终态", actionsRegion, "} else if (t.live &&", "} else if (t.done && !t.error) {",
-			[]string{"btn('primary','▶ 打开文件'", "btn('primary','⏹ 停止（保存已录）'"}},
+			[]string{"btn('primary','▶ 打开文件'", "btn('primary','⏹ 停止'"}},
 
 		{"简略模式·运行中", rowRegion, "acts = (t.live", "const name = esc(fnameOf(t));",
 			[]string{"ibtn('primary','⏸','暂停'", "ibtn('primary','⏹','停止'"}},
 		{"简略模式·已暂停", rowRegion, "} else if (t.paused) {", "} else if (t.error) {",
-			[]string{"ibtn('primary','⏯','继续下载'"}},
+			[]string{"ibtn('primary','⏯','继续'"}},
 		{"简略模式·失败", rowRegion, "} else if (t.error) {", "acts = (t.live",
 			[]string{"ibtn('primary','↻','重试'"}},
 		{"简略模式·已完成", rowRegion, "} else if (t.done && !t.error) {", "} else if (t.paused) {",
 			[]string{"ibtn('primary','▶','打开文件'"}},
 		{"简略模式·直播终态", rowRegion, "} else if (t.live &&", "} else if (t.done && !t.error) {",
-			[]string{"ibtn('primary','▶','打开文件'", "ibtn('primary','⏹','停止（保存已录部分）'"}},
+			[]string{"ibtn('primary','▶','打开文件'", "ibtn('primary','⏹','停止'"}},
 	}
 	for _, c := range cases {
 		reg, ok := spanBetween(c.src, c.from, c.to)
@@ -308,8 +331,8 @@ func TestControlButtonColorIsUnified(t *testing.T) {
 	for _, c := range []struct{ why, src, frag string }{
 		{"黄底按钮已废弃（主操作改蓝底）", actionsRegion, "btn('warn'"},
 		{"`button.warn` 样式已删，定义不得复活", page, "button.warn{"},
-		{"「继续」不得再用 ▶ —— 会和「打开文件」同形", rowRegion, "ibtn('primary','▶','继续下载'"},
-		{"详细模式「继续」同样不得用 ▶", actionsRegion, "'▶ 继续下载'"},
+		{"「继续」不得再用 ▶ —— 会和「打开文件」同形", rowRegion, "ibtn('primary','▶','继续'"},
+		{"详细模式「继续」同样不得用 ▶", actionsRegion, "'▶ 继续'"},
 		{"详细模式「重试」不得用 ▶ —— 与「打开文件」同形，简略模式用的是 ↻", actionsRegion, "'▶ 重试'"},
 		{"简略模式「打开文件」不得退回中性（学徒定：播放要蓝底）", rowRegion, "ibtn('','▶','打开文件'"},
 	} {

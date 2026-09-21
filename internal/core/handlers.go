@@ -159,12 +159,30 @@ func (e *Engine) handleResume(w http.ResponseWriter, r *http.Request) {
 		jsonError(w, http.StatusBadRequest, "task already finished")
 		return
 	}
-	// 直播任务一律不给恢复入口（含"录制中断"的终态与旧状态文件遗留的断点任务）。
-	// 这是产品语义，不是能力缺失：中间的内容已经从滑动窗口滚走，接着录只能
-	// 产出一个时间轴带空洞的文件。要接着录就回直播页重新开始。
+	// 直播任务的「继续」= 结束录制并把已录部分收尾成成品（学徒 2026-09-20 定）。
+	//
+	// 直播流没有"接着录"这回事：中断期间的分片已从滑动窗口滚走，接着录只能在
+	// 产物时间轴上留一段空洞。所以这条入口不是"无法恢复"，而是**收尾** ——
+	// 用户点「继续」的含义是"我接受这个结果"，不是"从未中断过"。
+	//
+	// 分流放在后端而不是靠前端给对按钮：GUI / CLI / 扩展任何入口调 resume 都走
+	// 这里。收尾复用与点「停止」相同的两个函数（finishInterrupt→finishStop、
+	// finishStoppedTask→finishStop），两条入口的产物规则因此天然一致。
 	if te.st.live {
+		te.intent = intentStop
+		te.st.stage = "停止中"
+		cancel := te.cancel
+		running := te.st.running || te.st.queued
 		te.mu.Unlock()
-		jsonError(w, http.StatusBadRequest, "直播流不支持恢复：暂停期间的内容已从列表滚走，请重新开始录制")
+		if running && cancel != nil {
+			// 还在录：中断它，收尾交给 pipeline 的中断路径（与运行中点「停止」同路）。
+			cancel()
+			writeJSON(w, http.StatusOK, actionResp{OK: true, ID: id, Resumed: true})
+			return
+		}
+		// 已静止（失败 / 中断后）：pipeline 早已退出，直接按现有 .part 收尾。
+		go finishStoppedTask(te)
+		writeJSON(w, http.StatusOK, actionResp{OK: true, ID: id, Resumed: true})
 		return
 	}
 	if te.st.running && !te.st.paused {

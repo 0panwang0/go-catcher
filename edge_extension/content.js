@@ -1152,7 +1152,7 @@
       // 多任务并发：记录本次任务 id，供后续轮询精确定位（多个标签页各下各的互不串扰）
       activeTaskId = resp.taskId || null;
       // live 标记按本任务重算：上个任务若是直播，残留的 true 会让点播任务首帧
-      // 画出「停止（保存已录）」（评审自审 #13）。嗅探的 live 是启发式——false
+      // 画出「停止」（评审自审 #13）。嗅探的 live 是启发式——false
       // 不代表点播，误判由第一次轮询以服务端字段纠正；这里重算只为清掉上一个
       // 任务的残留、并让本任务 sniff 到的 true 即刻生效。
       activeLive = !!(source && source.live);
@@ -1234,10 +1234,12 @@
   //
   // 直播与点播是两套语义，混用会直接坏掉 —— 服务端 /pause 对直播返回 400
   // （"直播录制请使用停止：直播流不支持暂停后续录"）：
-  //   - 直播：只有「停止（保存已录）」与「取消」，**没有任何恢复入口**。
+  //   - 直播：只有「停止」与「取消」，**没有任何恢复入口**。
   //     暂停期间的分片已从滑动窗口滚走，接着录只会在产物里留一个时间轴空洞。
-  //     这与主界面 index.html 的控制按钮（'⏹ 停止（保存已录）'）一致。
-  //   - 点播：运行中「暂停」，暂停后「继续下载」——断点续传在这里是真的。
+  //     这与主界面 index.html 的控制按钮（'⏹ 停止'）一致。
+  //     按钮文案不带括号补充说明（学徒 2026-09-20 定）："停止后已录部分会保存成文件"
+  //     由面板底部那行完整句子承担（见 renderInitiatedControls 里的 hint）。
+  //   - 点播：运行中「暂停」，暂停后「继续」——断点续传在这里是真的。
   // 纯函数、不碰 DOM，renderInitiatedControls 与回归测试共用同一份判据。
   //
   // 配色与图标跟内置前端（web/index.html 的 actions()/rowCard()）保持同一套：
@@ -1247,13 +1249,13 @@
   function controlButtons(live, paused) {
     if (live) {
       return [
-        { ctl: "stop", label: "⏹ 停止（保存已录）", kind: "primary" },
+        { ctl: "stop", label: "⏹ 停止", kind: "primary" },
         { ctl: "cancel", label: "✕ 取消", kind: "danger" },
       ];
     }
     if (paused) {
       return [
-        { ctl: "resume", label: "⏯ 继续下载", kind: "primary" },
+        { ctl: "resume", label: "⏯ 继续", kind: "primary" },
         { ctl: "cancel", label: "✕ 取消", kind: "danger" },
       ];
     }

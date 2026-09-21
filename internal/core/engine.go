@@ -222,7 +222,7 @@ func (r *Runtime) stopOrPauseAllTasks() {
 //
 // 正常退出走 stopOrPauseAllTasks → 收尾；但任务管理器强杀、断电这类场景里
 // 进程没有任何机会执行收尾，已录部分留在 .part 里，载入后任务停在
-// 「录制中断（程序退出）」等用户点「停止」。这里补做一次，让"直播中断必自动
+// 「录制中断（程序异常退出）」等用户点「停止」。这里补做一次，让"直播中断必自动
 // 收尾"这条语义不留一个只能手动操作的口子。
 //
 // 三条约束：
@@ -301,9 +301,9 @@ func (r *Runtime) salvageOneInterruptedLive(te *taskEntry) {
 
 	// 校验器只看内容特征，不看播放列表：加密标志传 false 只会让判定更宽松
 	// （明文直接放行），不会把完好的文件误判成损坏。宁可漏判，不可误杀。
-	if err := finalizeRecording(te, job, part, finalizeInterrupted, "程序退出导致中断"); err != nil {
+	if err := finalizeRecording(te, job, part, finalizeInterrupted, "程序异常退出导致中断"); err != nil {
 		fmt.Printf("[disk] WARN: 直播任务 %s 的补偿收尾失败（.part 已保留）: %v\n", st.id, err)
-		failTask(te, "程序退出导致录制中断，且自动收尾失败: "+err.Error())
+		failTask(te, "程序异常退出导致中断，且自动收尾失败: "+err.Error())
 		r.markDirty()
 		return
 	}

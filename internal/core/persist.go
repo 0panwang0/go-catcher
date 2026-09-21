@@ -15,29 +15,37 @@ const stateVersion = 1
 // persistedTask 落盘的字段（不含运行时对象）
 
 type persistedTask struct {
-	ID        string            `json:"id"`
-	Filename  string            `json:"filename"`
-	SaveDir   string            `json:"saveDir"`
-	M3u8URL   string            `json:"m3u8URL"`
-	Referer   string            `json:"referer"`
-	SegRefs   map[string]string `json:"segrefs,omitempty"`
-	SegDone   int64             `json:"segDone"`
-	SegTot    int64             `json:"segTot"`
-	Stage     string            `json:"stage"`
-	Done      bool              `json:"done"`
-	Paused    bool              `json:"paused"`
-	Canceled  bool              `json:"canceled"`
-	FinalPath string            `json:"finalPath"`
-	ErrorMsg  string            `json:"errorMsg"`
-	Started   time.Time         `json:"started"`
-	Finished  time.Time         `json:"finished"`
-	Live      bool              `json:"live"` // 直播跟随任务（播放列表无 ENDLIST）
+	ID       string            `json:"id"`
+	Filename string            `json:"filename"`
+	SaveDir  string            `json:"saveDir"`
+	M3u8URL  string            `json:"m3u8URL"`
+	Referer  string            `json:"referer"`
+	SegRefs  map[string]string `json:"segrefs,omitempty"`
+	SegDone  int64             `json:"segDone"`
+	SegTot   int64             `json:"segTot"`
+	// FlushedBytes 已确认落盘的分片字节数（含 init 段）。旧状态文件（v0.5.0）
+	// 没有这个字段，读到 0 ⇒ 由恢复时的对齐判据判为"无法对齐"，从 0 重下
+	// （见 pipeline 的对齐判据），不是解析出一个半残状态。
+	FlushedBytes int64     `json:"flushedBytes,omitempty"`
+	Stage        string    `json:"stage"`
+	Done         bool      `json:"done"`
+	Paused       bool      `json:"paused"`
+	Canceled     bool      `json:"canceled"`
+	FinalPath    string    `json:"finalPath"`
+	ErrorMsg     string    `json:"errorMsg"`
+	Started      time.Time `json:"started"`
+	Finished     time.Time `json:"finished"`
+	Live         bool      `json:"live"` // 直播跟随任务（播放列表无 ENDLIST）
 	// 中断收尾（已保存已录部分但没录完）与产物时间轴上的缺口时长。
 	// 落盘是为了重启后界面仍能把"中断"与"完整录完"区分开。
 	Interrupted bool            `json:"interrupted,omitempty"`
 	GapSeconds  float64         `json:"gapSeconds,omitempty"`
 	ContainerID string          `json:"containerID,omitempty"` // 探测到的容器 ID（续传恢复规范化）
 	NormState   json.RawMessage `json:"normState,omitempty"`   // 跨分片状态字节（NormState.snapshot 导出，续传 restore 恢复）
+	// PartMode 直链 .part 的写入模式（"chunked" / "stream"）。
+	// 分片模式用 WriteAt 稀疏写 ⇒ 文件大小 ≠ 有效字节数，位图丢失时**不能**按
+	// 大小续传；单连接模式是连续前缀 ⇒ 可以。两种模式在磁盘上无法区分，必须记。
+	PartMode string `json:"partMode,omitempty"`
 }
 
 type stateFile struct {
@@ -108,17 +116,21 @@ func (r *Runtime) collectPersisted() []persistedTask {
 	out := make([]persistedTask, 0, len(entries))
 	for _, te := range entries {
 		s := snapshot(te)
-		// 断点必须用"已确认落盘"的计数，不能用界面上那个（R9）：segDone 反映的是
-		// "已写进缓冲区"，可能领先磁盘若干 MB，拿它当续传起点会在文件中间留空洞。
-		segDone := s.segDone
+		// 断点必须用"已确认落盘"的那一对账本值，不能用界面上那个（R9）：
+		// segDone 反映的是"已写进缓冲区"，可能领先磁盘若干 MB，拿它当续传起点
+		// 会在文件中间留空洞。序号与字节数必须**同源取**（一次 Load）——
+		// 分开取会让恢复拿到错配的一对，进而把 .part 截到错误位置。
+		segDone, flushedBytes := s.segDone, s.flushedBytes
 		if job := te.jobRef(); job != nil {
-			segDone = job.segFlushedNow()
+			m := job.flushedMarkNow()
+			segDone, flushedBytes = m.segs, m.bytes
 		}
 		pt := persistedTask{
 			ID: s.id, Filename: s.filename, SaveDir: s.saveDir,
 			M3u8URL: s.m3u8URL, Referer: s.referer, SegRefs: s.segRefs,
-			SegDone: segDone, SegTot: s.segTot, Stage: s.stage,
-			Done: s.done, Paused: s.paused, Canceled: s.canceled,
+			SegDone: segDone, SegTot: s.segTot, FlushedBytes: flushedBytes,
+			Stage: s.stage,
+			Done:  s.done, Paused: s.paused, Canceled: s.canceled,
 			FinalPath: s.finalPath, ErrorMsg: s.errorMsg,
 			Started: s.started, Finished: s.finished,
 			Live:        s.live,
@@ -126,6 +138,14 @@ func (r *Runtime) collectPersisted() []persistedTask {
 			GapSeconds:  s.gapSeconds,
 		}
 		pt.ContainerID = s.containerID
+		// 直链的写入模式优先取 job 的实时值：它要到下载开始时才确定
+		// （见 downloadDirect / setPartMode），而 setPartMode 会自己触发落盘。
+		pt.PartMode = s.partMode
+		if job := te.jobRef(); job != nil {
+			if m := job.partModeNow(); m != "" {
+				pt.PartMode = m
+			}
+		}
 		if len(s.normState) > 0 {
 			pt.NormState = json.RawMessage(s.normState)
 		}
@@ -242,10 +262,12 @@ func (r *Runtime) loadState() {
 			canceled: pt.Canceled, finalPath: pt.FinalPath, errorMsg: pt.ErrorMsg,
 			m3u8URL: pt.M3u8URL, referer: pt.Referer, segRefs: pt.SegRefs, filename: pt.Filename,
 			saveDir: pt.SaveDir, segDone: pt.SegDone, segTot: pt.SegTot,
-			started: pt.Started, finished: pt.Finished,
+			flushedBytes: pt.FlushedBytes,
+			started:      pt.Started, finished: pt.Finished,
 			live:        pt.Live,
 			interrupted: pt.Interrupted, gapSeconds: pt.GapSeconds,
 			containerID: pt.ContainerID,
+			partMode:    pt.PartMode,
 		}
 		if len(pt.NormState) > 0 {
 			te.st.normState = append([]byte(nil), pt.NormState...)
@@ -262,7 +284,9 @@ func (r *Runtime) loadState() {
 			te.st.queued = false
 			te.st.paused = true
 			if te.st.live {
-				te.st.stage = "录制中断（程序退出）"
+				// 「异常」二字不能省：能走到这里的直播任务只可能是"上次进程没机会收尾"
+				// （强杀 / 断电）——正常退出会由 stopOrPauseAllTasks 收尾成「已完成」。
+				te.st.stage = "录制中断（程序异常退出）"
 			} else {
 				te.st.stage = "已暂停"
 				resumed++

@@ -559,7 +559,7 @@ func TestStreamWriterFlushBreakpointNotAhead(t *testing.T) {
 		segSize  = 300 << 10 // 8 × 300KB = 2.4MB，足以跨过 1MB 刷新阈值
 	)
 	flushed := 0
-	sw, err := newStreamWriter(path, 0, func(int) {}, func(f int) {
+	sw, err := newStreamWriter(path, 0, 0, func(int) {}, func(f int, _ int64) {
 		if f > flushed {
 			flushed = f
 		}
@@ -604,7 +604,7 @@ func TestStreamWriterFlushBreakpointNotAhead(t *testing.T) {
 func TestStreamWriterFlushedLagsMemoryBreakpoint(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "lag.ts")
-	sw, err := newStreamWriter(path, 0, func(int) {}, func(int) {}, nil)
+	sw, err := newStreamWriter(path, 0, 0, func(int) {}, func(int, int64) {}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -641,7 +641,7 @@ func TestFinishStreamKeepsDiskBreakpointOnCloseFailure(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "fail.ts")
 	j := &dlJob{rt: testStd}
-	sw, err := newStreamWriter(path, 0, func(int) {}, func(int) {}, nil)
+	sw, err := newStreamWriter(path, 0, 0, func(int) {}, func(int, int64) {}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

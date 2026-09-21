@@ -63,6 +63,11 @@
   .stage.ok{color:var(--ok)}
   .stage.pause{color:#fcd34d}
   .stage.stale{color:#94a3b8}
+  /* 恢复路径的一次性提示（服务端 restartNote）：单占一行，**不混进状态行** ——
+     它回答的是"这次为什么重来了"，与"当前在干什么"（stageText）是两件事。
+     存在意义：账本不可用时任务会自动从 0 重下，不说出来用户只会看到进度从零重爬。 */
+  .rnote{color:#fcd34d;font-size:12.5px;line-height:1.6;margin-bottom:8px;
+         word-break:break-all;overflow-wrap:anywhere}
   .pctline{display:flex;justify-content:space-between;font-size:12px;color:var(--muted);margin-bottom:5px}
   /* 直播的指标行：左「已录时长」右「片数」。直播没有总进度，这一行不给百分比。 */
   .metric{display:flex;justify-content:space-between;align-items:baseline;margin-bottom:6px}
@@ -130,6 +135,10 @@
   .rowname{flex:1;min-width:0;overflow:hidden;white-space:nowrap;height:18px;line-height:18px}
   .rowname>span{display:inline-block;white-space:nowrap;will-change:transform}
   .rowpct{flex:none;font-size:11.5px;color:#7dd3fc;font-weight:600;font-variant-numeric:tabular-nums}
+  /* 简略行里的恢复提示：34px 高塞不下一句话，只给一个可悬停的标记
+     （这套 UI 里 ibtn 全靠 title 说明自己，同一套做法）。
+     详细模式那一行才是主要出口——title 在触屏上不出现，且必须悬停才看得见。 */
+  .rowwarn{flex:none;font-size:12px;color:#fcd34d;cursor:help;line-height:1}
   .rowacts{display:flex;gap:4px;flex:none}
   .ibtn{width:26px;height:26px;border-radius:7px;border:1px solid var(--line);background:transparent;
         color:var(--muted);font-size:12px;line-height:1;cursor:pointer;display:flex;align-items:center;
@@ -275,13 +284,25 @@ function recordedText(t){
   return durText(t);
 }
 
+// 「为什么中断 / 为什么失败」的**唯一**文本来源（纯文本，不含标签）。
+//
+// ⚠️ 同源约定（学徒 2026-09-20 定）：详细模式的 stageText() 与简略模式的
+// rowNote() 都必须调它。两处各拼一份就出现过这种事 —— 展开卡片能看到原因，
+// 折叠成一行就只剩徽章「已中断」，原因一个字都没有（学徒 09-20 23:47 截图抓到）。
+// 又是本项目反复出现的头号缺陷形态：**行为是对的，界面把事实藏起来了。**
+function causeText(t){
+  if(t.interrupted)
+    // 直播中断收尾：文件已保存，但要如实说明"没录完"、原因、以及时间轴上的缺口
+    // ——否则就是把"产物不完整"藏起来。
+    return (t.stage||'录制中断 · 已保存') + (t.error ? '（'+t.error+'）' : '') + gapTail(t);
+  if(t.error) return '失败：'+t.error;
+  return '';
+}
+
 function stageText(t){
   if(t.canceled) return '<span class="stage err">已取消，临时文件已清理</span>';
-  // 直播中断收尾：文件已保存，但要如实说明"没录完"、原因、以及时间轴上的缺口
-  // ——否则就是把"产物不完整"藏起来（本项目反复出现的头号缺陷形态）。
-  if(t.interrupted)
-    return '<span class="stage pause">'+esc(t.stage||'录制中断 · 已保存')+'（'+esc(t.error)+'）'+esc(gapTail(t))+'</span>';
-  if(t.error) return '<span class="stage err">失败：'+esc(t.error)+'</span>';
+  const cause = causeText(t);
+  if(cause) return '<span class="stage '+(t.interrupted?'pause':'err')+'">'+esc(cause)+'</span>';
   // 直播没有"暂停后接着录"这回事：暂停期间的流已经从列表滚走，接着录只会
   // 在产物中间留一个时间轴空洞。所以这里不给"暂停后还能接着录"的承诺。
   // 时长与片数由指标行给，这里只说"该怎么办"。
@@ -349,6 +370,7 @@ function card(t){
     +   (started?'<div>开始</div><div class="mv" style="color:var(--muted)">'+started+'</div>':'')
     + '</div>'
     + stageRow(t)
+    + noteRow(t)
     + (t.live
         // 直播：一行定指标（录了多久 / 录了多少片），下面用活性带表示"还在录"。
         // 不画百分比进度——直播没有总时长，画出来只会是假的。
@@ -369,19 +391,52 @@ function stageRow(t){
   return s ? '<div style="margin-bottom:6px">'+s+'</div>' : '';
 }
 
+// 恢复路径的一次性提示（服务端 restartNote）：告诉用户"这次为什么重来了"。
+// 后端在"账本不可用 / 位图丢失 ⇒ 自动从 0 重下"时写它（pipeline.go 的 alignPartToLedger
+// 与 downloadDirect），方案要求**必须可见**——GUI 是 windowsgui 子系统、没有控制台，
+// 日志文件对普通用户等于不存在，所以这里（加上简略行的 ⚠ 标记）是它的唯一出口。
+// 不说出来的后果：用户只看到进度条从零重新爬，以为程序在重下已经下过的东西。
+function noteRow(t){
+  return t.restartNote ? '<div class="rnote">⚠ '+esc(t.restartNote)+'</div>' : '';
+}
+
+// 简略模式的原因出口（学徒 2026-09-20 选方案 A）：34px 的行放不下整句，
+// 只画一个 ⚠，全文挂 title —— **⚠ 与整行都挂**，鼠标落在行内任意处都能看到，
+// 不用对准那个 12px 的小图标。
+// 内容与详细模式同源：noteRow() 给 restartNote、stageRow()→stageText()→causeText() 给原因。
+// 两样都要（"这次为什么重下"与"为什么中断/失败"可能同时存在），所以拼接而不是二选一。
+function rowNote(t){
+  const parts = [];
+  if (t.restartNote) parts.push(t.restartNote);
+  const c = causeText(t);
+  if (c) parts.push(c);
+  return parts.join(' · ');
+}
+
 // 每个任务按状态给出可用操作。
 //
 // ⚠️ 按钮顺序 **和配色** 都是统一约定，不要逐状态自由发挥 —— 简略模式的 rowCard() 必须给同一套：
 //   ① 主操作（运行中 ⏸ / 直播运行中 ⏹；已暂停 ⏯继续；失败 ↻重试；已完成 ▶打开文件）
-//      —— 一律 `primary`（蓝底）：这些是"让任务动起来"的媒体控制键，同色才是一组；
-//   ② 📂 打开文件夹 —— 中性描边（ghost）：不改任务状态，只是看一眼磁盘；
-//   ③ ✕ 取消 = `danger`（红）/ 🗑 移除记录 = 中性描边。
+//      —— 一律 `primary`（蓝底）：这些是"让任务动起来"的媒体控制键，同色才是一组。
+//      可以**不止一个**（直播中断态是「▶ 打开文件」+「⏹ 停止」两个），连排在最前；
+//   ② ✕ 取消 = `danger`（红）—— 排在 📂 之前；
+//   ③ 📂 打开文件夹 —— 中性描边（ghost）：它不改任务状态，只是看一眼磁盘。
+//      它**恒在末位或次末位**（学徒 2026-09-21 定）：本状态有「🗑 移除记录」时它排在 🗑 前面
+//      （倒数第二），没有 🗑 时它自己占末位；
+//   ④ 🗑 移除记录 —— 中性描边，只要出现就**恒在最后一位**（它才是清记录那一步）。
+// ⇒ 一句话：**📂 一直贴着末尾走，只有 🗑 出现时它往左让一格。**
 // 两处各拼各的会露馅：📂 曾在"运行中"排第 1、在"已完成"排第 2，图标列横向漂移、
 // 右对齐也救不回来（2026-09-16 学徒截图抓到）。后来配色又各拼各的：运行中的 ⏸/⏹ 是
 // warn(黄底)、而 ⏯继续/↻重试 是 primary(蓝底) —— 同一行"运行中"在点播与直播下长得不一样。
+// 2026-09-21 学徒**三轮**收敛后的定稿（前两轮的中间结论都作废，别再回去）：
+//   1. "把打开文件夹放到最后面就行" ⇒ 做成"📂 恒末位、✕ 倒数第二"；
+//   2. "打开文件夹要放到倒数第二个，倒数第一个是移除记录" ⇒ 我理解成"销毁类压轴"，
+//      顺手把"✕ 也排在 📂 之后"推广到了**没有 🗑** 的状态；
+//   3. 定稿：位置由**有没有「🗑 移除记录」**决定 —— 有 🗑 时 📂 倒数第二，没有 🗑 时 📂 倒数第一。
+//      ⇒ 失败 / 运行中 / 已暂停都是 "… ✕ 📂"，只有已完成 / 直播已完成是 "… 📂 🗑"。
 // 新增状态时照这个顺序与配色往 b 里塞。
-// **唯一的例外是失败态**（见下面 t.error 分支）：次序改为 ↻重试 → ✕取消 → 📂打开文件夹，
-// 且不给「🗑 移除记录」（学徒 2026-09-19 定，理由写在该分支里）。除此之外不许再有例外。
+// **唯一的特殊约定在失败态**（见下面 t.error 分支）：**不给「🗑 移除记录」**（学徒 2026-09-19 定，
+// 理由写在该分支里）。它的次序完全服从通用约定，**不是次序上的例外**。
 function actions(t){
   const id = JSON.stringify(t.id);
   const op = t.openPath ? JSON.stringify(t.openPath) : null; // 真实存在的文件（成品或 .part 半成品）
@@ -390,29 +445,38 @@ function actions(t){
   if (t.canceled) {
     b.push(btn('ghost','🗑 移除记录','removeTask('+id+')'));
   } else if (t.live && (t.done || t.paused || t.error)) {
-    // 直播：只有「停止（保存已录部分）」与「取消」，不给暂停/继续/重试——
+    // 直播：只有「停止」与「取消」，不给暂停/继续/重试——
     // 中间滚走的流补不回来，续录只会产出时间轴带空洞的文件。
+    // 「停止」不带括号补充说明（学徒 2026-09-20 定）：「停止后已录部分会保存」这件事
+    // 由状态行那句完整句子承担（stageText 里那条），按钮只留动作名。
+    // ⚠️ 后果要知道：这个标签现在与"直播运行中"逐字相同，两个态靠徽章
+    // （「已中断」/「录制中」）与状态行区分——不要再往按钮上加字来"补救"。
     if (op) b.push(btn('primary','▶ 打开文件','openFile('+id+')'));
-    if (sd) b.push(btn('ghost','📂 打开文件夹','openFolder('+id+')'));
+    if (!t.done) b.push(btn('primary','⏹ 停止','stopTask('+id+')'));
+    // 尾部两种排法（约定 ③④）：有「🗑 移除记录」⇒ 📂 让到它前面（倒数第二）；
+    // 没有 ⇒ 📂 自己占末位。done 那条走前者（已是"已完成"），
+    // 待收尾（中断 B 档 / 失败）那条只能取消，走后者。
     if (t.done) {
+      if (sd) b.push(btn('ghost','📂 打开文件夹','openFolder('+id+')'));
       b.push(btn('ghost','🗑 移除记录','removeTask('+id+')'));
     } else {
-      b.push(btn('primary','⏹ 停止（保存已录）','stopTask('+id+')'));
       b.push(btn('danger','✕ 取消','cancelTask('+id+')'));
+      if (sd) b.push(btn('ghost','📂 打开文件夹','openFolder('+id+')'));
     }
   } else if (t.done && !t.error) {
     if (op) b.push(btn('primary','▶ 打开文件','openFile('+id+')'));
     if (sd) b.push(btn('ghost','📂 打开文件夹','openFolder('+id+')'));
     b.push(btn('ghost','🗑 移除记录','removeTask('+id+')'));
   } else if (t.paused) {
-    b.push(btn('primary','⏯ 继续下载','resumeTask('+id+')'));
-    if (sd) b.push(btn('ghost','📂 打开文件夹','openFolder('+id+')'));
+    b.push(btn('primary','⏯ 继续','resumeTask('+id+')'));
     b.push(btn('danger','✕ 取消','cancelTask('+id+')'));
+    if (sd) b.push(btn('ghost','📂 打开文件夹','openFolder('+id+')'));
   } else if (t.error) {
-    // 失败态刻意少两样（学徒 2026-09-19 定），是本状态对照通用约定的**有意例外**：
-    //   * 不给「🗑 移除记录」—— 失败是该被修的对象，不是该被清掉的垃圾；
-    //   * 「📂 打开文件夹」从第 2 位挪到末位 —— 失败时先要做的决定是"重试还是放弃"，
-    //     看磁盘只是补充动作。（通用约定见函数头注释，简略模式的 rowCard() 同步同序。）
+    // 失败态刻意少一样（学徒 2026-09-19 定）：**不给「🗑 移除记录」** ——
+    // 失败是该被修的对象，不是该被清掉的垃圾：一键移除会把「重试所需的上下文
+    // （URL / Referer / 断点）」连同记录一起清掉，而用户当时想点的往往只是「取消」。
+    // 尾部次序服从通用约定（见函数头注释 ③④）：没有 🗑 ⇒ 📂 占末位、✕ 在它之前。
+    // 简略模式的 rowCard() 同步同序。
     b.push(btn('primary','↻ 重试','resumeTask('+id+')'));
     b.push(btn('danger','✕ 取消','cancelTask('+id+')'));
     if (sd) b.push(btn('ghost','📂 打开文件夹','openFolder('+id+')'));
@@ -421,8 +485,8 @@ function actions(t){
     b.push(t.live
       ? btn('primary','⏹ 停止','stopTask('+id+')')
       : btn('primary','⏸ 暂停','pauseTask('+id+')'));
-    if (sd) b.push(btn('ghost','📂 打开文件夹','openFolder('+id+')'));
     b.push(btn('danger','✕ 取消','cancelTask('+id+')'));
+    if (sd) b.push(btn('ghost','📂 打开文件夹','openFolder('+id+')'));
   }
   return b.length ? '<div class="acts">'+b.join('')+'</div>' : '';
 }
@@ -452,29 +516,38 @@ function rowCard(t){
     : (t.stage==='下载直链文件中') ? (pct>0 ? pct.toFixed(1)+'%' : '…')
     : (t.live ? recordedText(t) : pct.toFixed(1)+'%');
   // ⚠️ 顺序与配色都必须与详细模式的 actions() 完全一致（约定写在其函数头注释里）：
-  //    ① 主操作（蓝底 primary） ② 📂 打开文件夹（中性） ③ ✕ 取消（红 danger）/ 🗑 移除记录（中性）。
+  //    ① 主操作（蓝底 primary，可以不止一个） ② ✕ 取消（红 danger）
+  //    ③ 📂 打开文件夹（中性，**末位或次末位**：有 🗑 时在它前面一格，没 🗑 时自己占末位）
+  //    ④ 🗑 移除记录（中性，只要出现就末位）。
   //    两处是同一条规则的两份实现，改一处必须同步改另一处，否则图标列又开始漂移、配色又开始打架。
   let acts = '';
   if (t.canceled) {
     acts = ibtn('','🗑','移除记录','removeTask('+id+')');
   } else if (t.live && (t.done || t.paused || t.error)) {
+    // 尾部两种排法（约定 ③④），与详细模式的 actions() 同序。写成 if/else 而不是套两层三元：
+    // 一是两种排法各自的"📂 排哪"要一眼看清；二是 web_folder_position_test.go 按分支切分，
+    // 三元里混两层会让子分支切不出来（那条守卫只认每段里第一个 📂，第二处会漏检）。
     acts = (op ? ibtn('primary','▶','打开文件','openFile('+id+')') : '')
-         + (sd ? ibtn('','📂','打开文件夹','openFolder('+id+')') : '')
-         + (t.done
-            ? ibtn('','🗑','移除记录','removeTask('+id+')')
-            : ibtn('primary','⏹','停止（保存已录部分）','stopTask('+id+')')
-              + ibtn('danger','✕','取消（删除文件）','cancelTask('+id+')'));
+         + (t.done ? '' : ibtn('primary','⏹','停止','stopTask('+id+')'));
+    if (t.done) {
+      if (sd) acts += ibtn('','📂','打开文件夹','openFolder('+id+')');
+      acts += ibtn('','🗑','移除记录','removeTask('+id+')');
+    } else {
+      acts += ibtn('danger','✕','取消（删除文件）','cancelTask('+id+')');
+      if (sd) acts += ibtn('','📂','打开文件夹','openFolder('+id+')');
+    }
   } else if (t.done && !t.error) {
     acts = (op ? ibtn('primary','▶','打开文件','openFile('+id+')') : '')
          + (sd ? ibtn('','📂','打开文件夹','openFolder('+id+')') : '')
          + ibtn('','🗑','移除记录','removeTask('+id+')');
   } else if (t.paused) {
-    acts = ibtn('primary','⏯','继续下载','resumeTask('+id+')')
-         + (sd ? ibtn('','📂','打开文件夹','openFolder('+id+')') : '')
-         + ibtn('danger','✕','取消（删除文件）','cancelTask('+id+')');
+    acts = ibtn('primary','⏯','继续','resumeTask('+id+')')
+         + ibtn('danger','✕','取消（删除文件）','cancelTask('+id+')')
+         + (sd ? ibtn('','📂','打开文件夹','openFolder('+id+')') : '');
   } else if (t.error) {
     // 与详细模式 actions() 的失败态同序：↻ 重试 → ✕ 取消 → 📂 打开文件夹，
     // 且同样不给「🗑 移除记录」（理由见 actions() 里那段注释）。
+    // 尾部次序服从通用约定：本状态**没有 🗑** ⇒ 📂 占末位、✕ 排在它之前。
     acts = ibtn('primary','↻','重试','resumeTask('+id+')')
          + ibtn('danger','✕','取消（删除文件）','cancelTask('+id+')')
          + (sd ? ibtn('','📂','打开文件夹','openFolder('+id+')') : '');
@@ -482,18 +555,24 @@ function rowCard(t){
     acts = (t.live
             ? ibtn('primary','⏹','停止','stopTask('+id+')')
             : ibtn('primary','⏸','暂停','pauseTask('+id+')'))
-         + (sd ? ibtn('','📂','打开文件夹','openFolder('+id+')') : '')
-         + ibtn('danger','✕','取消（删除文件）','cancelTask('+id+')');
+         + ibtn('danger','✕','取消（删除文件）','cancelTask('+id+')')
+         + (sd ? ibtn('','📂','打开文件夹','openFolder('+id+')') : '');
   }
   const name = esc(fnameOf(t));
+  // 行内唯一的原因出口（恢复提示 + 中断/失败原因），见 rowNote 的注释
+  const note = rowNote(t);
   // 直播：两条胶囊由伪元素画，宿主只需墙钟相位；点播：内层按百分比填充
   // （少一层空元素也少一处写错宽度的机会）
   const strip = t.live
     ? '<span class="rowstrip live" style="'+bandPhase()+'"></span>'
     : '<span class="rowstrip"><i style="width:'+pct+'%"></i></span>';
-  return '<div class="row'+(isRun?' run':'')+'" data-id="'+esc(t.id)+'">'
+  // 整行也挂 title（学徒 2026-09-20 定）：鼠标落在行内任意处都能读到全文，
+  // 不用对准那个 12px 的 ⚠。子元素若自带 title（如按钮）会优先显示自己的。
+  return '<div class="row'+(isRun?' run':'')+'" data-id="'+esc(t.id)+'"'+(note?' title="'+esc(note)+'"':'')+'>'
     + badge(t)
     + '<div class="rowname"><span>'+name+'</span></div>'
+    // 恢复提示与中断/失败原因共用这一个 ⚠（34px 高放不下句子）；内容见 rowNote()。
+    + (note ? '<span class="rowwarn" title="'+esc(note)+'">⚠</span>' : '')
     + (pctTxt ? '<span class="rowpct">'+pctTxt+'</span>' : '')
     + '<span class="rowacts">'+acts+'</span>'
     + (isRun ? strip : '')

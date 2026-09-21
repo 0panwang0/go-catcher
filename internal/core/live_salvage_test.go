@@ -284,9 +284,24 @@ func TestSalvageInterruptedLiveFinalizesPart(t *testing.T) {
 	seedStateFile(t, []persistedTask{{
 		ID: "t1", Filename: "live.ts", SaveDir: dir, FinalPath: final,
 		M3u8URL: "https://example.com/live.m3u8",
-		Stage:   "录制中断（程序退出）", Live: true, Paused: true, SegDone: 2,
+		Stage:   "录制中断（程序异常退出）", Live: true, Paused: true, SegDone: 2,
 	}})
 	testStd.loadState()
+
+	// 载入标记（persist.go）也要点出**异常**：能走到这里的直播任务只可能是
+	// "上次进程没机会收尾"——正常退出会经 stopOrPauseAllTasks → finishStop(finalizeStopped,
+	// "用户停止录制") 收尾成「已完成」，根本不会以未收尾状态留在磁盘上。
+	// 学徒 2026-09-21 定：非用户主动退出统一写「程序异常退出导致中断」。
+	if te0 := testStd.findTask("t1"); te0 == nil {
+		t.Fatal("loadState 后任务未被恢复")
+	} else {
+		te0.mu.Lock()
+		stage0 := te0.st.stage
+		te0.mu.Unlock()
+		if stage0 != "录制中断（程序异常退出）" {
+			t.Fatalf("载入标记=%q want 「录制中断（程序异常退出）」", stage0)
+		}
+	}
 
 	testStd.salvageInterruptedLive()
 
@@ -299,6 +314,11 @@ func TestSalvageInterruptedLiveFinalizesPart(t *testing.T) {
 	te.mu.Unlock()
 	if !st.done || !st.interrupted {
 		t.Fatalf("补偿收尾未生效: done=%v interrupted=%v stage=%q", st.done, st.interrupted, st.stage)
+	}
+	// 原因是用户唯一能看到的"为什么没录完"。写"程序退出"会让人以为是正常关程序，
+	// 而这条路的触发条件是**强杀 / 断电**（正常关闭早在 stopOrPauseAllTasks 收尾了）。
+	if st.errorMsg != "程序异常退出导致中断" {
+		t.Fatalf("中断原因=%q want 「程序异常退出导致中断」", st.errorMsg)
 	}
 	if st.segDone != 2 {
 		t.Fatalf("segDone=%d want 2（已录片数必须保留）", st.segDone)
@@ -331,7 +351,7 @@ func TestSalvageInterruptedLiveKeepsPartOnFailure(t *testing.T) {
 	seedStateFile(t, []persistedTask{{
 		ID: "t1", Filename: "live.mp4", SaveDir: dir, FinalPath: final,
 		M3u8URL: "https://example.com/live.m3u8",
-		Stage:   "录制中断（程序退出）", Live: true, Paused: true, SegDone: 3,
+		Stage:   "录制中断（程序异常退出）", Live: true, Paused: true, SegDone: 3,
 		ContainerID: "fmp4-map", // 声明是 fMP4，内容却不是 → 抽样校验必然失败
 	}})
 	testStd.loadState()
@@ -453,7 +473,7 @@ func TestStoppedRestoredLiveSavesPart(t *testing.T) {
 	seedStateFile(t, []persistedTask{{
 		ID: "t1", Filename: "live.ts", SaveDir: dir, FinalPath: final,
 		M3u8URL: "https://example.com/live.m3u8",
-		Stage:   "录制中断（程序退出）", Live: true, Paused: true, SegDone: 2,
+		Stage:   "录制中断（程序异常退出）", Live: true, Paused: true, SegDone: 2,
 	}})
 	testStd.loadState()
 
@@ -556,7 +576,8 @@ func TestUserStopKeepsPartWhenValidationFails(t *testing.T) {
 	}}
 	job := &dlJob{rt: testStd, id: "livestop-bad", live: true}
 	job.setSeg(3, 0)
-	job.setSegFlushed(3)
+	// 账本成对：3 片 + 对应的文件字节数（收尾判据要用字节数判"有无内容"）。
+	job.setFlushed(3, int64(len("NOT-FMP4-DATA")))
 	restoreContainer(job, "fmp4-map", final+".part", nil) // 声明 fMP4，内容不是 → 校验必失败
 	te.job = job
 	te.intent = intentStop
@@ -608,7 +629,7 @@ func TestSalvageAndStopDoNotDoubleFinalize(t *testing.T) {
 	seedStateFile(t, []persistedTask{{
 		ID: "t1", Filename: "live.ts", SaveDir: dir, FinalPath: final,
 		M3u8URL: "https://example.com/live.m3u8",
-		Stage:   "录制中断（程序退出）", Live: true, Paused: true, SegDone: 2,
+		Stage:   "录制中断（程序异常退出）", Live: true, Paused: true, SegDone: 2,
 	}})
 	testStd.loadState()
 
@@ -701,7 +722,7 @@ func TestSalvageInterruptedLiveSkipsInitOnlyShell(t *testing.T) {
 	seedStateFile(t, []persistedTask{{
 		ID: "t1", Filename: "shell.mp4", SaveDir: dir, FinalPath: final,
 		M3u8URL: "https://example.com/live.m3u8",
-		Stage:   "录制中断（程序退出）", Live: true, Paused: true, SegDone: 0,
+		Stage:   "录制中断（程序异常退出）", Live: true, Paused: true, SegDone: 0,
 	}})
 	testStd.loadState()
 
@@ -751,10 +772,10 @@ func TestFinalizeRebuildsClearedFinalPath(t *testing.T) {
 	seedStateFile(t, []persistedTask{
 		{ID: "t1", Filename: "t1.ts", SaveDir: dir, FinalPath: "",
 			M3u8URL: "https://example.com/live.m3u8",
-			Stage:   "录制中断（程序退出）", Live: true, Paused: true, SegDone: 2},
+			Stage:   "录制中断（程序异常退出）", Live: true, Paused: true, SegDone: 2},
 		{ID: "t2", Filename: "t2.ts", SaveDir: dir, FinalPath: "",
 			M3u8URL: "https://example.com/live.m3u8",
-			Stage:   "录制中断（程序退出）", Live: true, Paused: true, SegDone: 2},
+			Stage:   "录制中断（程序异常退出）", Live: true, Paused: true, SegDone: 2},
 	})
 	testStd.loadState()
 

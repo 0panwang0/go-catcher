@@ -7,7 +7,11 @@
 //
 // 直播只有「停止」「取消」两态：暂停期间的流已从滑动窗口滚走，续录只会在产物
 // 中间留一个时间轴空洞。这不是能力缺失，是产品语义 —— 主界面 index.html 早已
-// 按这个语义走（'⏹ 停止（保存已录）'），扩展面板当时漏了。
+// 按这个语义走（'⏹ 停止'），扩展面板当时漏了。
+//
+// 文案口径（学徒 2026-09-20 定）：只留动作名，**不带括号补充说明** ——
+// 原先的「⏹ 停止（保存已录）」不再使用。"停止后已录部分会保存成文件"这件事
+// 由面板底部那行完整句子承担。两侧（内置页 / 扩展面板）文案必须逐字一致。
 //
 // 守两件事：
 //   1. **直播不得出现暂停/继续**（controlButtons 真跑，不是扫字符串）；
@@ -80,6 +84,12 @@ console.log("直播：只有「停止」「取消」");
 check("运行中 → stop + cancel，没有 pause", JSON.stringify(ctls(true, false)) === '["stop","cancel"]', ctls(true, false));
 check("中断态（paused=true）仍是 stop + cancel —— 直播没有\"继续\"", JSON.stringify(ctls(true, true)) === '["stop","cancel"]', ctls(true, true));
 check("停止按钮文案说\"停止\"不说\"暂停\"", hasText(true, false, "停止") && !hasText(true, false, "暂停"));
+// 逐字钉住（学徒 2026-09-20 定）：只留动作名，不加括号补充说明。
+// 用精确相等而不是 includes —— includes 在"后面又跟了（保存已录）"时照样绿，
+// 那正好是这次要防的形态。改文案时这里会红，是预期的：它是这条口径的唯一守卫。
+check("停止按钮文案逐字是「⏹ 停止」（不带括号补充说明）",
+  ui.controlButtons(true, false)[0].label === "⏹ 停止",
+  ui.controlButtons(true, false)[0].label);
 check("stop 是主操作（primary），cancel 是危险操作（danger）",
   ui.controlButtons(true, false)[0].kind === "primary" && ui.controlButtons(true, false)[1].kind === "danger");
 check("每个按钮都带可执行的 ctl 值（renderInitiatedControls 直接取用）",
@@ -88,7 +98,11 @@ check("每个按钮都带可执行的 ctl 值（renderInitiatedControls 直接�
 console.log("点播：暂停 / 继续 保持不变");
 check("运行中 → pause + cancel", JSON.stringify(ctls(false, false)) === '["pause","cancel"]', ctls(false, false));
 check("暂停中 → resume + cancel", JSON.stringify(ctls(false, true)) === '["resume","cancel"]', ctls(false, true));
-check("暂停态文案仍是\"继续下载\"", hasText(false, true, "继续"));
+// 逐字钉住（学徒 2026-09-20 定）：只留动作名「继续」，不带"下载"后缀。
+// 同样用精确相等 —— includes("继续") 在文案是「继续下载」时照样绿，防不住。
+check("点播暂停态文案逐字是「⏯ 继续」",
+  ui.controlButtons(false, true)[0].label === "⏯ 继续",
+  ui.controlButtons(false, true)[0].label);
 check("点播运行中的 pause 按钮不带\"停止\"字样", !hasText(false, false, "停止"));
 
 console.log("配色与图标：与内置前端同一套");
