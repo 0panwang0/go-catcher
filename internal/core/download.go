@@ -1144,12 +1144,20 @@ func fetchSegment(ctx context.Context, j *dlJob, segURL string) ([]byte, error) 
 			}
 			continue
 		}
-		data, err := readAllWithIdleTimeout(resp.Body, transferIdleTimeout)
+		// 读体设体积上限。空闲超时只挡"对方卡住不动"，挡不住"对方一直吐"：
+		// 只要持续有字节到达就永远不空闲，无上限的 ReadAll 会一路读进内存
+		// 直到进程 OOM（上限取值依据见 maxSegmentBytes）。
+		data, err := readCappedWithIdleTimeout(resp.Body, resp.Body, j.rt.segBodyLimitNow(), transferIdleTimeout)
 		resp.Body.Close()
 		if err != nil {
 			lastErr = fmt.Errorf("attempt %d: read body: %w", attempt, err)
 			if ctx.Err() != nil {
 				return nil, ctx.Err()
+			}
+			if errors.Is(err, errBodyTooLarge) {
+				// 超限意味着"远端在这个 URL 上返回的不是分片"，同一个 URL 再试
+				// 还是同一份内容，没必要空耗退避（与 httpGetWithRetry 同策）。
+				return nil, lastErr
 			}
 			if !sleepCtx(ctx, time.Duration(attempt)*time.Second) {
 				return nil, ctx.Err()

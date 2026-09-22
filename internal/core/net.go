@@ -554,6 +554,23 @@ var errBodyTooLarge = errors.New("响应体超过体积上限")
 // 决定（可到 1000:1），只在压缩前设限挡不住"小输入炸出大内存"。
 const maxPlaylistBytes int64 = 8 << 20
 
+// maxSegmentBytes 单个媒体分片读体上限（生产默认值）。
+//
+// 与 maxPlaylistBytes 的定值依据完全不同：播放列表是纯文本，大小可以估
+// （一万条分片约 1 MB）；分片是二进制媒体，合法大小跨三个数量级 —— 音频片
+// 几十 KB，4K 高码率片上百 MB —— 而且**没有可依据的声明长度**：播放列表不
+// 给单片大小，BANDWIDTH 只出现在 master 里、media playlist 拿不到。
+//
+// 所以这个值刻意取得很宽：它要挡的不是"偏大的分片"，而是**"无限灌"**。
+// 分片读路径原先只有空闲超时（连续 60s 无数据才中断），而空闲超时管的是
+// "对方卡住不动"——只要对方持续吐字节就永远不空闲，ReadAll 会一路读进内存
+// 直到进程 OOM，且日志上一个错字都没有。256 MiB 高于任何已知合法分片，
+// 又远低于"能把内存吃光"。
+//
+// ⚠ 这是**单片**上限，不是任务上限：并发 10 时理论峰值仍是 10 × 256 MiB。
+// 它给的是"有界"，不是"够用"——量级守卫，别当成容量规划。
+const maxSegmentBytes int64 = 256 << 20
+
 // copyWithIdleTimeout 把 body 拷到 dst，读空闲超过 idle 即关闭 body 中断传输。
 // 返回已写字节数与错误；正常情况下 io.EOF 归零为 nil。
 //
@@ -591,15 +608,6 @@ func copyWithIdleTimeout(dst io.Writer, body io.ReadCloser, idle time.Duration) 
 	}
 }
 
-// readAllWithIdleTimeout 读整个 body 到内存，带空闲超时（小分片用）。
-func readAllWithIdleTimeout(body io.ReadCloser, idle time.Duration) ([]byte, error) {
-	var buf bytes.Buffer
-	if _, err := copyWithIdleTimeout(&buf, body, idle); err != nil {
-		return nil, err
-	}
-	return buf.Bytes(), nil
-}
-
 // readCappedBytes 把 r 读进内存并硬性限制字节数（用于已在内存里的数据，如 gzip 解压流）。
 //
 // 超限**返回错误而不是截断**：截断会让"只读到一半的播放列表"被当成完整内容进管线，
@@ -611,7 +619,7 @@ func readCappedBytes(r io.Reader, limit int64) ([]byte, error) {
 		return nil, err
 	}
 	if int64(len(b)) > limit {
-		return nil, fmt.Errorf("%w（已超出 %d 字节，远端返回的内容不是正常播放列表）", errBodyTooLarge, limit)
+		return nil, fmt.Errorf("%w（已超出 %d 字节上限）", errBodyTooLarge, limit)
 	}
 	return b, nil
 }
@@ -626,7 +634,7 @@ func readCappedWithIdleTimeout(r io.Reader, closer io.Closer, limit int64, idle 
 		return nil, err
 	}
 	if n > limit {
-		return nil, fmt.Errorf("%w（已超出 %d 字节，远端返回的内容不是正常播放列表）", errBodyTooLarge, limit)
+		return nil, fmt.Errorf("%w（已超出 %d 字节上限）", errBodyTooLarge, limit)
 	}
 	return buf.Bytes(), nil
 }

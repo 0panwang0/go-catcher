@@ -105,6 +105,12 @@ type Runtime struct {
 	// chunkSizeBytes 目标片长；0 = 用 chunkSizeFixed（生产值）。
 	// 仅供测试调小以覆盖多片/续传路径，未暴露到 /config。
 	chunkSizeBytes int64
+
+	// ---- 媒体分片读体参数 ----
+	// segBodyBytes 单个分片读体上限；0 = 用 maxSegmentBytes（生产值，256 MiB）。
+	// 仅供测试调小以覆盖超限路径 —— 生产值下要造 256 MiB 响应才能触发，
+	// 那条路没法在单测里真跑。未暴露到 /config。
+	segBodyBytes int64
 }
 
 // newRuntime 创建一份带默认值的运行时。Engine 与 CLI 各持一份，互不共享。
@@ -126,6 +132,7 @@ func newRuntimeWithEntropy(rnd io.Reader) *Runtime {
 		livePollInterval:  3 * time.Second,
 		liveMaxEmptyPolls: 25,
 		chunkSizeBytes:    chunkSizeFixed,
+		segBodyBytes:      maxSegmentBytes,
 	}
 	// 内嵌豁免键：每次运行新键，GUI 外壳的 iframe 豁免凭据。熵源故障时留空
 	// 并记下原因——空键下 embedAccepted 一律拒绝（fail-closed），不静默放行。

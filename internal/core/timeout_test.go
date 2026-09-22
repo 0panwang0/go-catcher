@@ -96,16 +96,46 @@ func TestCopyWithIdleTimeoutToleratesSlowButAlive(t *testing.T) {
 	}
 }
 
-// TestReadAllWithIdleTimeout 正常读完返回全部内容。
-func TestReadAllWithIdleTimeout(t *testing.T) {
-	body := newFakeBody(time.Millisecond, false, "hello-", "catcher")
-	got, err := readAllWithIdleTimeout(body, time.Second)
-	if err != nil {
-		t.Fatalf("readAllWithIdleTimeout: %v", err)
-	}
-	if string(got) != "hello-catcher" {
-		t.Fatalf("got=%q", got)
-	}
+// TestReadCappedWithIdleTimeout 两道闸一起验：上限够用时读完返回全部内容，
+// 上限不够时显式报错且不返回截断内容。
+//
+// 分片读路径（fetchSegment）原先只有空闲超时这一道（时间），体积那道是
+// 第七轮 E1 补的 —— 空闲超时挡不住"对方一直吐字节"（见 maxSegmentBytes）。
+func TestReadCappedWithIdleTimeout(t *testing.T) {
+	t.Run("上限够用读完", func(t *testing.T) {
+		body := newFakeBody(time.Millisecond, false, "hello-", "catcher")
+		got, err := readCappedWithIdleTimeout(body, body, 1<<20, time.Second)
+		if err != nil {
+			t.Fatalf("readCappedWithIdleTimeout: %v", err)
+		}
+		if string(got) != "hello-catcher" {
+			t.Fatalf("got=%q", got)
+		}
+	})
+	t.Run("上限不够报错且不返回内容", func(t *testing.T) {
+		body := newFakeBody(time.Millisecond, false, "hello-", "catcher")
+		got, err := readCappedWithIdleTimeout(body, body, 5, time.Second)
+		if !errors.Is(err, errBodyTooLarge) {
+			t.Fatalf("超限应显式报错，得到 %q / err=%v", got, err)
+		}
+		if got != nil {
+			t.Fatalf("超限不得返回截断内容（截断会被当成分片继续写进产物），got %q", got)
+		}
+	})
+	t.Run("正好等于上限必须通过", func(t *testing.T) {
+		// 判定是 n > limit 而不是 n >= limit：多读那 1 字节就是为了把
+		// "正好等于上限"与"已超出上限"分开。这里是边界该放行的那一侧 ——
+		// 写成 >= 会让每个卡在上限上的正常分片被误杀。
+		const content = "hello-catcher"
+		body := newFakeBody(time.Millisecond, false, content)
+		got, err := readCappedWithIdleTimeout(body, body, int64(len(content)), time.Second)
+		if err != nil {
+			t.Fatalf("正好等于上限不该被拒: %v", err)
+		}
+		if string(got) != content {
+			t.Fatalf("got=%q want %q", got, content)
+		}
+	})
 }
 
 // TestClientHasNoTotalTimeout 共享客户端不得再设总时长超时——
