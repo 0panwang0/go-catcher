@@ -855,7 +855,14 @@ func normalizeFMP4Segment(data []byte, n *normState) (out []byte, err error) {
 			if pending != nil {
 				newMdat, newSizes, rerr := rebuildMdat(data[pos:pos+sz], pos, pending.infos, n)
 				if rerr != nil {
-					// 转换失败：保留 tfdt 归一化，mdat 原样放行
+					// 转换失败：保留 tfdt 归一化，mdat 原样放行。
+					//
+					// ⚠️ 必须留痕。这一条产出的分片是"重建过的 moof + 原始 mdat"——
+					// 轨道里声明的样本尺寸/偏移不再与 mdat 内容对齐，播放端可能花屏、
+					// 音画错位甚至播不动，而下载日志一个字都不提，正是本项目头号缺陷
+					// 形态（产物坏了但日志正常）。同文件 parseMoof 失败那条分支就是这么
+					// 做的（见上面那处 logDiagnostic），这里原来漏了。
+					n.logDiagnostic("[norm] mdat 重建失败，该分片原样写入（moof 已重建、样本尺寸未重算）: %v", rerr)
 					out = append(out, buildMoof(pending, nil)...)
 					out = append(out, data[pos:pos+sz]...)
 				} else {

@@ -1361,22 +1361,42 @@ func finishStream(sw *streamWriter, j *dlJob, dispTot int64, closeErr error) (in
 // 返回 (已写分片数, 错误)：暂停/取消时返回当前断点与 nil，由上层按意图收尾。
 // ============================================================
 
-// livePollInterval / liveMaxEmptyPolls 为 Runtime 字段（约 75s/25 次兜底，
-// 防死流/直播结束但无 ENDLIST 时挂死；测试可调短）。
+// livePollInterval / liveMaxEmptyPolls 为 Runtime 字段：每 livePollInterval
+// （runtime.go 默认 3s）轮询一次，连续 liveMaxEmptyPolls（默认 25）次没有新分片
+// 就判定直播结束 —— 默认即 75 秒无新分片。防死流/直播结束但无 ENDLIST 时挂死；
+// 测试可调短。
+//
+// ⚠️ 这条注释原来写作"约 75s/25 次兜底"，没说清哪个是间隔，被读成过
+// "75 秒一轮 × 25 次"（差 25 倍）。数字以 runtime.go 的默认值为准，别在注释里
+// 复述成含糊形式。
 
-func (j *dlJob) liveDownload(ctx context.Context, outPath string, from int) (int, error) {
+// liveEndKind 报告 liveDownload 是"怎么结束的"。
+//
+// 三个正常出口（用户中断 / 播放列表声明结束 / 长时间无新分片）都返回 nil error，
+// 上层只能靠它区分。不区分就会把"推断结束"当成"确证结束"、记成一次完整录完 ——
+// 本项目头号缺陷形态（产物可能不完整，而状态与日志显示一切正常）。
+type liveEndKind int
+
+const (
+	liveEndNone     liveEndKind = iota // 没走到任何正常出口（报错返回）
+	liveEndUserStop                    // ctx 取消：用户停止 / 取消 / 程序退出
+	liveEndEndList                     // 播放列表出现 #EXT-X-ENDLIST：源站声明结束
+	liveEndInferred                    // 连续 liveMaxEmptyPolls 次无新分片：推断结束
+)
+
+func (j *dlJob) liveDownload(ctx context.Context, outPath string, from int) (int, liveEndKind, error) {
 	next := from
 	empty := 0
 	for {
 		if err := ctx.Err(); err != nil {
-			return next, nil // 用户中断（停止/取消/退出）：干净返回，收尾意图由上层 finishInterrupt 决定
+			return next, liveEndUserStop, nil // 用户中断（停止/取消/退出）：干净返回，收尾意图由上层 finishInterrupt 决定
 		}
 		content, base, isDirect, err := j.fetchPlaylist(ctx)
 		if err != nil {
-			return next, err
+			return next, liveEndNone, err
 		}
 		if isDirect {
-			return next, fmt.Errorf("直播播放列表响应变为直链媒体，无法继续跟随录制")
+			return next, liveEndNone, fmt.Errorf("直播播放列表响应变为直链媒体，无法继续跟随录制")
 		}
 		cur := parsePlaylist(content, base)
 		// 同一轮窗口内换 key（key rotation）无法安全解密：显式失败。
@@ -1387,11 +1407,11 @@ func (j *dlJob) liveDownload(ctx context.Context, outPath string, from int) (int
 		// 非 identity 的 KEYFORMAT 在点播路径都会被它挡下，直播若只做简易校验
 		// 就成了绕过口 —— 那几类恰好都是「产物坏了但日志正常」的静默损坏。
 		if kerr := validatePlaylist(cur); kerr != nil {
-			return next, kerr
+			return next, liveEndNone, kerr
 		}
 		// 每轮轮询重新装配解密器（幂等：key 未变不重拉）；key 轮换时按新 key 解密后续分片
 		if kerr := j.ensureDecryptor(ctx, cur.key); kerr != nil {
-			return next, kerr
+			return next, liveEndNone, kerr
 		}
 
 		// 窗口滚动检测：上一轮录到的最大序号与本轮列表首片之间若断开，说明中间
@@ -1433,7 +1453,7 @@ func (j *dlJob) liveDownload(ctx context.Context, outPath string, from int) (int
 			commitLiveWaterline(j, pendSeqs, startIdx)
 			if derr != nil {
 				if ctx.Err() != nil {
-					return next, nil
+					return next, liveEndUserStop, nil
 				}
 				// 这批里"本该录到、却没写进文件"的分片，在产物时间轴上就是一段
 				// 真实空洞（源站故障时它们大概率已跟着窗口滚走）。用户主动停止
@@ -1445,27 +1465,27 @@ func (j *dlJob) liveDownload(ctx context.Context, outPath string, from int) (int
 				if written < len(newDurs) {
 					j.addGapSeconds(sumDurs(newDurs[written:]))
 				}
-				return next, derr
+				return next, liveEndNone, derr
 			}
 			if cur.hasEndList {
 				fmt.Println("[live] 播放列表出现 ENDLIST，直播录制自然结束")
-				return next, nil
+				return next, liveEndEndList, nil
 			}
 		} else {
 			if cur.hasEndList {
 				fmt.Println("[live] 播放列表出现 ENDLIST，直播录制自然结束")
-				return next, nil
+				return next, liveEndEndList, nil
 			}
 			empty++
 			if empty >= j.rt.liveMaxEmptyPolls {
 				fmt.Printf("[live] 连续 %d 次轮询无新分片，判定直播结束\n", empty)
-				return next, nil
+				return next, liveEndInferred, nil
 			}
 		}
 
 		select {
 		case <-ctx.Done():
-			return next, nil
+			return next, liveEndUserStop, nil
 		case <-time.After(j.rt.livePollInterval):
 		}
 	}

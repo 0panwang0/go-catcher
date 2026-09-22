@@ -224,7 +224,8 @@ func RunCLI(o CLIOptions) int {
 		defer stop()
 		dlCtx = ctx
 		job.live = true
-		written, err = job.liveDownload(dlCtx, partPath, 0)
+		// CLI 不区分结束种类（那是给 GUI 收尾文案用的）：这里只关心录到几片。
+		written, _, err = job.liveDownload(dlCtx, partPath, 0)
 	} else {
 		written, err = streamDownload(dlCtx, job, segURLs, 0, pl.mediaSeq, partPath)
 	}

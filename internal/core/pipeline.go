@@ -381,8 +381,10 @@ func runDiskPipeline(te *taskEntry) {
 	te.mu.Unlock()
 
 	var next int
+	// 结束种类只有直播会填：同一个 nil error 底下藏着三个出口，必须分开。
+	var endKind liveEndKind
 	if isLive {
-		next, err = job.liveDownload(ctx, partPath, from)
+		next, endKind, err = job.liveDownload(ctx, partPath, from)
 	} else if from >= len(pl.segments) {
 		// 断点已达/超过列表总数（含旧版本重复续传遗留的脏断点）：分片已齐，直接收尾。
 		// streamDownload 未运行，job 计数需手动同步（snapshot 的进度读 job 原子值）
@@ -462,7 +464,25 @@ func runDiskPipeline(te *taskEntry) {
 	// 5-6. 抽样校验 → 容器收尾 → .part 改名为正式文件。
 	//      与「停止」「中断」路径共用同一个收尾函数：收尾代码一旦分叉，
 	//      两条路的产物规则就再也对不齐了。
-	if ferr := finalizeRecording(te, job, partPath, finalizeComplete, ""); ferr != nil {
+	//
+	// 直播走到这里有两条出口，**判据强度不同，文案必须分开**：
+	//   - ENDLIST：源站白纸黑字声明结束 —— 确证；
+	//   - 连续 liveMaxEmptyPolls 次无新分片：只是"列表不再增长"—— 推断，
+	//     产物末尾可能被截断（源站编码卡顿/CDN 慢一拍都会撞上）。
+	// 两者原来都落到 finalizeComplete 且不带说明，卡片上逐字相同，用户看不出
+	// 哪次是"录完的"、哪次是"猜完的"（本项目头号缺陷形态：产物可能不完整，
+	// 而状态与日志显示一切正常）。
+	// 点播没有这回事，说明留空，保持干脆的「已保存」。
+	note := ""
+	if isLive {
+		switch endKind {
+		case liveEndEndList:
+			note = "播放列表已结束"
+		case liveEndInferred:
+			note = "播放列表停止更新 · 末尾可能不全"
+		}
+	}
+	if ferr := finalizeRecording(te, job, partPath, finalizeComplete, note); ferr != nil {
 		fail(ferr.Error())
 		return
 	}
@@ -493,6 +513,11 @@ func (o finalizeOutcome) interrupted() bool { return o == finalizeInterrupted }
 // 总时长 mehd/mvhd）→ 改名成成品 → 置任务终态。
 //
 // 三条路径共用（正常完成 / 用户停止 / 故障中断），差别只在 outcome。
+//
+// reason 是这条收尾的说明，两个分支用法不同：
+//   - interrupted：错误原因，原样写进 errorMsg；
+//   - 正常完成：结束方式的补充说明（只有直播会给），拼进 stage 的括号里 ——
+//     让"源站声明结束"与"我们推断结束"在卡片上可区分。
 //
 // interrupted 那一条有两条硬约束，缺一条就是把缺陷藏起来：
 //   - stage 必须与"完整录制"可区分（"录制中断 · 已保存"）；
@@ -564,7 +589,13 @@ func finalizeRecording(te *taskEntry, job *dlJob, partPath string, outcome final
 		te.st.stage = "已保存（用户停止录制）"
 		te.st.errorMsg = ""
 	} else {
+		// 正常结束。reason 在这里是"结束方式"的说明（见函数注释）：直播会给
+		// 「播放列表已结束」或「播放列表停止更新 · 末尾可能不全」，点播留空。
+		// 不能用同一句「已保存」盖过去——那正是把两种判据强度混成一种的写法。
 		te.st.stage = "已保存"
+		if reason != "" {
+			te.st.stage = "已保存（" + reason + "）"
+		}
 		te.st.errorMsg = ""
 	}
 	// interrupted 标记决定前端把这条记录显示成「已中断」还是「已完成」
