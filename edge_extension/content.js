@@ -28,10 +28,21 @@
   const SEGMENT_WINDOW_MS = 15000;
   const CONCURRENCY = 8;
   const MAX_RETRIES = 3;
+  // 轮询查询任务状态的失败上限：连续查不到任务（本地服务重启过、任务被清理）就
+  // 落到失败态，而不是每 700ms 永久轮询 —— 否则面板会永停在「正在连接…」，
+  // 用户看不出已经失败。⚠ 与 downloader.js 的 POLL_MAX_MISSES 同值：两处是同
+  // 一套语义，改动必须一起改（tests/polllimit.test.js 钉着这条一致性）。
+  const POLL_MAX_MISSES = 15;
   const DEBUG = false; // true 时在页面控制台输出悬停判定日志（排查按钮不出现用）
 
   function dbg(...args) {
     if (DEBUG) console.log("[M3U8 Catcher]", ...args);
+  }
+
+  // pollGiveUp 连续查不到任务的次数是否已达放弃阈值。抽成纯函数是为了可测：
+  // 这个判据一旦被删掉或改成恒 false，轮询就退回"永久静默轮询"（P2-2 的形态）。
+  function pollGiveUp(misses) {
+    return misses > POLL_MAX_MISSES;
   }
 
   let currentBtn = null;
@@ -335,6 +346,10 @@
   }
 
   function hideButton() {
+    // 让在途的 showButtonIfSniffed 作废：它 await 回来时 token 已不匹配、直接返回，
+    // 不会在按钮已被隐藏后又把按钮建回来（P3-3 的形态：悬停期间在途的异步检查
+    // 晚到一步，覆盖了"隐藏"这个更新的状态）。
+    gateToken++;
     if (currentBtn) {
       currentBtn.remove();
       currentBtn = null;
@@ -1180,10 +1195,27 @@
   function trackDownload(source) {
     // 首帧的 live 标记由 triggerDownload 在进面板前按本任务重算（嗅探启发式），
     // 服务端的权威标记要等第一次轮询才到；任一状态变化都会重画控件。
+    let misses = 0; // 连续查不到任务的次数（上限见 pollGiveUp）
     const interval = setInterval(async () => {
       try {
         const resp = await chrome.runtime.sendMessage({ type: "queryDownload", taskId: activeTaskId });
-        if (!resp || !resp.exists) return; // server 还没就绪或短暂不可达，继续轮询
+        if (!resp || !resp.exists) {
+          // 刚发起时服务端可能还没登记该任务，前几次查不到属正常；但连续查不到
+          // 达到上限，说明本地服务重启过或任务已被清理 —— 必须落到可区分的失败态，
+          // 不许继续静默轮询（那会让面板永停在「正在连接…」，用户看不出已失败）。
+          // 判据与 downloader.js 的 pollTask 同口径。
+          if (pollGiveUp(++misses)) {
+            clearInterval(interval);
+            showPanel("error", {
+              message: "任务状态丢失（本地服务可能已重启）",
+              m3u8Url: source.url,
+              pageUrl: source.pageUrl || location.href,
+              title: source.title || document.title || "",
+            });
+          }
+          return;
+        }
+        misses = 0;
         const state = resp.state;
         if (state === "inProgress" || state === "paused") {
           const stage = resp.stage || "下载中";
@@ -1464,7 +1496,18 @@
   // tests/livecontrols.test.js 与 tests/contentparse.test.js 直接调用。
   // content script 里没有 module，整段不执行 —— 对线上行为零影响。
   if (typeof module !== "undefined" && module.exports) {
-    module.exports.__ui = { controlButtons, CTL_STYLE, buildGoCommand, buildOutputName };
+    module.exports.__ui = {
+      controlButtons,
+      CTL_STYLE,
+      buildGoCommand,
+      buildOutputName,
+      // P2-2：轮询放弃判据与阈值（tests/polllimit.test.js 拿它与 downloader.js 对值）
+      pollGiveUp,
+      POLL_MAX_MISSES,
+      // P3-3：hideButton 真跑断言用（token 必须前移，否则晚到的检查会把按钮画回）
+      hideButton,
+      gateTokenNow: () => gateToken,
+    };
   }
 
   if (document.readyState === "loading") {
