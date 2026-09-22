@@ -292,7 +292,7 @@ func resetPartForRerun(partPath string) error {
 		return fmt.Errorf("丢弃临时文件失败（请手动删除后重试）: %s: %w", partPath, rmErr)
 	}
 	// 分片位图是直链分片续传的元数据，与本次全新下载无关，一并清掉避免误用
-	if rmErr := os.Remove(chunkMetaPath(partPath)); rmErr != nil && !os.IsNotExist(rmErr) {
+	if rmErr := removeChunkMeta(partPath); rmErr != nil {
 		fmt.Printf("[warn] 清理分片位图失败 %s: %v\n", chunkMetaPath(partPath), rmErr)
 	}
 	return nil

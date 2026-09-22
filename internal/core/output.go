@@ -32,6 +32,48 @@ func (r *Runtime) normalizeOutput() string {
 	return name
 }
 
+// writeFileAtomic 原子落盘：写同目录临时文件 → Sync → rename 覆盖目标。
+//
+// 为什么必须原子（P1-2）：分片位图 <part>.meta 原先用 os.WriteFile 就地
+// O_TRUNC，写到一半断电/强杀会留下**截断的 JSON** —— 位图随之被判不可用。
+// 而直链 .part 在分片模式下是 WriteAt 稀疏写的产物（文件大小 ≠ 有效字节），
+// 位图一丢，续传就只能从文件末尾往后追加，中间那些洞永远补不上：成品能播、
+// 其中几段是坏数据、日志一切正常。
+//
+// 为什么先 Sync 再 Rename：rename 只保证"目录项切换"这一步不可分割，数据
+// 本身可能还留在页缓存里。先 Sync 才能保证断电后不会出现"文件名已是新的、
+// 内容却是空的"。Sync 之后，磁盘上的目标文件要么是旧的完整内容、要么是新的
+// 完整内容，不存在"半个文件"这个中间态。
+//
+// 临时文件必须与目标同目录（同卷）—— 跨卷 rename 会失败。失败路径一律清掉
+// 临时文件：留着的孤儿既没用，又会在收尾时被当成垃圾。
+func writeFileAtomic(path string, data []byte, perm os.FileMode) error {
+	tmp := path + ".tmp"
+	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, perm)
+	if err != nil {
+		return err
+	}
+	if _, err := f.Write(data); err != nil {
+		f.Close()
+		os.Remove(tmp)
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		f.Close()
+		os.Remove(tmp)
+		return err
+	}
+	if err := f.Close(); err != nil {
+		os.Remove(tmp)
+		return err
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		os.Remove(tmp)
+		return err
+	}
+	return nil
+}
+
 // moveFile 把 src 移到 dst：优先同卷 Rename，跨卷(不同盘)时回退为 复制+删除。
 func moveFile(src, dst string) error {
 	if err := os.MkdirAll(filepath.Dir(dst), 0755); err != nil {

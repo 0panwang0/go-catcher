@@ -276,7 +276,7 @@ func (e *Engine) handleCancel(w http.ResponseWriter, r *http.Request) {
 		te.mu.Unlock()
 		if part != "" {
 			_ = os.Remove(part)
-			_ = os.Remove(part + ".meta")
+			_ = removeChunkMeta(part)
 		}
 		e.rt.markDirty()
 	}

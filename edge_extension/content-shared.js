@@ -20,6 +20,7 @@
     parseVariants: () => parseVariants,
     qualityFromURL: () => qualityFromURL,
     resolveURL: () => resolveURL,
+    sanitizeQuality: () => sanitizeQuality,
     shortQuality: () => shortQuality,
     sleep: () => sleep,
     variantLabel: () => variantLabel,
@@ -121,6 +122,10 @@
   function shortQuality(variant) {
     return String(variant.label || "").split(" \xB7 ")[0] || "";
   }
+  function sanitizeQuality(v) {
+    const s = String(v ?? "");
+    return /^[A-Za-z0-9._+\- ]{1,24}$/.test(s) ? s : "";
+  }
   function qualityFromURL(u) {
     if (!u) return "";
     try {
@@ -129,7 +134,7 @@
         /(2160p|1440p|1080p|720p|480p|360p|240p)/i
       );
       if (m) return m[1].toUpperCase();
-      const q = p.searchParams.get("quality");
+      const q = sanitizeQuality(p.searchParams.get("quality"));
       if (q) return q;
     } catch {
     }

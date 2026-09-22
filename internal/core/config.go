@@ -247,15 +247,9 @@ func (r *Runtime) saveConfigLocked() error {
 	if err != nil {
 		return err
 	}
-	p := r.getConfigPath()
-	tmp := p + ".tmp"
-	if err := os.WriteFile(tmp, data, 0644); err != nil {
-		return err
-	}
-	if err := os.Rename(tmp, p); err != nil {
-		return err
-	}
-	return nil
+	// 原子写：临时文件 + Sync + rename（见 writeFileAtomic）—— 就地写会在断电时
+	// 留下半份 JSON，下次启动解析失败直接回落默认配置，用户改过的设置静默丢失。
+	return writeFileAtomic(r.getConfigPath(), data, 0644)
 }
 
 // initRuntimeConfig 服务启动时调用：建限制器并装载持久化配置。

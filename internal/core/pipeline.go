@@ -522,7 +522,7 @@ func finalizeRecording(te *taskEntry, job *dlJob, partPath string, outcome final
 		// 正常路径判定损坏就直接丢弃：重试只会重下出同样的坏数据，
 		// 留着它只会让"重试"反复失败并占着断点。
 		os.Remove(partPath)
-		os.Remove(partPath + ".meta")
+		removeChunkMeta(partPath)
 		return fmt.Errorf("%w（已丢弃损坏的临时文件）", verr)
 	}
 
@@ -619,8 +619,8 @@ func finishInterrupt(te *taskEntry) {
 			if err := os.Remove(part); err != nil && !os.IsNotExist(err) {
 				fmt.Printf("[disk] WARN: 删除临时文件失败 %s: %v\n", part, err)
 			}
-			if err := os.Remove(part + ".meta"); err != nil && !os.IsNotExist(err) {
-				fmt.Printf("[disk] WARN: 删除分片位图失败 %s: %v\n", part+".meta", err)
+			if err := removeChunkMeta(part); err != nil {
+				fmt.Printf("[disk] WARN: 删除分片位图失败 %s: %v\n", chunkMetaPath(part), err)
 			}
 		}
 		fmt.Printf("[disk] id=%s 已取消\n", id)
@@ -774,8 +774,8 @@ func finishStop(te *taskEntry, id, part string, segDone int64, outcome finalizeO
 			if err := os.Remove(part); err != nil && !os.IsNotExist(err) {
 				fmt.Printf("[disk] WARN: 删除临时文件失败 %s: %v\n", part, err)
 			}
-			if err := os.Remove(part + ".meta"); err != nil && !os.IsNotExist(err) {
-				fmt.Printf("[disk] WARN: 删除分片位图失败 %s: %v\n", part+".meta", err)
+			if err := removeChunkMeta(part); err != nil {
+				fmt.Printf("[disk] WARN: 删除分片位图失败 %s: %v\n", chunkMetaPath(part), err)
 			}
 		}
 		te.mu.Lock()

@@ -594,6 +594,23 @@ type chunkMeta struct {
 
 func chunkMetaPath(partPath string) string { return partPath + ".meta" }
 
+// chunkMetaTmpPath 位图原子写的临时文件（见 writeFileAtomic：先写它、再 rename
+// 到 chunkMetaPath）。
+func chunkMetaTmpPath(partPath string) string { return chunkMetaPath(partPath) + ".tmp" }
+
+// removeChunkMeta 删掉位图及其原子写的临时文件。
+//
+// 收尾 / 失效 / 取消路径统一走这里：只删 .meta 会把 writeFileAtomic 在 Sync 与
+// Rename 之间被杀时留下的 .meta.tmp 变成孤儿 —— 任务早就结束了，再没人来覆盖它。
+func removeChunkMeta(partPath string) error {
+	if err := os.Remove(chunkMetaPath(partPath)); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	// 临时文件不存在是常态（正常路径下它已被 rename 走），错误一律忽略
+	os.Remove(chunkMetaTmpPath(partPath))
+	return nil
+}
+
 // chunkCount 按片长切分 total 字节得到的片数（向上取整；用除余避免 total+size 溢出）。
 func chunkCount(total, size int64) int64 {
 	if size < 1 {
@@ -625,12 +642,16 @@ func loadChunkMeta(partPath string) (*chunkMeta, bool) {
 	return &m, true
 }
 
+// saveChunkMeta 把位图原子写盘（P1-2）：临时文件 + Sync + rename，见 writeFileAtomic。
+// 就地 O_TRUNC 写在"写盘瞬间被强杀/断电"时会留下截断的 JSON，位图随即被判不可用；
+// 而此刻 .part 是稀疏写的产物（大小 ≠ 有效字节），续传只剩"从末尾往后追加"一条路，
+// 中间的空洞会被永久留在成品里。
 func saveChunkMeta(partPath string, m *chunkMeta) error {
 	data, err := json.Marshal(m)
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(chunkMetaPath(partPath), data, 0644)
+	return writeFileAtomic(chunkMetaPath(partPath), data, 0644)
 }
 
 // 位图落盘节流：每完成这么多片、或距上次落盘达到这么久，就写一次盘。
@@ -844,7 +865,7 @@ func (j *dlJob) downloadChunked(ctx context.Context, outPath string, m *chunkMet
 		// 下次任务全量重下
 		closeFile()
 		os.Remove(outPath)
-		os.Remove(chunkMetaPath(outPath))
+		removeChunkMeta(outPath)
 		return errChunkStale
 	}
 	if store.Done() != store.Total() {
@@ -853,7 +874,7 @@ func (j *dlJob) downloadChunked(ctx context.Context, outPath string, m *chunkMet
 		store.Flush()
 		return fmt.Errorf("分片下载未完成")
 	}
-	os.Remove(chunkMetaPath(outPath))
+	removeChunkMeta(outPath)
 	return nil
 }
 

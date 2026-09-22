@@ -281,6 +281,10 @@ var __m3u8catcher = (() => {
   }
 
   // src/background/m3u8-parse.js
+  function sanitizeQuality(v) {
+    const s = String(v ?? "");
+    return /^[A-Za-z0-9._+\- ]{1,24}$/.test(s) ? s : "";
+  }
   function qualityFromURL(u) {
     if (!u) return "";
     try {
@@ -289,7 +293,7 @@ var __m3u8catcher = (() => {
         /(2160p|1440p|1080p|720p|480p|360p|240p)/i
       );
       if (m) return m[1].toUpperCase();
-      const q = p.searchParams.get("quality");
+      const q = sanitizeQuality(p.searchParams.get("quality"));
       if (q) return q;
     } catch {
     }

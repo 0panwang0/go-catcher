@@ -213,16 +213,11 @@ func (r *Runtime) saveState() {
 		fmt.Printf("[state] 序列化失败: %v\n", err)
 		return
 	}
-	p := r.getStatePath()
-	tmp := p + ".tmp"
-	if err := os.WriteFile(tmp, data, 0644); err != nil {
+	// 原子写：临时文件 + Sync + rename（见 writeFileAtomic）—— 就地写会在断电/强杀时
+	// 留下半份 JSON，而载入侧对不符版本/解析失败是整份丢弃，历史任务会一起没。
+	if err := writeFileAtomic(r.getStatePath(), data, 0644); err != nil {
 		r.recordPersistResult(fmt.Errorf("写入失败: %w", err))
 		fmt.Printf("[state] 写入失败: %v\n", err)
-		return
-	}
-	if err := os.Rename(tmp, p); err != nil {
-		r.recordPersistResult(fmt.Errorf("替换状态文件失败: %w", err))
-		fmt.Printf("[state] 替换状态文件失败: %v\n", err)
 		return
 	}
 	r.recordPersistResult(nil)
