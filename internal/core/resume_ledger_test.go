@@ -369,29 +369,225 @@ func TestFinishStopKeepsPartWhenLedgerIsStale(t *testing.T) {
 //
 // 判据必须取"上次记录的模式"：拿"现在能不能读到位图"当判据等于没有守卫 ——
 // 位图丢失本身就是要防的形态。
+//
+// ⚠️ 2026-09-23：本用例的夹具原先用 body[:size/3]（有效前缀），而「按大小 append
+// 一个有效前缀」与「清空重下」产出的字节完全相同 ⇒ 那条字节断言恒真、不产生信息。
+// 已改为真·带洞夹具，并把「续传起点是否为 0」变成独立断言（rr.first()）。
+// 空 partMode 那一态由 TestUnknownPartModeWithLostBitmapRestarts 覆盖 ——
+// 两者合起来才是完整的守卫面（已知分片 / 模式未知）。
 func TestChunkedPartModeWithLostBitmapRestarts(t *testing.T) {
 	saveRestoreState(t)
 	const size = 3 << 20
 	body := directMP4Stub(size)
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "video/mp4")
-		serveDirectRange(w, r, body)
-	}))
+	rr := &rangeRecorder{}
+	srv := newDirectRangeServer(rr, body)
 	t.Cleanup(srv.Close)
 
 	dir := t.TempDir()
 	part := filepath.Join(dir, "movie.mp4.part")
-	// 分片模式的残留：只有前 1/3（真实场景里是带洞的稀疏文件，此处用前缀代表
-	// "文件里有内容但不是有效连续前缀"），而 .meta 位图已经丢失。
-	if err := os.WriteFile(part, body[:size/3], 0644); err != nil {
-		t.Fatal(err)
-	}
+	// ⚠️ 夹具必须是真机可达的形态：WriteAt 稀疏写留下的**带洞**文件。
+	// 原先这里用 body[:size/3]（有效前缀），而"按大小 append 一个有效前缀"与
+	// "清空重下"产出的字节**完全相同** ⇒ 那条字节相等断言恒真、不产生信息，
+	// 整条用例的区分力全靠尾部 takeRestartNote() 撑着（2026-09-23 查实并改正）。
+	holeyPart(t, part, body, size)
 
 	job := &dlJob{rt: testStd, m3u8URL: srv.URL + "/movie.mp4"}
 	job.setPartMode(partModeChunked)
 	if err := job.downloadDirect(context.Background(), part); err != nil {
 		t.Fatalf("下载失败: %v", err)
 	}
+	assertSameAsSource(t, part, body)
+	// 续传起点必须回到 0。这条比字节相等更强：它把"到底有没有清空"变成可观测事实 ——
+	// 守卫失效时第一个请求会带 bytes=<残留长度>-，而两种写法的**最终字节可以相同**。
+	if got := rr.first(); got != "" {
+		t.Fatalf("分片模式位图丢失必须清空重下（首个请求不该带 Range），实际 Range=%q", got)
+	}
+	if note := job.takeRestartNote(); note == "" {
+		t.Fatal("清空重下必须留下可见提示（悄悄重来会让人以为程序在浪费带宽）")
+	}
+}
+
+// TestUnknownPartModeWithLostBitmapRestarts 空 partMode + 带洞 .part 必须清空重下。
+//
+// 这是 2026-09-23 修掉的真实缺陷：原判据是 `partModeNow() == partModeChunked`，
+// 只认「已知是分片」。而 v0.5.0 已经有 WriteAt 分片下载、却没有 partMode 字段 ⇒
+// 升级上来的任务读到空串 ⇒ 守卫整个不生效 ⇒ 带洞的 .part 被按文件大小续传，
+// 那几段洞永久留在成品里（能播、日志一切正常）。
+//
+// 形态归因：**「对象不存在」与「对象为空」必须同等对待** —— 判据只写了非空的那
+// 一半，等于给「不知道」发了张通行证。
+func TestUnknownPartModeWithLostBitmapRestarts(t *testing.T) {
+	saveRestoreState(t)
+	const size = 3 << 20
+	body := directMP4Stub(size)
+	rr := &rangeRecorder{}
+	srv := newDirectRangeServer(rr, body)
+	t.Cleanup(srv.Close)
+
+	dir := t.TempDir()
+	part := filepath.Join(dir, "movie.mp4.part")
+	holeyPart(t, part, body, size)
+
+	job := &dlJob{rt: testStd, m3u8URL: srv.URL + "/movie.mp4"}
+	// 关键：**不**调 setPartMode —— 模拟 v0.5.0 的状态文件里没有 partMode 字段。
+	if err := job.downloadDirect(context.Background(), part); err != nil {
+		t.Fatalf("下载失败: %v", err)
+	}
+	assertSameAsSource(t, part, body)
+	if got := rr.first(); got != "" {
+		t.Fatalf("模式未知时不许按文件大小续传（首个请求 Range=%q）："+
+			"空值的含义是「不知道」，不是「安全」", got)
+	}
+	if note := job.takeRestartNote(); note == "" {
+		t.Fatal("清空重下必须留下可见提示")
+	}
+}
+
+// TestStreamPartModeResumesBySize 与上面两条成对（"该放的放了"）：确知上次是
+// 单连接连续追加时，文件大小**就是**有效字节数，续传是对的 —— 不许误伤。
+//
+// 这条挡的是"把守卫改成一律清空"的过度修正：那样成品仍然正确、上两条也照绿，
+// 但每次重启都把已下好的部分白扔。判据取源站收到的 Range：续传必须从残留长度处
+// 接着要，而不是重新要全量。
+func TestStreamPartModeResumesBySize(t *testing.T) {
+	saveRestoreState(t)
+	const size = 3 << 20
+	body := directMP4Stub(size)
+	rr := &rangeRecorder{}
+	srv := newDirectRangeServer(rr, body)
+	t.Cleanup(srv.Close)
+
+	dir := t.TempDir()
+	part := filepath.Join(dir, "movie.mp4.part")
+	const prefix = size / 2
+	// stream 模式的残留是**有效前缀**（连续追加写的），所以这里用前缀是对的 ——
+	// 与上面两条的带洞夹具形成对照，说明本组用例真的在区分两种残留形态。
+	if err := os.WriteFile(part, body[:prefix], 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	job := &dlJob{rt: testStd, m3u8URL: srv.URL + "/movie.mp4"}
+	job.setPartMode(partModeStream)
+	if err := job.downloadDirect(context.Background(), part); err != nil {
+		t.Fatalf("下载失败: %v", err)
+	}
+	assertSameAsSource(t, part, body)
+	want := fmt.Sprintf("bytes=%d-", prefix)
+	if got := rr.first(); got != want {
+		t.Fatalf("确知 stream 模式必须从残留长度续传，Range 应为 %q，实际 %q", want, got)
+	}
+	if note := job.takeRestartNote(); note != "" {
+		t.Fatalf("stream 模式的合法续传不该报「从头下载」：%q", note)
+	}
+}
+
+// TestDirectResumeGuardIsFailSafe 结构守卫：直链"按文件大小续传"的前置判据必须是
+// **fail-safe 方向**的 —— 只有确知上次是 stream 才放行。
+//
+// 为什么行为用例之外还要这一条：上面三条只证明"当前这三种取值的后果"，若有人把判据
+// 换成另一种"看起来更严谨"的写法（如白名单式 `mode == partModeChunked || mode ==
+// partModeStream` 再补分支），行为可能仍然全绿而语义已经反过来 —— 那正是本次缺陷的
+// 成因。这里直接钉住判据本体与两个方向性文案。
+func TestDirectResumeGuardIsFailSafe(t *testing.T) {
+	src, err := os.ReadFile("download.go")
+	if err != nil {
+		t.Fatalf("读 download.go 失败: %v", err)
+	}
+	// 只看**代码**：本次修正的注释里为了说明来龙去脉，原样引用了旧判据
+	// `partModeNow() == partModeChunked`。若把注释也算进去，这条守卫会因为
+	// "文档写清楚了历史"而翻红 —— 断言的是接线，不是散文。
+	// （与 limits_test.go 里"跳过 _test.go"同源：都要把非代码噪声排除掉。）
+	var code strings.Builder
+	for _, ln := range strings.Split(string(src), "\n") {
+		if t := strings.TrimSpace(ln); strings.HasPrefix(t, "//") {
+			continue
+		}
+		code.WriteString(ln)
+		code.WriteByte('\n')
+	}
+	s := code.String()
+	if strings.TrimSpace(s) == "" {
+		t.Fatal("剥掉注释后源码为空 —— 读取或切分失效，下面的断言会恒真")
+	}
+
+	if !strings.Contains(s, "offset > 0 && mode != partModeStream") {
+		t.Error("downloadDirect 的模式守卫不再是 fail-safe 写法" +
+			"（应为 `offset > 0 && mode != partModeStream`）：只有确知上次是单连接连续追加，" +
+			"文件大小才等于有效字节数")
+	}
+	// 反向：旧的"只认已知分片"写法不许复活（它漏掉空串 = 升级任务）。
+	if strings.Contains(s, "partModeNow() == partModeChunked") {
+		t.Error("守卫又回到了只认「已知是分片」的旧写法：partMode 为空（v0.5.0 升级任务）时整个失效")
+	}
+	// 两种情形各要有自己的可见文案：合并成一句含混的话会让用户分不清
+	// "位图被删了"和"这是升级上来的旧任务"。
+	for _, want := range []string{"续传位图丢失，已从头下载", "续传信息不完整，已从头下载"} {
+		if !strings.Contains(s, want) {
+			t.Errorf("download.go 缺少恢复提示文案 %q（且必须写在代码里，不是注释里）", want)
+		}
+	}
+}
+
+// rangeRecorder 记录直链源站收到的 Range 头（按请求顺序），用于断言"这次到底是
+// 续传还是从头下"。光看最终字节分不出这两者，见各用例注释。
+type rangeRecorder struct {
+	mu   sync.Mutex
+	seen []string
+}
+
+func (rr *rangeRecorder) add(r *http.Request) {
+	rr.mu.Lock()
+	rr.seen = append(rr.seen, r.Header.Get("Range"))
+	rr.mu.Unlock()
+}
+
+// first 返回首个请求的 Range 头；"<无请求>" 与 "" 可区分（后者 = 请求了但没带 Range）。
+func (rr *rangeRecorder) first() string {
+	rr.mu.Lock()
+	defer rr.mu.Unlock()
+	if len(rr.seen) == 0 {
+		return "<无请求>"
+	}
+	return rr.seen[0]
+}
+
+// newDirectRangeServer 起一个直链源站：记录 Range 并交给 serveDirectRange 应答。
+func newDirectRangeServer(rr *rangeRecorder, body []byte) *httptest.Server {
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		rr.add(r)
+		w.Header().Set("Content-Type", "video/mp4")
+		serveDirectRange(w, r, body)
+	}))
+}
+
+// holeyPart 造一个"WriteAt 稀疏写留下的带洞文件"：写 [0,size/6) 与 [size/3,size/2)，
+// 中间 [size/6,size/3) 是洞。文件大小 = size/2，但有效字节数只有 size/3。
+//
+// 为什么必须是真·带洞而不是"有效前缀"：前缀文件按大小续传**也能得到正确结果**，
+// 只有带洞文件才能把守卫的缺失暴露出来（这正是原用例夹具的盲区）。
+func holeyPart(t *testing.T, path string, body []byte, size int) {
+	t.Helper()
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteAt(body[:size/6], 0); err != nil {
+		f.Close()
+		t.Fatal(err)
+	}
+	if _, err := f.WriteAt(body[size/3:size/2], int64(size/3)); err != nil {
+		f.Close()
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// assertSameAsSource 断言产物与源站字节逐字节相同。守卫缺失时中间那段洞会留下，
+// 这条就会红 —— "产物坏了"的可观测事实，而不是"有没有报错"。
+func assertSameAsSource(t *testing.T, part string, body []byte) {
+	t.Helper()
 	got, err := os.ReadFile(part)
 	if err != nil {
 		t.Fatal(err)
@@ -399,9 +595,6 @@ func TestChunkedPartModeWithLostBitmapRestarts(t *testing.T) {
 	if !bytes.Equal(got, body) {
 		t.Fatalf("成品 %d 字节 want %d：按文件大小续传会把空洞留在产物里（应清空重下）",
 			len(got), len(body))
-	}
-	if note := job.takeRestartNote(); note == "" {
-		t.Fatal("清空重下必须留下可见提示（悄悄重来会让人以为程序在浪费带宽）")
 	}
 }
 

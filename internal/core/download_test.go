@@ -80,6 +80,11 @@ func TestDownloadDirectResume(t *testing.T) {
 	os.WriteFile(part, []byte("01234"), 0644) // 已下 5 字节
 
 	job := &dlJob{rt: testStd, m3u8URL: srv.URL}
+	// 残留是**有效前缀**：必须声明"上次是单连接连续追加"，才允许按文件大小续传。
+	// 模式未知时守卫会清空重下（见 downloadDirect 的模式守卫）—— 真机上这个值由
+	// pipeline 从状态文件恢复（pipeline.go 的 st.partMode），而单测直连
+	// downloadDirect，所以得自己声明；漏了这一行就等于在断言"未知模式的安全"。
+	job.setPartMode(partModeStream)
 	if err := job.downloadDirect(context.Background(), part); err != nil {
 		t.Fatalf("downloadDirect: %v", err)
 	}
@@ -108,6 +113,7 @@ func TestDownloadDirectNoRangeFallback(t *testing.T) {
 	os.WriteFile(part, []byte("stale-old-data"), 0644)
 
 	job := &dlJob{rt: testStd, m3u8URL: srv.URL}
+	job.setPartMode(partModeStream) // 上次为单连接连续追加（见上一条用例的说明）
 	if err := job.downloadDirect(context.Background(), part); err != nil {
 		t.Fatalf("downloadDirect: %v", err)
 	}
@@ -140,6 +146,7 @@ func TestDownloadDirect416Retry(t *testing.T) {
 	os.WriteFile(part, []byte("very-long-stale-part"), 0644) // 20 字节 > 新文件长度
 
 	job := &dlJob{rt: testStd, m3u8URL: srv.URL}
+	job.setPartMode(partModeStream) // 上次为单连接连续追加（见 TestDownloadDirectResume 的说明）
 	if err := job.downloadDirect(context.Background(), part); err != nil {
 		t.Fatalf("downloadDirect: %v", err)
 	}

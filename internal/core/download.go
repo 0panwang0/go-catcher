@@ -471,7 +471,9 @@ func (sw *streamWriter) Close() error {
 // 三种模式自动选择：
 //  1. 分片续传：.part.meta 位图存在 → 只下载未完成的分片
 //  2. 分片下载：全新文件且服务器支持 Range（Content-Range 给出总大小）→ 并发分片
-//  3. 单连接续传：其余情况 → Range 追加（206）/ 全量覆盖（200）/ 丢弃重下（416）
+//  3. 单连接续传：其余情况 → Range 追加（206）/ 全量覆盖（200）/ 丢弃重下（416）。
+//     按文件大小续传的前提是"上次确知为单连接连续追加"（partModeStream）：分片模式
+//     或模式未知（旧任务）一律先清空，见下方模式守卫。
 //
 // 分片模式下 ctx 取消或失败会保留 .part 与 .meta（位图记下已落盘的片），
 // 任务恢复后只重下缺失片。片长固定为 chunkSizeFixed、与并发数解耦，
@@ -503,16 +505,33 @@ func (j *dlJob) downloadDirect(ctx context.Context, outPath string) error {
 
 	// 模式 3：单连接续传
 	offset := partFileOffset(outPath)
-	// 模式守卫（P0-4 的直链版本）：上次是分片模式、但位图已经丢了（落盘失败、
-	// 被外部删除，或上次退出时还没写盘）。此时文件是 WriteAt 稀疏写的产物 ——
-	// 大小 = 最大已写区间末端，**中间可能有洞** —— 按大小续传会从文件末尾往后
-	// append，那些洞永远补不上：成品能播，但其中几段是坏数据，日志一切正常。
+	// 模式守卫（P0-4 的直链版本）：一个非空的 .part 只有在上次是**单连接连续追加**
+	// 时才是有效前缀 —— 那时文件大小恰好等于有效字节数。上次若是分片模式，文件是
+	// WriteAt 稀疏写的产物：大小 = 最大已写区间末端，**中间可能有洞**，按大小续传
+	// 会从文件末尾往后 append，那些洞永远补不上 —— 成品能播，但其中几段是坏数据，
+	// 日志一切正常（本项目头号缺陷形态）。
 	//
 	// 判据必须取"上次记录的模式"，不能取"现在能不能读到位图"：位图丢失本身
 	// 就是要防的形态，拿它当判据等于没有守卫。
-	if offset > 0 && j.partModeNow() == partModeChunked {
-		fmt.Printf("[direct] 上次为分片模式但位图已丢失，临时文件可能存在空洞：清空重下\n")
-		j.setRestartNote("续传位图丢失，已从头下载")
+	//
+	// 方向一律 fail-safe（与 pipeline.go 的 alignPartToLedger 是同一条原则：账本/
+	// 模式不可用即清空重下，绝不按文件大小猜）。所以这里**只有确知是 stream 才敢
+	// 按大小续传**，其余两态都清空重下：
+	//   - 分片模式（chunked）：位图已丢，文件可能带洞；
+	//   - 空串：v0.5.0 升级上来的旧任务 —— 那个版本已有 WriteAt 分片下载，但没有
+	//     partMode 字段，于是读到空串。**空值的含义是"不知道"，不是"安全"**。
+	//
+	// ⚠️ 2026-09-23 修正：原判据是 `partModeNow() == partModeChunked`，只认"已知是
+	// 分片"。旧任务读到空串 ⇒ 守卫整个不生效 ⇒ 带洞的 .part 被按大小续传，洞留在
+	// 成品里（形态②"对象不存在 vs 对象为空"：判据只写过非空的那一半）。
+	if mode := j.partModeNow(); offset > 0 && mode != partModeStream {
+		if mode == partModeChunked {
+			fmt.Printf("[direct] 上次为分片模式但位图已丢失，临时文件可能存在空洞：清空重下\n")
+			j.setRestartNote("续传位图丢失，已从头下载")
+		} else {
+			fmt.Printf("[direct] 上次的写入模式未知（升级前的旧任务），无法确认临时文件是有效前缀：清空重下\n")
+			j.setRestartNote("续传信息不完整，已从头下载（原有临时文件已清空）")
+		}
 		if err := os.Truncate(outPath, 0); err != nil {
 			return err
 		}
