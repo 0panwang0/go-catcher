@@ -114,6 +114,13 @@ type playlistInfo struct {
 	// N 行会解析出同一个 URL 并各下一遍再顺序 append —— 体积放大 N 倍、时间轴
 	// 完全错位，而且不会有任何报错。用这个标记让调用方显式失败。
 	hasByteRange bool
+	// mapByteRange #EXT-X-MAP 行带了 BYTERANGE 属性：init 段是某个文件的**字节片段**。
+	// 当前实现只按 URI 把整个文件拉回来当 init 段 —— 偏移非 0 时那根本不是 init 段，
+	// fMP4 的容器识别与轨道信息都跟着错，产物"能播但时间轴/轨道错"而日志全绿。
+	// 与 hasByteRange 同源（同一个特性，落在 MAP 行上），并进同一条校验。
+	// 只在 MAP 行同时给出 URI 时置位：没有 URI 就没有要取的 init 段，
+	// 不该因为一行畸形声明拒掉一个本来正常的流。
+	mapByteRange bool
 }
 
 // sameKey 判定两条 #EXT-X-KEY 是否等价（METHOD/URI/IV/KEYFORMAT 全同）。
@@ -181,14 +188,18 @@ func ensureSingleKey(pl playlistInfo) error {
 	return nil
 }
 
-// ensureNoByteRange 校验播放列表没有使用字节范围分片。
+// ensureNoByteRange 校验播放列表没有使用字节范围取流。
 //
 // #EXT-X-BYTERANGE 让多个分片行指向同一个 URL 的不同字节区间。当前管线把每行
 // 当成独立文件整份下载，结果是同一个文件被下 N 遍再顺序拼接：体积放大 N 倍、
 // 时间轴错位，且 validateOutput 的同步字节判据发现不了（每一份都是合法 TS）。
 // 完整支持需要给分片附上 Range 语义，属于较大的改动；定版前先显式拒绝。
+//
+// 同一个特性落在 #EXT-X-MAP 行上（init 段是字节片段）危害更大：管线会把整个
+// 文件当成 init 段，容器识别与轨道信息全错，而"产物能播"会让人以为没问题。
+// 所以这**不是**只查分片行——两条来源并进同一个判据，新增来源时也往这里加。
 func ensureNoByteRange(pl playlistInfo) error {
-	if pl.hasByteRange {
+	if pl.hasByteRange || pl.mapByteRange {
 		return fmt.Errorf("播放列表使用了 #EXT-X-BYTERANGE（单文件按字节区间切片），当前版本不支持字节范围分片，无法正确下载该流")
 	}
 	return nil
@@ -293,6 +304,9 @@ func parsePlaylist(m3u8Text, base string) playlistInfo {
 			if u := mapURIAttr(line); u != "" {
 				pl.hasMap = true
 				pl.mapURI = resolveURL(base, u)
+				// init 段的 BYTERANGE 与分片行的 BYTERANGE 是同一特性，
+				// 但管线对 init 段只做"按 URI 整份下载"，同样按错误语义硬跑。
+				pl.mapByteRange = pl.mapByteRange || mapHasByteRangeAttr(line)
 			}
 		case strings.HasPrefix(line, "#EXTINF:"):
 			// EXTINF 行在它对应的分片 URL 行之前出现，先记下等 URL 行配对
@@ -365,6 +379,42 @@ func mapURIAttr(line string) string {
 		return m[1]
 	}
 	return strings.TrimSpace(m[2])
+}
+
+// mapHasByteRangeAttr 判定 #EXT-X-MAP 行是否带 BYTERANGE 属性。
+//
+// 不在整行上正则匹配 `BYTERANGE=`：URI 属性是 quoted-string，查询串里完全可能
+// 出现这个词（`URI="https://x/i.mp4?BYTERANGE=0"`），整行匹配会把合法流误判成
+// 不支持。规范里属性用逗号分隔、quoted-string 内部的逗号不算分隔符，所以按引号
+// 状态切段、再逐段比对**属性名**，就只认真正的属性位置。
+func mapHasByteRangeAttr(line string) bool {
+	i := strings.IndexByte(line, ':')
+	if i < 0 {
+		return false
+	}
+	attrs := line[i+1:]
+	inQuote := false
+	start := 0
+	for j := 0; j < len(attrs); j++ {
+		c := attrs[j]
+		if c == '"' {
+			inQuote = !inQuote
+			continue
+		}
+		if c != ',' || inQuote {
+			continue
+		}
+		if isByteRangeToken(attrs[start:j]) {
+			return true
+		}
+		start = j + 1
+	}
+	return isByteRangeToken(attrs[start:])
+}
+
+// isByteRangeToken 判定一个属性片段是否为 BYTERANGE=…（属性名大小写不敏感）。
+func isByteRangeToken(seg string) bool {
+	return strings.HasPrefix(strings.ToUpper(strings.TrimSpace(seg)), "BYTERANGE=")
 }
 
 // parseKeyLine 解析 #EXT-X-KEY 行：METHOD、URI（相对路径按 base 解析）、

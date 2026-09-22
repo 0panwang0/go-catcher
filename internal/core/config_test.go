@@ -389,7 +389,11 @@ func TestRuntimeTuningConcurrentAccess(t *testing.T) {
 				case <-stop:
 					return
 				default:
-					if testStd.concurrencyNow() <= 0 || testStd.maxRetriesNow() < 0 {
+					// 判据是"读到可用的运行参数"：并发 ≠ 0、重试次数 ≥ 1。
+					// 这里**必须用读取入口**（而不是裸字段）：重试次数的存储值可以是 0
+					// （设置页允许），下限夹取发生在 maxRetriesNow() 里 ——
+					// 写成 `< 0` 的话，夹取被删掉也不会红，等于没查。
+					if testStd.concurrencyNow() <= 0 || testStd.maxRetriesNow() < 1 {
 						t.Errorf("读到非法运行参数")
 						return
 					}

@@ -143,7 +143,25 @@ func defaultConfig() appConfig {
 
 // concurrencyNow / maxRetriesNow 是下载热路径的读取入口（无锁）。
 func (r *Runtime) concurrencyNow() int { return int(r.segConcurrency.Load()) }
-func (r *Runtime) maxRetriesNow() int  { return int(r.retryLimit.Load()) }
+
+// maxRetriesNow 读取重试次数，并把下限夹取到 1。
+//
+// 为什么下限是 1 而不是 0：设置页把「分片失败重试」的合法区间写作 0–10
+// （settings.html），所以 0 是用户能选的值，语义是"不重试"。但所有重试循环
+// 都写成 `for attempt := 1; attempt <= n; attempt++`，n=0 时一次都不进 ——
+// httpGetWithRetry 于是走到函数末尾 `return nil, lastStatus, lastErr`，
+// 而 lastErr 从未被赋值 ⇒ 返回 (nil, 0, nil)：**nil error + nil body**。
+// 调用方把它当成功，拿着空体往下走，产物坏了而日志全绿。
+//
+// 夹取放在读取入口而不是写入点：存储值保留用户的字面选择（0 就是 0，
+// 设置页回显一致），只在这里保证"至少尝试一次"这条不变量，四处调用点
+// （net.go ×2、download.go ×2）一次全覆盖。
+func (r *Runtime) maxRetriesNow() int {
+	if n := int(r.retryLimit.Load()); n > 0 {
+		return n
+	}
+	return 1
+}
 
 // chunkSizeNow 本次直链分片使用的片长（0 视为默认，测试可调小）。
 func (r *Runtime) chunkSizeNow() int64 {

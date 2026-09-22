@@ -253,7 +253,13 @@ func hdlrMediaType(mdia []byte) string {
 		}
 		if typ == "hdlr" {
 			// hdlr: verflags(4) + pre_defined(4) + handler_type(4) + reserved(12) + name*
-			if len(mdia)-payload < 16 {
+			//
+			// 边界必须按该盒**自己声明的长度**（pos+sz）算，不能用父盒 mdia 的总长：
+			// 一个 sz 越过 mdia 末端的畸形 hdlr 会在这里被判成"长度足够"，随后读到的
+			// 是下一个盒（或盒外）的字节，handler_type 解析出垃圾 —— 音轨被判成视频轨
+			// 之类，产物"能播但轨道标记错"，日志全绿。同文件另四个盒遍历
+			// （stsdMediaType / mvhdTimescale 等）都按各自的 box 末端判断，这里补齐一致。
+			if payload+16 > pos+sz {
 				return ""
 			}
 			switch string(mdia[payload+8 : payload+12]) {

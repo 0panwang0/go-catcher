@@ -310,13 +310,17 @@ func (r *Runtime) httpGetWithRetry(ctx context.Context, target, ref string) ([]b
 			continue
 		}
 		// 读体带空闲超时（与分片下载同一套）：只设 ResponseHeaderTimeout 时，
-		// 服务端把响应头发完就停住会让读取永久挂住。
-		body, err := readAllWithIdleTimeout(resp.Body, transferIdleTimeout)
+		// 服务端把响应头发完就停住会让读取永久挂住。上限见 maxPlaylistBytes。
+		body, err := readCappedWithIdleTimeout(resp.Body, resp.Body, maxPlaylistBytes, transferIdleTimeout)
 		resp.Body.Close()
 		if err != nil {
 			lastErr = fmt.Errorf("attempt %d: read body: %w", attempt, err)
 			if ctx.Err() != nil {
 				return nil, lastStatus, ctx.Err()
+			}
+			if errors.Is(err, errBodyTooLarge) {
+				// 超限是"远端返回的东西不是播放列表"，重试只会再来一遍同样的内容。
+				return nil, lastStatus, lastErr
 			}
 			continue
 		}
@@ -325,10 +329,17 @@ func (r *Runtime) httpGetWithRetry(ctx context.Context, target, ref string) ([]b
 		// 此处按 Content-Encoding 兜底（若 Go 已解压，该头会被移除，不会二次解压）。
 		if enc := resp.Header.Get("Content-Encoding"); strings.Contains(enc, "gzip") {
 			if gz, gerr := gzip.NewReader(bytes.NewReader(body)); gerr == nil {
-				if ub, uerr := io.ReadAll(gz); uerr == nil {
+				// 解压同样有上限：压缩率由对方决定，压缩前那道限挡不住解压炸弹。
+				ub, uerr := readCappedBytes(gz, maxPlaylistBytes)
+				gz.Close()
+				if errors.Is(uerr, errBodyTooLarge) {
+					return nil, lastStatus, fmt.Errorf("attempt %d: %w", attempt, uerr)
+				}
+				if uerr == nil {
 					body = ub
 				}
-				gz.Close()
+				// 其它解压错误（损坏的 gzip，极少见）：沿用原行为按未解压正文处理，
+				// 后面 isM3U8Playlist 会判定它不是播放列表。
 			}
 		}
 		return body, http.StatusOK, nil
@@ -416,13 +427,19 @@ func (r *Runtime) httpGetPlaylist(ctx context.Context, target, ref string) (body
 			resp.Body.Close()
 			return peek, true, http.StatusOK, nil
 		}
-		rest, rerr := readAllWithIdleTimeout(&limitedReadCloser{Reader: rd, Closer: resp.Body}, transferIdleTimeout)
+		// 上限按"整份播放列表"算：peek 已占去一部分，剩下的额度在这里
+		// （httpGetWithRetry 与这里读的是同一类东西，两侧同一个 maxPlaylistBytes）。
+		rest, rerr := readCappedWithIdleTimeout(rd, resp.Body, maxPlaylistBytes-int64(len(peek)), transferIdleTimeout)
 		if gz != nil {
 			gz.Close()
 		}
 		resp.Body.Close()
 		if rerr != nil {
 			lastErr = fmt.Errorf("attempt %d: read body: %w", attempt, rerr)
+			if errors.Is(rerr, errBodyTooLarge) {
+				// 超限的内容重试一遍还是同一份，没必要空耗 maxRetries 轮
+				return nil, false, 0, lastErr
+			}
 			continue
 		}
 		full := append(peek, rest...)
@@ -523,6 +540,20 @@ const transferIdleTimeout = 60 * time.Second
 var errTransferStalled = fmt.Errorf(
 	"传输中断：连续 %s 无数据到达（连接卡死或服务端已停止响应）", transferIdleTimeout)
 
+// errBodyTooLarge 响应体超过体积上限。独立哨兵：调用方要区分"超限"（远端恶意/异常，
+// 必须显式失败）与"其它读错误"（沿用原有重试语义）。
+var errBodyTooLarge = errors.New("响应体超过体积上限")
+
+// maxPlaylistBytes 单个播放列表响应的读取上限，**解压前后各自适用**。
+//
+// 真实播放列表是纯文本：一万条分片 × 每行约 100 字节 ≈ 1 MB，8 MiB 已是一个
+// 数量级的余量（大分片段走 fetchSegment，不经这里，故不受此值影响）。
+//
+// 设上限的理由不是"装不下"，而是**远端字节不可信**：无上限时，一个持续输出的
+// 源站就能把响应体无限灌进内存。解压后的读取必须用同一个上限——压缩率由对方
+// 决定（可到 1000:1），只在压缩前设限挡不住"小输入炸出大内存"。
+const maxPlaylistBytes int64 = 8 << 20
+
 // copyWithIdleTimeout 把 body 拷到 dst，读空闲超过 idle 即关闭 body 中断传输。
 // 返回已写字节数与错误；正常情况下 io.EOF 归零为 nil。
 //
@@ -565,6 +596,37 @@ func readAllWithIdleTimeout(body io.ReadCloser, idle time.Duration) ([]byte, err
 	var buf bytes.Buffer
 	if _, err := copyWithIdleTimeout(&buf, body, idle); err != nil {
 		return nil, err
+	}
+	return buf.Bytes(), nil
+}
+
+// readCappedBytes 把 r 读进内存并硬性限制字节数（用于已在内存里的数据，如 gzip 解压流）。
+//
+// 超限**返回错误而不是截断**：截断会让"只读到一半的播放列表"被当成完整内容进管线，
+// 产物错了而日志正常——正是本项目反复出现的头号缺陷形态。多读 1 字节是为了把
+// "正好等于上限"与"超出上限"区分开。
+func readCappedBytes(r io.Reader, limit int64) ([]byte, error) {
+	b, err := io.ReadAll(io.LimitReader(r, limit+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(b)) > limit {
+		return nil, fmt.Errorf("%w（已超出 %d 字节，远端返回的内容不是正常播放列表）", errBodyTooLarge, limit)
+	}
+	return b, nil
+}
+
+// readCappedWithIdleTimeout 同 readCappedBytes，但带空闲超时。
+// r 与 closer 分开传：r 可能是套在 resp.Body 上的 gzip.Reader，
+// 而中断阻塞读必须作用于底层 resp.Body（见 limitedReadCloser 的注释）。
+func readCappedWithIdleTimeout(r io.Reader, closer io.Closer, limit int64, idle time.Duration) ([]byte, error) {
+	var buf bytes.Buffer
+	n, err := copyWithIdleTimeout(&buf, limitReadCloser(r, limit+1, closer), idle)
+	if err != nil {
+		return nil, err
+	}
+	if n > limit {
+		return nil, fmt.Errorf("%w（已超出 %d 字节，远端返回的内容不是正常播放列表）", errBodyTooLarge, limit)
 	}
 	return buf.Bytes(), nil
 }
