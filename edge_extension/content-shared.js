@@ -223,6 +223,17 @@
     })[c]);
   }
 
+  // src/background/constants.js
+  var constants_exports = {};
+  __export(constants_exports, {
+    MAX_SNIFFED: () => MAX_SNIFFED,
+    MAX_SNIFF_AGE_MS: () => MAX_SNIFF_AGE_MS,
+    POLL_MAX_MISSES: () => POLL_MAX_MISSES
+  });
+  var MAX_SNIFFED = 30;
+  var MAX_SNIFF_AGE_MS = 7 * 24 * 60 * 60 * 1e3;
+  var POLL_MAX_MISSES = 15;
+
   // src/content-shared-entry.js
-  globalThis.__m3u8Shared = { ...m3u8_parse_exports, ...cli_args_exports, ...media_url_exports, ...html_escape_exports };
+  globalThis.__m3u8Shared = { ...m3u8_parse_exports, ...cli_args_exports, ...media_url_exports, ...html_escape_exports, ...constants_exports };
 })();

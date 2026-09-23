@@ -6,8 +6,11 @@
 //   被清理后，面板**永远**停在「正在连接…」，用户看不出已经失败（本项目头号
 //   缺陷形态：静默失败）。downloader.js 的 pollTask 早有 POLL_MAX_MISSES = 15，
 //   浮层侧漏了 ⇒ 修法是把已有那套搬过去，不是另造一套。
-//   ⚠ 两处是同一套语义 ⇒ **阈值必须相等**，本文件跨文件对值（离开这个测试，
-//   两处各自的测试都看不住漂移）。
+//   ⚠ 两处是同一套语义 ⇒ 阈值只能有一个来源。D3 当时的写法是两处各写一份 15、
+//   由本文件跨文件对值防漂移；**质量审查（2026-09-23）改成单一来源**：常量落在
+//   src/background/constants.js，content.js 经 content-shared.js 取、
+//   downloader.js 直接 import。现在本文件守的是"没有第二份字面量复活 + 两条
+//   取用路径都真的接上了"。
 //
 // 【P3-3 在途检查覆盖「隐藏」】hideButton 原实现不碰 gateToken ⇒ 悬停期间发起的
 //   getVideoSource 检查晚一步返回时 token 仍然匹配，会把**已经隐藏**的按钮重新
@@ -22,6 +25,12 @@ const path = require("path");
 const DIR = path.join(__dirname, "..");
 const src = fs.readFileSync(path.join(DIR, "content.js"), "utf8");
 const downloaderSrc = fs.readFileSync(path.join(DIR, "downloader.js"), "utf8");
+const constSrc = fs.readFileSync(path.join(DIR, "src", "background", "constants.js"), "utf8");
+const sharedSrc = fs.readFileSync(path.join(DIR, "content-shared.js"), "utf8");
+
+// 阈值的唯一来源。**从源码解析真值**再喂进下面的桩，而不是写死 15：
+// 写死的话"content.js 有没有真的从共享对象取值"就测不出来了（夹具恒真）。
+const constMatch = constSrc.match(/export const POLL_MAX_MISSES\s*=\s*(\d+)/);
 
 const window = {
   __m3u8_catcher_injected__: false,
@@ -38,7 +47,14 @@ const document = {
 };
 const mod = { exports: {} };
 
-globalThis.__m3u8Shared = { sanitizeFileName: (s) => s, qualityFromURL: () => "" };
+// 桩模拟真机装配：content-shared.js 在 content.js 之前注入，把 constants.js 的
+// 导出挂到 globalThis。POLL_MAX_MISSES 喂**从源码解析来的真值**（见上）——
+// 桩里写死一个数字，就等于替生产代码把答案填好了。
+globalThis.__m3u8Shared = {
+  sanitizeFileName: (s) => s,
+  qualityFromURL: () => "",
+  POLL_MAX_MISSES: constMatch ? Number(constMatch[1]) : NaN,
+};
 
 new Function(
   "window",
@@ -73,14 +89,26 @@ function check(name, cond, extra) {
   }
 }
 
-// ---------- A. 跨文件一致性：两处阈值必须是同一个数 ----------
-console.log("A. 与 downloader.js 对值（同一套语义，不许漂移）");
-const dlMatch = downloaderSrc.match(/const POLL_MAX_MISSES\s*=\s*(\d+)/);
-const dlMax = dlMatch ? Number(dlMatch[1]) : NaN;
-check("downloader.js 里仍能取到 POLL_MAX_MISSES 常量（夹具自检：取不到就是解析失效）",
-  Number.isFinite(dlMax), dlMax);
-check("content.js 的 POLL_MAX_MISSES 与 downloader.js 相等",
-  ui.POLL_MAX_MISSES === dlMax, { content: ui.POLL_MAX_MISSES, downloader: dlMax });
+// ---------- A. 单一来源：阈值只许有一份定义 ----------
+console.log("A. 阈值只有一份来源（constants.js），两处消费方都不许自留字面量");
+const constMax = constMatch ? Number(constMatch[1]) : NaN;
+check("constants.js 里能取到 POLL_MAX_MISSES（夹具自检：取不到就是解析失效）",
+  Number.isFinite(constMax), constMax);
+// 下面两条是"有没有退回到两处各写一份"的机器守卫。D3 当时的写法靠"两处恰好还
+// 相等"防漂移 —— 那种判据在有人只改一处、且恰好没触发对值断言时是漏的。
+check("content.js 不再本地定义 POLL_MAX_MISSES 字面量",
+  !/POLL_MAX_MISSES\s*=\s*\d/.test(src));
+check("downloader.js 不再本地定义 POLL_MAX_MISSES 字面量",
+  !/POLL_MAX_MISSES\s*=\s*\d/.test(downloaderSrc));
+check("downloader.js 从 constants.js import 该常量（ESM 侧的取用路径）",
+  /import\s*\{[^}]*\bPOLL_MAX_MISSES\b[^}]*\}\s*from\s*["'][^"']*constants\.js["']/.test(downloaderSrc));
+// 内容脚本侧的取用路径：常量必须真挂在 content-shared.js 的共享对象上。
+// 漏挂时 content.js 的 P.POLL_MAX_MISSES 是 undefined（面板永停「正在连接…」），
+// 只有产物这一层的痕迹能提前发现。
+check("content-shared.js 产物挂着 POLL_MAX_MISSES（漏挂则浮层取到 undefined）",
+  /POLL_MAX_MISSES/.test(sharedSrc));
+check("content.js 取到的阈值等于唯一来源的值（改了一处忘另一处必红）",
+  ui.POLL_MAX_MISSES === constMax, { content: ui.POLL_MAX_MISSES, constants: constMax });
 // 轮询周期是 700ms：阈值太小会让"服务刚起、任务还没登记"的正常窗口被判成丢失。
 check("阈值对应至少 5 秒的等待窗口（15 × 700ms ≈ 10.5s）",
   ui.POLL_MAX_MISSES >= 5, ui.POLL_MAX_MISSES);

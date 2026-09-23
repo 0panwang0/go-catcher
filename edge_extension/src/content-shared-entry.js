@@ -14,5 +14,9 @@ import * as parse from "./background/m3u8-parse.js";
 import * as cli from "./background/cli-args.js";
 import * as mediaUrl from "./background/media-url.js";
 import * as htmlText from "./background/html-escape.js";
+// constants 也进共享对象：content.js 是经典脚本，取不到 ESM 导出的常量，
+// 而 POLL_MAX_MISSES 是浮层与下载器页**同一套语义**的一个阈值（P2-2 修订：
+// 原先两处各写一份 15）⇒ 让它跟函数一样只有一份来源。
+import * as constants from "./background/constants.js";
 
-globalThis.__m3u8Shared = { ...parse, ...cli, ...mediaUrl, ...htmlText };
+globalThis.__m3u8Shared = { ...parse, ...cli, ...mediaUrl, ...htmlText, ...constants };

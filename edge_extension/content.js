@@ -30,9 +30,15 @@
   const MAX_RETRIES = 3;
   // 轮询查询任务状态的失败上限：连续查不到任务（本地服务重启过、任务被清理）就
   // 落到失败态，而不是每 700ms 永久轮询 —— 否则面板会永停在「正在连接…」，
-  // 用户看不出已经失败。⚠ 与 downloader.js 的 POLL_MAX_MISSES 同值：两处是同
-  // 一套语义，改动必须一起改（tests/polllimit.test.js 钉着这条一致性）。
-  const POLL_MAX_MISSES = 15;
+  // 用户看不出已经失败。阈值取自共享模块（P2-2 修订：原先这里与 downloader.js
+  // 各写一份 15、靠跨文件对值防漂移，现在唯一来源是 src/background/constants.js）。
+  const POLL_MAX_MISSES = P.POLL_MAX_MISSES;
+  // 与上面 P 非空同一条理由：取不到就是**装配错误**（constants.js 没挂进
+  // content-shared 入口），而 undefined 会让 `misses > undefined` 恒假 ⇒
+  // 轮询永不放弃、面板永停「正在连接…」。装配错了就立刻死、死得可读。
+  if (!Number.isFinite(POLL_MAX_MISSES)) {
+    throw new Error("__m3u8Shared.POLL_MAX_MISSES 缺失：constants.js 未挂进 content-shared 入口");
+  }
   const DEBUG = false; // true 时在页面控制台输出悬停判定日志（排查按钮不出现用）
 
   function dbg(...args) {

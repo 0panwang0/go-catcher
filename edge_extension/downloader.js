@@ -20,11 +20,13 @@ import { fetchText, parseDuration, parseSegments, parseVariants, shortQuality, q
 import { sanitizeFileName, assembleGoCommand } from "./src/background/cli-args.js";
 import { isCandidateURL, isPlaylistURL } from "./src/background/media-url.js";
 import { escapeHtml } from "./src/background/html-escape.js";
+// 阈值与浮层侧（content.js）共用一份来源 —— 本页是 ESM，可以直接 import，
+// 不必经由 content-shared.js（那条路是给经典脚本 content.js 用的）。
+import { POLL_MAX_MISSES } from "./src/background/constants.js";
 
 const ANALYZE_LIMIT = 12; // 最多分析的嗅探条数
 const MAIN_VIDEO_MIN = 60; // 时长 >= 60s 判定为主视频
 const POLL_INTERVAL_MS = 700; // 轮询服务端任务状态的间隔
-const POLL_MAX_MISSES = 15; // 连续查不到任务多少次后放弃（≈10s，服务重启过）
 
 const $ = (sel) => document.querySelector(sel);
 

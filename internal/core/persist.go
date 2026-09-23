@@ -48,6 +48,27 @@ type persistedTask struct {
 	PartMode string `json:"partMode,omitempty"`
 }
 
+// persistedOmissions 列出 taskState 里**故意**不落盘的字段及理由。
+//
+// 它存在的意义是把隐式决定变成显式登记：taskState → persistedTask → taskStateDTO
+// 是三层手工同步的结构，加一个字段要在六处改（两个 struct、两个转换函数、以及
+// 前端契约），而 Go 对"具名字面量漏写字段"是静默的（补零值、编译期不报错）。
+// 于是"忘了持久化"与"想过、决定不持久化"在代码里长得一模一样 —— 前者会让
+// 该字段的重启后丢失且无任何症状（形态①：静默丢值）。
+//
+// 加字段时的规矩：要么在 collectPersisted / loadState 里接线（两侧都要），
+// 要么在这里写明为什么不留。TestTaskStatePersistenceIsExplicit 会拦下三处都漏的。
+//
+// 只读注册表，运行期不要改写。
+var persistedOmissions = map[string]string{
+	"queued":      "重启后排队位无意义：loadState 把没跑完的一律重建成可恢复态",
+	"running":     "同上：上次进程留下的 running 必然是脏值，载入时统一置 false",
+	"openPath":    "每次 snapshot 按磁盘实况现算（文件可能已被移走/删掉），落盘值必然陈旧",
+	"bytesDone":   "直链进度由 downloadDirect 从 .part 实际大小重新取（setBytes），落盘值只会在恢复瞬间显示错值",
+	"bytesTot":    "同上：总长下载时才探到，恢复时重新探，不依赖旧状态",
+	"restartNote": "恢复时的一次性提示，本次进程内有效（见 taskState.restartNote 的注释）",
+}
+
 type stateFile struct {
 	Version int             `json:"version"`
 	Tasks   []persistedTask `json:"tasks"`

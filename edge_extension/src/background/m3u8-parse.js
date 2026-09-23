@@ -127,10 +127,6 @@ export function shortQuality(variant) {
   return String(variant.label || "").split(" · ")[0] || "";
 }
 
-// qualityFromURL 从 URL 推断画质：优先路径里的分辨率字样（/1080p/v.m3u8、
-// xxx_720p.m3u8 都命中），其次 ?quality= 参数。
-// 与 buildOutputName / makeFilename 共用——文件名后缀必须由这一处决定，
-// 否则同一个视频从浮层下载与从扩展页下载会得到不同的文件名。
 // sanitizeQuality 画质 token 的白名单（P0-2）。
 //
 // 画质是**页面可控**的输入（`?quality=`），两条入口都必须走这里：
@@ -148,6 +144,10 @@ export function sanitizeQuality(v) {
   return /^[A-Za-z0-9._+\- ]{1,24}$/.test(s) ? s : "";
 }
 
+// qualityFromURL 从 URL 推断画质：优先路径里的分辨率字样（/1080p/v.m3u8、
+// xxx_720p.m3u8 都命中），其次 ?quality= 参数。
+// 与 buildOutputName / makeFilename 共用——文件名后缀必须由这一处决定，
+// 否则同一个视频从浮层下载与从扩展页下载会得到不同的文件名。
 export function qualityFromURL(u) {
   if (!u) return "";
   try {

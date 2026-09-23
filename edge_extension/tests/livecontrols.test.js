@@ -45,8 +45,14 @@ const document = {
 const mod = { exports: {} };
 
 // content.js 顶层要求共享对象已注入（缺失立即抛——评审自审 #11 的显式失败口径，
-// 不再降级成空对象）。本文件只测纯函数，给个最小桩让顶层通过即可。
-globalThis.__m3u8Shared = { sanitizeFileName: (s) => s, qualityFromURL: () => "" };
+// 不再降级成空对象）。本文件只测纯函数，给个最小桩让顶层通过即可：桩里每个
+// 顶层就校验的字段都得给上（POLL_MAX_MISSES 是 2026-09-23 新加的那一个），
+// 它们的取值准确性由各自的主题文件守（polllimit.test.js / contentparse.test.js）。
+globalThis.__m3u8Shared = {
+  sanitizeFileName: (s) => s,
+  qualityFromURL: () => "",
+  POLL_MAX_MISSES: 15,
+};
 
 new Function(
   "window",
