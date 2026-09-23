@@ -147,11 +147,12 @@ func (r *Runtime) concurrencyNow() int { return int(r.segConcurrency.Load()) }
 // maxRetriesNow 读取重试次数，并把下限夹取到 1。
 //
 // 为什么下限是 1 而不是 0：设置页把「分片失败重试」的合法区间写作 0–10
-// （settings.html），所以 0 是用户能选的值，语义是"不重试"。但所有重试循环
-// 都写成 `for attempt := 1; attempt <= n; attempt++`，n=0 时一次都不进 ——
-// httpGetWithRetry 于是走到函数末尾 `return nil, lastStatus, lastErr`，
-// 而 lastErr 从未被赋值 ⇒ 返回 (nil, 0, nil)：**nil error + nil body**。
+// （settings.html），所以 0 是用户能选的值，语义是"不重试"。但重试循环都写成
+// `for attempt := 1; attempt <= n; attempt++`，n=0 时一次都不进 ⇒ 函数直接走到
+// 末尾那句 `return …, lastErr`，而 lastErr 从未被赋值 ⇒ 返回 **nil error + 空产物**。
 // 调用方把它当成功，拿着空体往下走，产物坏了而日志全绿。
+// ⚠️ net.go 的两处已收进 retryGet，它对 <1 显式报错（见 retry_skeleton_test.go）；
+// download.go 的两处循环仍只靠这里的夹取兜着。
 //
 // 夹取放在读取入口而不是写入点：存储值保留用户的字面选择（0 就是 0，
 // 设置页回显一致），只在这里保证"至少尝试一次"这条不变量，四处调用点

@@ -3,7 +3,8 @@
 // 两条缺陷同一个成因的一半：**远端字节不可信，而"不可信"有两种表现** ——
 //   - 数量上不可信（P1-1）：响应体可以无限大，也可以在很小体积里藏一个解压炸弹；
 //   - 参数上不可信（P0-3）：用户能在设置页把重试次数设成 0，而 0 会让重试循环
-//     一次都不进，httpGetWithRetry 于是返回"成功 + 空内容"。
+//     一次都不进，函数于是返回"成功 + 空内容"（net.go 的两处现由 retryGet
+//     显式拒绝，见 retry_skeleton_test.go）。
 //
 // 两条都落在同一个判据上：**读进来的 / 没读到的，都不能被当成正常结果继续用。**
 // 所以超限一律显式报错，绝不做"截断了也算成功"或"没尝试也算成功"。
@@ -40,10 +41,12 @@ func TestRetryLimitZeroKeepsAtLeastOneAttempt(t *testing.T) {
 // TestRetryLimitZeroFailsInsteadOfReportingSuccess 服务端必失败时，重试次数 0
 // 也必须**返回错误**，而不是 (nil, 0, nil)。
 //
-// 这是那条缺陷的可观测后果：四条循环都写成 `attempt := 1; attempt <= n; attempt++`，
-// n=0 时一次都不执行，函数直接走到末尾 `return nil, lastStatus, lastErr` ——
-// 而 lastErr 从未被赋值，于是返回 nil error + nil body。调用方把空体当
-// 播放列表继续往下走，产物坏了而日志全绿。
+// 这是那条缺陷的可观测后果：重试循环都写成 `attempt := 1; attempt <= n; attempt++`，
+// n=0 时一次都不执行，函数直接走到末尾 `return …, lastErr` —— 而 lastErr 从未被
+// 赋值，于是返回 nil error + nil body。调用方把空体当播放列表继续往下走，
+// 产物坏了而日志全绿。
+// ⚠️ net.go 侧现在连这一层都不依赖了：retryGet 对 <1 直接报错（见 retry_skeleton_test.go）。
+// 本条仍要留着 —— 它守的是**读取入口**（download.go 的两处循环只靠这里）。
 func TestRetryLimitZeroFailsInsteadOfReportingSuccess(t *testing.T) {
 	var hits int
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
