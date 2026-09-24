@@ -15,15 +15,12 @@
 package app
 
 import (
-	"fmt"
 	"sync/atomic"
 	"unsafe"
 
 	"github.com/getlantern/systray"
 	"github.com/jchv/go-webview2"
 	"golang.org/x/sys/windows"
-
-	"github.com/0panwang0/go-catcher/internal/core"
 )
 
 // Win32 常量
@@ -189,16 +186,16 @@ func realQuit() {
 
 // initTray 在 webview 主窗创建之后、w.Run() 之前调用一次。
 // systray.Register 立即返回（不阻塞），托盘窗口的 wndproc 注册后由 w.Run 的消息循环分发。
-func initTray(w webview2.WebView, eng *core.Engine) {
+//
+// 菜单只有「显示主窗口」与「退出客户端」两项：服务随程序启动自动运行、退出自动停止，
+// 单独启停服务的入口（连同它需要的一整套状态提示与恢复路径）与"在浏览器打开监控"
+// （与主窗口功能重复）都已去掉。
+func initTray(w webview2.WebView) {
 	systray.Register(func() {
 		systray.SetIcon(iconPNG)
 		systray.SetTooltip("GoCatcher 下载客户端")
 
 		mShow := systray.AddMenuItem("📺 显示主窗口", "恢复 GoCatcher 主窗口")
-		systray.AddSeparator()
-		mToggle := systray.AddMenuItem("⏯ 启动 / 停止服务", "按当前状态切换下载服务")
-		systray.AddSeparator()
-		mBrowse := systray.AddMenuItem("↗ 在浏览器打开监控", "用默认浏览器打开本地监控页")
 		systray.AddSeparator()
 		mQuit := systray.AddMenuItem("❌ 退出客户端", "退出客户端并停止下载服务")
 
@@ -207,17 +204,6 @@ func initTray(w webview2.WebView, eng *core.Engine) {
 				select {
 				case <-mShow.ClickedCh:
 					w.Dispatch(func() { showMainWindow() })
-				case <-mToggle.ClickedCh:
-					if eng.Running() {
-						eng.Stop()
-						systray.SetTooltip("GoCatcher 下载客户端 · 服务已停止")
-					} else if err := eng.Start(); err != nil {
-						systray.SetTooltip(fmt.Sprintf("GoCatcher: 启动失败 %v", err))
-					} else {
-						systray.SetTooltip("GoCatcher 下载客户端 · 服务运行中")
-					}
-				case <-mBrowse.ClickedCh:
-					_ = openBrowser(monitorURL(eng) + "/")
 				case <-mQuit.ClickedCh:
 					w.Dispatch(func() { realQuit() })
 					return

@@ -475,8 +475,8 @@ func (e *Engine) handleOpenFolder(w http.ResponseWriter, r *http.Request) {
 
 // handleConfig GET 返回当前配置；POST 按补丁语义更新——只应用请求里出现的字段，缺省字段保持现值，
 // 这样 {uiView:"compact"} 之类的局部更新不会顺带把并发/重试清零。
-// 并发/重试即时生效；端口只写入配置，下次服务启动（托盘重启 / 重开程序）才生效——
-// 服务正跑着时改端口，响应带 restartRequired=true 提示前端弹"需重启服务"。
+// 并发/重试即时生效；端口只写入配置，下次服务启动（重开客户端）才生效——
+// 服务正跑着时改端口，响应带 restartRequired=true 提示前端弹"需重启客户端"。
 // configResp /config 的响应体。
 //   - systemProxy：当前检测到的 Windows 系统代理（设置页「跟随系统」模式回显）
 //   - clamped：请求里有值越界、已被夹取到合法区间（前端据此提示用户）
