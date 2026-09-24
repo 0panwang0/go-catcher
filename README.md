@@ -186,6 +186,9 @@ go-catcher.exe
 | 只支持 HLS(m3u8) 与直链 MP4 | 不支持 DASH(`.mpd`)、HLS over WebSocket |
 | 加密只支持 AES-128 | SAMPLE-AES 与商业 DRM 方案会明确报错（不支持的 METHOD / KEYFORMAT） |
 | 全程必须同一把密钥 | 播放列表中途换 key（key rotation）会明确报错而不是产出损坏文件 |
+| 不支持时间轴断点 | 播放列表含 `#EXT-X-DISCONTINUITY`（广告插入、编码切换、直播中编码器重启都会产生）会明确报错，而不是拼出时间轴错位的成品 |
+| 不支持独立音频轨道 | master 用 `#EXT-X-MEDIA:TYPE=AUDIO` 把音频拆成单独播放列表时会明确报错，而不是下出没有声音的成品 |
+| 只支持一跳 master | 子播放列表本身又是 master（多级嵌套）时会明确报错，而不是把下一级 m3u8 当地址下回来 |
 | 明文 `http://` 同样走代理 | 已修正：此前只有 https 走 CONNECT 隧道，明文请求会绕过代理直连 |
 | 代理只支持 `http://` | `socks5://` 系统代理会在启动横幅与 `/config` 的 `systemProxyWarning` 里提示"已按直连处理" |
 | 强制 HTTP/1.1 | 覆写 ALPN，牺牲部分吞吐换兼容性（应对仅支持 1.1 的 CDN） |

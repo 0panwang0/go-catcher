@@ -121,6 +121,13 @@ type playlistInfo struct {
 	// 只在 MAP 行同时给出 URI 时置位：没有 URI 就没有要取的 init 段，
 	// 不该因为一行畸形声明拒掉一个本来正常的流。
 	mapByteRange bool
+	// hasDiscontinuity 播放列表用了 #EXT-X-DISCONTINUITY（或声明断点总数的
+	// #EXT-X-DISCONTINUITY-SEQUENCE）：声明「接下来的分片与前面的不在同一条
+	// 时间轴上」。编码参数变化、广告插入、直播中编码器重启都会产生它。当前管线
+	// 把分片一律当一条连续时间轴顺序拼接，既不重置时间基准也不重编号 —— 断点
+	// 之后的分片落在错误的时间位置，产物"能播但时间轴错"，且不会有任何报错。
+	// 用这个标记让 validatePlaylist 显式失败，而不是静默拼出一条时间轴错位的文件。
+	hasDiscontinuity bool
 }
 
 // sameKey 判定两条 #EXT-X-KEY 是否等价（METHOD/URI/IV/KEYFORMAT 全同）。
@@ -146,6 +153,9 @@ func validatePlaylist(pl playlistInfo) error {
 		return err
 	}
 	if err := ensureNoByteRange(pl); err != nil {
+		return err
+	}
+	if err := ensureNoDiscontinuity(pl); err != nil {
 		return err
 	}
 	return ensureIdentityKeyFormat(pl)
@@ -205,6 +215,117 @@ func ensureNoByteRange(pl playlistInfo) error {
 	return nil
 }
 
+// ensureNoDiscontinuity 校验播放列表没有时间轴断点。
+//
+// #EXT-X-DISCONTINUITY 声明「接下来的分片与前面的不在同一条时间轴上」：编码
+// 参数切换、广告插入、直播中编码器重启都会产生它。当前管线把分片一律当一条
+// 连续时间轴顺序拼接，既不重置时间基准也不重编号 —— 断点之后的分片会落在
+// 错误的时间位置，产物"能播但时间轴错"，而且不会有任何报错。完整支持需要处理
+// 时间基准重置（并可能涉及编码参数切换后的重新封装），属于较大的改动；
+// 与 #EXT-X-BYTERANGE 同类，定版前先显式拒绝。
+func ensureNoDiscontinuity(pl playlistInfo) error {
+	if pl.hasDiscontinuity {
+		return fmt.Errorf("播放列表包含 #EXT-X-DISCONTINUITY（时间轴断点），当前版本不支持在断点处重置时间轴，无法保证产物的时间轴正确")
+	}
+	return nil
+}
+
+// ensureNotNestedMaster 校验取出的一跳子播放列表不是又一个 master。
+//
+// master 里 #EXT-X-STREAM-INF 之后的行是下一级播放列表的地址。当前实现只做
+// 一跳（master → 媒体播放列表）：第二跳拿到的东西只验了「首行是 #EXTM3U」，
+// 若它又是 master，就意味着里面那一串地址是**下一级播放列表**，而 parsePlaylist
+// 会跳过所有以 # 开头的行、把这些地址当成分片逐个下载 —— 拼出来的成品是若干份
+// m3u8 文本，日志却一切正常（本项目头号缺陷形态）。
+//
+// 归在「不支持特性显式拒绝」这一族，但没并进 validatePlaylist：master 的内容在
+// 取出子播放列表那一刻就被替换掉了，出了 fetchPlaylist 再没有地方能看到它。
+func ensureNotNestedMaster(subBody []byte, subURL string) error {
+	if hasPlaylistTag(subBody, "#EXT-X-STREAM-INF") {
+		return fmt.Errorf("master playlist 指向的子播放列表又是一个 master（多级嵌套），"+
+			"当前版本只支持一跳，无法正确下载该流: %s", sanitizeURLForError(subURL))
+	}
+	return nil
+}
+
+// ensureNoSeparateAudio 校验选中的变体没有把音频放在独立的 #EXT-X-MEDIA 轨道上。
+//
+// master 可以用 #EXT-X-MEDIA:TYPE=AUDIO 把音频单独切成一条播放列表，再让变体通过
+// AUDIO="<组名>" 引用它（demuxed 音频）。当前实现只下载单一播放列表、完全不认识
+// #EXT-X-MEDIA，于是下回来的成品**没有声音**，而日志一切正常 —— 与 validatePlaylist
+// 里那几条同源，只是这条的线索只在 master 里（同样出不了 fetchPlaylist）。
+func ensureNoSeparateAudio(content, variantLine string) error {
+	if masterHasSeparateAudioTrack(content, variantLine) {
+		return fmt.Errorf("master playlist 把音频放在独立的 #EXT-X-MEDIA 轨道上" +
+			"（选中的变体用 AUDIO 属性引用了带 URI 的音频组），当前版本只下载单一播放列表、" +
+			"无法把独立音轨合并进来，会产出没有声音的成品")
+	}
+	return nil
+}
+
+// masterHasSeparateAudioTrack 判断选中的变体是否真的依赖一条独立音频轨道。
+//
+// 判据刻意收窄，否则会误伤一大片本来正常的流：
+//   - 变体没写 AUDIO 属性 ⇒ 音频与视频在同一条播放列表里（muxed），正常，不拒；
+//   - #EXT-X-MEDIA 的 URI 缺省 ⇒ 规范规定这就是「音频与该组视频同容器」的写法
+//     （URI 是可选属性），正常，不拒；
+//   - TYPE=SUBTITLES / CLOSED-CAPTIONS ⇒ 只是字幕轨，缺了不影响正片可播，不拒。
+//
+// 三者叠加（被引用 + 是音频 + 带 URI）才说明「关键内容确实在别的播放列表里」。
+func masterHasSeparateAudioTrack(content, variantLine string) bool {
+	group := firstGroup(streamAudioRe, variantLine)
+	if group == "" {
+		return false
+	}
+	for _, line := range strings.Split(strings.TrimPrefix(content, "\ufeff"), "\n") {
+		line = strings.TrimSpace(line)
+		// 必须带冒号：#EXT-X-MEDIA-SEQUENCE 是另一个标签，前缀相同但语义无关。
+		if !strings.HasPrefix(line, "#EXT-X-MEDIA:") {
+			continue
+		}
+		if !strings.EqualFold(firstGroup(mediaTypeRe, line), "AUDIO") {
+			continue
+		}
+		if firstGroup(mediaGroupRe, line) != group {
+			continue
+		}
+		if firstGroup(mediaURIRe, line) != "" {
+			return true
+		}
+	}
+	return false
+}
+
+var (
+	// EXT-X-MEDIA 行的属性：TYPE / GROUP-ID / URI。
+	mediaTypeRe  = regexp.MustCompile(`(?i)\bTYPE\s*=\s*"?([^",]+)"?`)
+	mediaGroupRe = regexp.MustCompile(`(?i)\bGROUP-ID\s*=\s*"?([^",]+)"?`)
+	mediaURIRe   = regexp.MustCompile(`(?i)\bURI\s*=\s*"?([^",]+)"?`)
+	// EXT-X-STREAM-INF 行的 AUDIO 属性：引用音频组的组名。
+	streamAudioRe = regexp.MustCompile(`(?i)\bAUDIO\s*=\s*"?([^",]+)"?`)
+)
+
+// hasPlaylistTag 按行判断播放列表正文里是否出现某个标签（忽略行首尾空白与 BOM）。
+// 用整行前缀而不是 strings.Contains：标签名是别的词的前缀时（如 #EXT-X-MEDIA
+// 与 #EXT-X-MEDIA-SEQUENCE）才不会被误判。
+func hasPlaylistTag(body []byte, tag string) bool {
+	s := strings.TrimPrefix(string(body), "\ufeff")
+	for _, line := range strings.Split(s, "\n") {
+		if strings.HasPrefix(strings.TrimSpace(line), tag) {
+			return true
+		}
+	}
+	return false
+}
+
+// firstGroup 取正则第一个捕获组（无匹配返回空串）。
+func firstGroup(re *regexp.Regexp, s string) string {
+	if m := re.FindStringSubmatch(s); len(m) == 2 {
+		return m[1]
+	}
+	return ""
+}
+
 // KeyInfo 一条 #EXT-X-KEY 声明（URI 已按播放列表 base 解析为绝对地址）。
 type KeyInfo struct {
 	Method string // AES-128 / SAMPLE-AES …（大写）
@@ -255,6 +376,9 @@ func (j *dlJob) fetchPlaylist(ctx context.Context) (content, base string, isDire
 			return "", "", false, fmt.Errorf(
 				"子播放列表响应不是 m3u8 内容（可能是网页/解析页）: %s", sanitizeURLForError(subURL))
 		}
+		if err := ensureNotNestedMaster(subBody, subURL); err != nil {
+			return "", "", false, err
+		}
 		return string(subBody), subURL, false, nil
 	}
 	return content, base, false, nil
@@ -279,6 +403,10 @@ func parsePlaylist(m3u8Text, base string) playlistInfo {
 		switch {
 		case strings.HasPrefix(line, "#EXT-X-ENDLIST"):
 			pl.hasEndList = true
+		case strings.HasPrefix(line, "#EXT-X-DISCONTINUITY"):
+			// 两种标签都计入：#EXT-X-DISCONTINUITY（断点本身）与
+			// #EXT-X-DISCONTINUITY-SEQUENCE（断点序列号，出现即说明有断点）。
+			pl.hasDiscontinuity = true
 		case strings.HasPrefix(line, "#EXT-X-MEDIA-SEQUENCE:"):
 			if v, err := strconv.ParseUint(strings.TrimSpace(strings.TrimPrefix(line, "#EXT-X-MEDIA-SEQUENCE:")), 10, 64); err == nil {
 				pl.mediaSeq = v
@@ -492,6 +620,9 @@ func keyURIAttr(line string) string {
 func (j *dlJob) pickHighestBitrateM3U8(content string) (string, error) {
 	lines := strings.Split(content, "\n")
 	var bestURL string
+	// bestLine 记住选中变体的 #EXT-X-STREAM-INF 行：它的属性（如 AUDIO）决定
+	// 这条流的关键内容是否被拆到了别的播放列表里。
+	var bestLine string
 	var bestBw int64 = -1
 	base := urlBase(j.m3u8URL)
 	for i := 0; i < len(lines); i++ {
@@ -504,6 +635,7 @@ func (j *dlJob) pickHighestBitrateM3U8(content string) (string, error) {
 					if bw > bestBw {
 						bestBw = bw
 						bestURL = resolveURL(base, next)
+						bestLine = line
 					}
 				}
 			}
@@ -511,6 +643,9 @@ func (j *dlJob) pickHighestBitrateM3U8(content string) (string, error) {
 	}
 	if bestURL == "" {
 		return "", fmt.Errorf("master playlist 中未找到子 m3u8")
+	}
+	if err := ensureNoSeparateAudio(content, bestLine); err != nil {
+		return "", err
 	}
 	return bestURL, nil
 }
