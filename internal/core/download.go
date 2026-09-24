@@ -1411,6 +1411,24 @@ const (
 	liveEndInferred                    // 连续 liveMaxEmptyPolls 次无新分片：推断结束
 )
 
+// note 返回这条结束方式的用户可见说明。
+//
+// 文案归枚举自己所有（而不是由收尾调用方拼字符串）：结束方式的**判据强度不同，
+// 说法就必须不同**，两句话摆在一起才能被逐字对比。原先这段 switch 写在
+// runDiskPipeline 的收尾段里，于是"结束方式 → 文案"的映射与它的枚举定义隔了
+// 一个文件 —— 加一种结束方式时得靠记忆去找改哪儿。
+//
+// userStop / none 返回空串：那两条不是"录完了"，说明该由中断路径给（见 finalizeCause）。
+func (k liveEndKind) note() string {
+	switch k {
+	case liveEndEndList:
+		return "播放列表已结束" // 源站白纸黑字声明结束 —— 确证
+	case liveEndInferred:
+		return "播放列表停止更新 · 末尾可能不全" // 只是"列表不再增长" —— 推断
+	}
+	return ""
+}
+
 func (j *dlJob) liveDownload(ctx context.Context, outPath string, from int) (int, liveEndKind, error) {
 	next := from
 	empty := 0
