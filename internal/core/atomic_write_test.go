@@ -3,6 +3,7 @@ package core
 import (
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -260,5 +261,74 @@ func TestNoStrayChunkMetaRemoval(t *testing.T) {
 	}
 	if scanned == 0 {
 		t.Fatal("一个文件都没扫到：glob 或过滤条件写错了，这条守卫等于没跑")
+	}
+}
+
+// TestPartRemovalAlwaysDropsBitmap 删 `.part` 的地方必须同时删位图。
+//
+// 为什么单列一条（P0-5）：上面那条守卫的判据是「行内含 `.meta` 字样」，而
+// handlers.go 的失败转取消分支写的是 `os.Remove(part)` —— **它看不见**。于是留下
+// 「.part 没了、位图还在」的组合：用户重新下载同一个视频时会认领同一个文件名
+// （uniquePath 只看 .part 在不在），新建的 0 字节 .part 配上残留位图，被标记
+// 「已完成」的片就永远不下载 ⇒ 成品带洞却报成功（downloadDirect 返回 nil）。
+//
+// 判据取「删的是 .part ⇒ 8 行内必须出现 removeChunkMeta」，而不是「两边数量相等」：
+// 数量相等只能说明总数对不上，定位不到是哪一处。
+//
+// 边界（这条守卫抓不到的）：
+//   - moveFile 跨卷回退里的 os.Remove(src)：那时位图早已删掉（分片模式成功收尾）
+//     或本来就没有（单连接模式），故未纳入判据；
+//   - 「删了 .part、位图隔了 8 行以上才删」的写法 —— 窗口是有意留的余量。
+func TestPartRemovalAlwaysDropsBitmap(t *testing.T) {
+	files, err := filepath.Glob("*.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 只认「删 .part 路径」的行：变量名走本仓库既有命名（part / partPath / outPath），
+	// 或行内直接拼了 ".part" 字面量。
+	partRemoval := regexp.MustCompile(`os\.Remove\((part|partPath|outPath)\b|os\.Remove\([^)]*\.part`)
+	const window = 8
+	scanned, hits := 0, 0
+	for _, f := range files {
+		if strings.HasSuffix(f, "_test.go") {
+			continue
+		}
+		raw, err := os.ReadFile(f)
+		if err != nil {
+			t.Fatal(err)
+		}
+		scanned++
+		lines := strings.Split(string(raw), "\n")
+		for i, line := range lines {
+			if !partRemoval.MatchString(line) {
+				continue
+			}
+			if strings.Contains(line, "chunkMetaPath") || strings.Contains(line, "chunkMetaTmpPath") {
+				continue // 这两行就是位图本体的删除
+			}
+			hits++
+			end := i + window
+			if end > len(lines) {
+				end = len(lines)
+			}
+			paired := false
+			for _, l := range lines[i:end] {
+				if strings.Contains(l, "removeChunkMeta(") {
+					paired = true
+					break
+				}
+			}
+			if !paired {
+				t.Errorf("%s:%d 删了 .part 却没删位图（%d 行内不见 removeChunkMeta）："+
+					"残留位图会让「重新下载同一个视频」悄悄跳片、成品带洞却报成功: %s",
+					f, i+1, window, strings.TrimSpace(line))
+			}
+		}
+	}
+	if scanned == 0 {
+		t.Fatal("一个文件都没扫到：glob 或过滤条件写错了，这条守卫等于没跑")
+	}
+	if hits < 5 {
+		t.Fatalf("只匹配到 %d 处删 .part —— 判据或命名约定已经漂移，守卫正在静默失效", hits)
 	}
 }

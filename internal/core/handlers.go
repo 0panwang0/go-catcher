@@ -185,12 +185,20 @@ func (e *Engine) handleResume(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, actionResp{OK: true, ID: id, Resumed: true})
 		return
 	}
-	if te.st.running && !te.st.paused {
+	// 忙碌判据必须含 queued（P2-13）：「已受理但还在等并发槽」的任务
+	// running=false、queued=true（pipeline.go 进 limiter.acquire 之前就是这么写的），
+	// 只判 running 会给它发通行证 ⇒ 连发两次 /resume 起两条 pipeline，各自持有并发
+	// 槽、各自 te.job = job（后者覆盖前者）、两个 streamWriter 以 O_APPEND 写同一个
+	// .part ⇒ 分片交错；te.cancel 也被覆盖，此后 /pause 只能取消其中一条。
+	// 槽满时（默认 MaxConcurrent=3）这个窗口可以长达整个排队时长，不是微秒级竞态。
+	// 同函数的直播分支判的是 `running || queued`，这里与它对齐。
+	if (te.st.running || te.st.queued) && !te.st.paused {
 		te.mu.Unlock()
 		writeJSON(w, http.StatusOK, actionResp{OK: true, ID: id, Running: true})
 		return
 	}
-	// 清掉旧意图，重新起一个 goroutine（会重新拿并发槽并接着断点下）
+	// 清掉旧意图并置忙 —— 与上面的判据同在 te.mu 临界区内，所以「检查」与「置忙」
+	// 是一个原子步骤：并发的第二次 /resume 一定看得到 queued=true 并从上面返回。
 	te.intent = intentNone
 	te.st.paused = false
 	te.st.done = false
@@ -200,7 +208,6 @@ func (e *Engine) handleResume(w http.ResponseWriter, r *http.Request) {
 	te.st.queued = true
 	te.mu.Unlock()
 
-	// 清掉旧意图，重新起一个 goroutine（会重新拿并发槽并接着断点下）。
 	// 与新建任务同一入口，也必须走 runGuarded：续传会重新跑一遍 init 段处理。
 	go runGuarded(te, func() { runDiskPipeline(te) })
 	writeJSON(w, http.StatusOK, actionResp{OK: true, ID: id, Resumed: true})
@@ -236,6 +243,12 @@ func (e *Engine) handleCancel(w http.ResponseWriter, r *http.Request) {
 		te.mu.Unlock()
 		if part != "" {
 			_ = os.Remove(part)
+			// 位图必须与 .part 一起删（P0-5）：留下一个"说第 0..K 片已完成"的位图，
+			// 而 .part 已经没了 —— 用户重新下载同一个视频时会认领同一个文件名，
+			// 新建的 0 字节 .part 配上这个残留位图，被标记完成的片**永远不会下载**，
+			// 成品中间是空洞、函数却返回成功。下面「已运行时取消」那个分支一直是
+			// 配对写的，这一支漏了（同一函数两分支一对一错）。
+			_ = removeChunkMeta(part)
 			fmt.Printf("[disk] 失败任务转取消，删除 .part: %s\n", part)
 			e.rt.markDirty()
 		}

@@ -175,7 +175,11 @@ func reclaimPath(saveDir, newName, oldFinalPath string) (string, error) {
 		return np, nil
 	}
 	if fi, serr := os.Stat(oldFinalPath + ".part"); serr == nil && fi.Size() == 0 {
+		// 只删**0 字节**占位，所以顺带清掉它的位图是安全的；反过来留着位图不安全：
+		// 0 字节 .part 配一个"说某些片已完成"的位图，正是 P0-5 那个静默留洞的形态
+		// （见 handlers.go 失败转取消分支）。位图删除一律走 removeChunkMeta。
 		_ = os.Remove(oldFinalPath + ".part")
+		_ = removeChunkMeta(oldFinalPath + ".part")
 	}
 	return np, nil
 }

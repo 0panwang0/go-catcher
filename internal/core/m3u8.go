@@ -349,7 +349,19 @@ func parseEXTINFDuration(line string) float64 {
 // #EXT-X-KEY 行属性的正则（模块级编译，parseKeyLine 每行解析复用；
 // 属性名按大小写不敏感匹配，容忍非规范播放列表）。
 var (
-	keyMethodRe = regexp.MustCompile(`(?i)METHOD=([A-Za-z0-9-]+)`)
+	// keyMethodRe METHOD 属性值。规范要求裸枚举值，但非规范播放列表会写成
+	// METHOD="AES-128"（带引号）或 METHOD = AES-128（等号两侧有空白）。
+	//
+	// 旧实现只认裸值，且**把"正则匹配不上"直接当成"没有 METHOD 属性"** ⇒ 带引号
+	// 的 METHOD 会让整条加密声明蒸发：key=nil、keyMalformed 不置位、validatePlaylist
+	// 放行 ⇒ 密文被当明文拼进成品、日志全绿（P1-7）。宽容度现与 keyURIRe /
+	// keyFormatRe / mapURIRe 对齐 —— 那三个一直容忍带引号与裸值两种写法。
+	keyMethodRe = regexp.MustCompile(`(?i)METHOD\s*=\s*"?([A-Za-z0-9-]+)"?`)
+	// keyMethodAttrRe 宽松探测「这一行到底有没有声明 METHOD 属性」：只看属性名，
+	// 不看值。**畸形判据必须建立在比解析器更宽的判据上** —— 拿同一个窄正则既当
+	// 解析器又当判据，等于让"解析失败"与"根本没有这个属性"永远不可区分，而这两者
+	// 的处置完全相反（前者必须显式失败，后者才是明文）。见 parseKeyLine。
+	keyMethodAttrRe = regexp.MustCompile(`(?i)[:,\s]METHOD\s*=`)
 	// keyURIRe URI 属性：规范要求 quoted-string，但非规范播放列表会写成裸值
 	// （URI=k.ts,IV=…），两种都认——与下面 keyFormatRe 的宽容度对齐。旧实现只认
 	// 带引号形态，裸值时 URI 取不到、整条声明被当成明文流（见 ensureKeyDeclared）。
@@ -425,10 +437,19 @@ func isByteRangeToken(seg string) bool {
 //   - (nil, false)：行里没有 METHOD 属性（不是有效 KEY 声明），或 METHOD=NONE
 //     （显式明文）——两者都该按明文处理；
 //   - (key, false)：解析成功；
-//   - (nil, true)：声明了加密 METHOD，但 URI 缺失/为空 —— 畸形，必须显式失败。
+//   - (nil, true)：声明了加密但读不懂 —— METHOD 值缺失/为空、或 URI 缺失/为空。
+//
+// ⚠️ 第三态的判据取 **keyMethodAttrRe（宽）** 而不是 keyMethodRe（窄）：只要行里
+// 出现了 METHOD 属性名，而我们没能解析出一个可用的方法值，就必须报畸形。
+// 反过来用窄正则当判据时，"METHOD 的写法没被认出来"会退化成第一态（明文），
+// 与它本该走的第三态（显式失败）正好相反 —— 这个漏洞 2026-09-24 用探针复现过
+// （METHOD="AES-128" 与 METHOD = AES-128 两种写法 ⇒ key=nil + 校验放行）。
 func parseKeyLine(line, base string) (*KeyInfo, bool) {
 	m := keyMethodRe.FindStringSubmatch(line)
 	if len(m) != 2 {
+		if keyMethodAttrRe.MatchString(line) {
+			return nil, true
+		}
 		return nil, false
 	}
 	method := strings.ToUpper(m[1])

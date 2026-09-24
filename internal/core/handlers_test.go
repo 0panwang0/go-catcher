@@ -6,6 +6,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -148,5 +149,106 @@ func TestHandleCancelDoneTask(t *testing.T) {
 	}
 	if _, err := os.Stat(final); err != nil {
 		t.Fatalf("成品文件被误删: %v", err)
+	}
+}
+
+// TestHandleCancelFailedTaskDropsBitmap 失败任务转「取消」必须连位图一起删。
+//
+// 回归（P0-5）：这一支原先只 os.Remove(part)，位图留下 ⇒ 用户重新下载同一个视频
+// 时会认领同一个文件名（uniquePath 只看 .part 在不在），新建的 0 字节 .part 配上
+// 这个残留位图，被标记「已完成」的片就永远不会下载 ⇒ 成品中间是空洞、
+// downloadDirect 却返回 nil、界面显示「已保存」。同一个函数里「任务还在跑时取消」
+// 那一支一直是配对写的（见 TestHandleCancelPausedTask 里删掉的那对），只有这一支漏了。
+//
+// 判据必须钉住**位图也没了**：只钉 .part 消失对这条缺陷完全无感（原来的代码就
+// 通过了任何"只查 .part"的断言）。顺带钉 .meta.tmp —— 这正是"必须走
+// removeChunkMeta 而不是裸删"的理由。
+func TestHandleCancelFailedTaskDropsBitmap(t *testing.T) {
+	saveRestoreState(t)
+	dir := t.TempDir()
+	final := filepath.Join(dir, "bad.ts")
+	part, meta := writePart(t, final)
+	tmp := meta + ".tmp"
+	if err := os.WriteFile(tmp, []byte("x"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	te := &taskEntry{rt: testStd, st: taskState{
+		id: "tf", done: true, stage: "失败", errorMsg: "HTTP 500",
+		filename: "bad.ts", saveDir: dir, finalPath: final,
+	}}
+	testStd.tasks[te.st.id] = te
+
+	callCancel(t, "tf")
+
+	if _, err := os.Stat(part); !os.IsNotExist(err) {
+		t.Fatal("取消后 .part 应删除")
+	}
+	if _, err := os.Stat(meta); !os.IsNotExist(err) {
+		t.Fatal("取消后 .part.meta 必须一并删除：残留位图会让「重新下载同一个视频」悄悄跳片、成品带洞却报成功")
+	}
+	if _, err := os.Stat(tmp); !os.IsNotExist(err) {
+		t.Fatal("取消后 .part.meta.tmp 也要清（这就是位图删除必须走 removeChunkMeta 的原因）")
+	}
+	te.mu.Lock()
+	st := te.st
+	te.mu.Unlock()
+	if !st.canceled || st.errorMsg != "" {
+		t.Fatalf("失败任务未转取消: %+v", st)
+	}
+}
+
+// TestResumeTreatsQueuedAsBusy 已受理但还在排队（running=false / queued=true）的
+// 任务必须被 /resume 当成「忙」。
+//
+// 回归（P2-13）：守卫原先只判 running，而 pipeline 在等并发槽期间写的正是
+// running=false / queued=true（pipeline.go 进 limiter.acquire 之前）⇒ 连发两次
+// /resume 会各起一条 pipeline：两条各自 te.job = job（后者覆盖前者）、两个
+// streamWriter 以 O_APPEND 写同一个 .part ⇒ 分片交错；te.cancel 也被覆盖，此后
+// /pause 只能取消其中一条。槽满时（默认 MaxConcurrent=3）这个窗口长达整个排队时长，
+// 不是微秒级竞态。同函数的直播分支判的是 running||queued —— 这条用例把点播分支
+// 也钉到同一口径。
+func TestResumeTreatsQueuedAsBusy(t *testing.T) {
+	saveRestoreState(t)
+	cases := []struct {
+		name    string
+		running bool
+		queued  bool
+	}{
+		{"正在跑", true, false},
+		{"已受理待排队", false, true},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			id := "tb-" + c.name
+			te := &taskEntry{rt: testStd, st: taskState{
+				id: id, stage: "排队中", errorMsg: "留着别动",
+				filename: "v.ts", saveDir: t.TempDir(),
+				running: c.running, queued: c.queued,
+			}}
+			testStd.tasks[id] = te
+			t.Cleanup(func() { delete(testStd.tasks, id) })
+
+			w := httptest.NewRecorder()
+			testEngine().handleResume(w, httptest.NewRequest("GET", "/resume?id="+id, nil))
+			if w.Code != 200 {
+				t.Fatalf("HTTP %d: %s", w.Code, w.Body.String())
+			}
+			if !strings.Contains(w.Body.String(), `"running":true`) {
+				t.Fatalf("忙任务应回 running:true，实际 %s", w.Body.String())
+			}
+			te.mu.Lock()
+			st := te.st
+			te.mu.Unlock()
+			if st.stage != "排队中" || st.errorMsg != "留着别动" {
+				t.Fatalf("忙任务被重新受理了（会起第二条 pipeline）: %+v", st)
+			}
+			// 忙任务的状态必须一点没动：done/canceled 不能被重置、queued 不能被清掉
+			// （queued 一旦被清，下一次 /resume 就又放行了）。
+			if st.queued != c.queued || st.done || st.canceled {
+				t.Fatalf("忙任务的状态被改动了: queued=%v(want %v) done=%v canceled=%v",
+					st.queued, c.queued, st.done, st.canceled)
+			}
+		})
 	}
 }

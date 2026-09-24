@@ -480,9 +480,22 @@ func (sw *streamWriter) Close() error {
 // 否则片数恒等于并发数、中断时位图上一个 true 都来不及有（详见该常量说明）。
 func (j *dlJob) downloadDirect(ctx context.Context, outPath string) error {
 	// 模式 1：分片续传（位图恢复）
+	//
+	// 位图必须与 .part 的实际长度相容才敢采信（P0-5）。位图是**独立文件**，它的
+	// 生命周期与 .part 并不绑定：任何"只删了 .part、位图留下"的路径（失败任务转
+	// 取消、外部手工删除、别的版本写的残留……）都会留下一个**内部自洽却描述不到
+	// 实处**的位图。此时照旧走模式 1，被它标记为"已完成"的片就永远不会下载 ——
+	// 成品中间是空洞，而函数返回 nil、界面显示「已保存」（本项目头号缺陷形态）。
+	//
+	// 不相容时**必须把它删掉**再往下走，不能只是"这次不采信"：下次下载时 .part
+	// 已被别的模式写长，长度检查反而会通过，残留位图就"复活"了。
 	if m, ok := loadChunkMeta(outPath); ok {
-		j.setPartMode(partModeChunked)
-		return j.downloadChunked(ctx, outPath, m)
+		if !chunkMetaMatchesPart(outPath, m) {
+			removeChunkMeta(outPath)
+		} else {
+			j.setPartMode(partModeChunked)
+			return j.downloadChunked(ctx, outPath, m)
+		}
 	}
 
 	// 模式 2：全新下载且服务器支持 Range → 分片下载（小文件不值得分片）
@@ -574,7 +587,11 @@ func (j *dlJob) downloadDirect(ctx context.Context, outPath string) error {
 		case http.StatusRequestedRangeNotSatisfiable:
 			resp.Body.Close()
 			if offset > 0 && attempt == 0 {
+				// 416 = 服务器说这个区间不成立（内容已变 / 文件被换）。
+				// 连位图一起丢：既然内容已变，位图记的"哪些片已完成"全部作废，
+				// 留着它下次会被当成有效账本（P0-5）。与上面 MarkStale 同一处理。
 				os.Remove(outPath)
+				removeChunkMeta(outPath)
 				offset = 0
 				continue
 			}
@@ -659,6 +676,39 @@ func loadChunkMeta(partPath string) (*chunkMeta, bool) {
 		return nil, false
 	}
 	return &m, true
+}
+
+// chunkMetaMatchesPart 判定位图与 .part 的**实际长度**是否相容（P0-5）。
+//
+// loadChunkMeta 只校验位图**自洽**（片数与 Total/Size 对得上），它看不见 .part ——
+// 而"位图说第 i 片已完成"在盘上是一个可观测事实：downloadRange 用 WriteAt 把
+// [i*Size, min((i+1)*Size, Total)) 写进文件，所以文件长度至少要到那个区间的末尾。
+//
+// 取**最高的那片已完成**算下界就够了：文件长度是单调的，最高的那片满足，
+// 比它低的必然也满足。
+//
+// 不相容的唯一现实成因是"位图是上一次尝试的残留、.part 已经换成了新的"——
+// 此时采信位图会让被标记完成的片永不下载 ⇒ 成品带洞却报成功。所以要 fail-safe：
+// 一律判不可用、清空重下（与 alignPartToLedger「账本不可用即清空」同一条原则，
+// 绝不按大小猜）。
+//
+// 一片都没标完成时返回 true：位图不提供任何"跳过"指令，与没有位图等价。
+func chunkMetaMatchesPart(partPath string, m *chunkMeta) bool {
+	size := partFileOffset(partPath)
+	if size <= 0 {
+		return false // 空 .part 与"某片已完成"直接矛盾
+	}
+	for i := len(m.Done) - 1; i >= 0; i-- {
+		if !m.Done[i] {
+			continue
+		}
+		need := int64(i+1) * m.Size
+		if need > m.Total {
+			need = m.Total
+		}
+		return size >= need
+	}
+	return true
 }
 
 // saveChunkMeta 把位图原子写盘（P1-2）：临时文件 + Sync + rename，见 writeFileAtomic。
