@@ -245,8 +245,14 @@ type trafInfo struct {
 	sampleCount int    // 本 traf 样本总数（跨多个 trun 累计）
 	dataStart   int    // 本轨首个样本的绝对文件偏移
 	dataOffOff  int    // trun 内 data_offset 字段在 moof 内的偏移（-1 = 无该字段）
-	sizes       []uint32
-	sizeOffs    []int // trun 内逐样本 size 字段在 moof 内的偏移（空 = trun 无逐样本 size）
+	// baseIsMoof 记录本轨 data_offset 的**基准语义**（B-1）：
+	//   true  ⇒ 相对 moof 起点（default-base-is-moof 或第一轨）；
+	//   false ⇒ 相对上一轨数据末尾。
+	// buildMoof 只许平移前者：后者的基准（上一轨数据末尾）在输出里会跟着前面轨的
+	// 长度一起移动，相对值本来就该保持不变 —— 再平移一次就是平移了两遍。
+	baseIsMoof bool
+	sizes      []uint32
+	sizeOffs   []int // trun 内逐样本 size 字段在 moof 内的偏移（空 = trun 无逐样本 size）
 }
 
 // readU32 读取 b[off:off+4] 的 big-endian uint32；字段必须完整落在 end 之前，
@@ -427,11 +433,24 @@ func parseTraf(moof []byte, pos, size int, moofAbs int, prevDataEnd int, firstTr
 				return nil, fmt.Errorf("traf 样本数不合理: trun 声明 %d（上限 %d）", ncRaw, maxTrafSamples)
 			}
 			ti.sampleCount += nc
+			// 上限按**整个 traf**卡，不是单个 trun（B-3）：下面的 sizes/sizeOffs 是
+			// 跨 trun append 的，只卡单 trun 时，"许多个各声明 100 万样本的 trun"
+			// 仍能把两个 slice 一起撑到内存耗尽。真流一个 traf 的样本数在千级。
+			if ti.sampleCount > maxTrafSamples {
+				return nil, fmt.Errorf("traf 样本数不合理: 跨 trun 累计 %d（上限 %d）", ti.sampleCount, maxTrafSamples)
+			}
 			r := payload + 8
 			if flags&0x1 != 0 {
 				v, ok := readU32(moof, r, boxEnd)
 				if !ok {
 					return nil, trafFieldErr(typ, sz)
+				}
+				// data_offset 只认第一个 trun（B-2）：同 traf 多个 trun 各自带
+				// data_offset 时，后一个会覆盖前一个，dataStart 于是指向**最后一个**
+				// trun 的起点而不是本轨数据起点 —— 样本定位错、产物错位，日志全绿。
+				// 这种形态当前版本不支持，显式拒绝该分片（宁缺勿假），不猜。
+				if hasDataOff {
+					return nil, fmt.Errorf("traf 内多个 trun 各自声明 data_offset，当前版本不支持（无法确定样本数据起点）")
 				}
 				dataOff = int32(v)
 				ti.dataOffOff = r
@@ -509,10 +528,12 @@ func parseTraf(moof []byte, pos, size int, moofAbs int, prevDataEnd int, firstTr
 		ti.durSet = true
 	}
 
-	// base：default-base-is-moof 或第一轨 → moof 起点；否则上一轨数据末尾
+	// base：default-base-is-moof 或第一轨 → moof 起点；否则上一轨数据末尾。
+	// 这个"二选一"必须记进 trafInfo（B-1）：buildMoof 平移 data_offset 只对前者成立。
 	base := prevDataEnd
 	if defaultBaseIsMoof || firstTraf {
 		base = moofAbs
+		ti.baseIsMoof = true
 	}
 	ti.dataStart = base
 	if hasDataOff {
@@ -548,14 +569,18 @@ type pendingMoof struct {
 }
 
 // buildMoof 重建 moof：克隆原字节（tfdt 已归一化），若提供 newSizes 则重写
-// 对应轨的 trun 样本大小，并把其后各轨的 data_offset 同步平移
-// （default-base-is-moof 下 data_offset 相对 moof 起点，前面样本变大必须跟着加）。
+// 对应轨的 trun 样本大小，并把其后各轨里**以 moof 起点为基准**的 data_offset
+// 同步平移（前面样本变大 ⇒ 数据后移 ⇒ 相对 moof 的偏移必须跟着加）。
+// ⚠️ 基准不是 moof 的轨**不能**平移（B-1）：判据见 trafInfo.baseIsMoof。
 func buildMoof(p *pendingMoof, newSizes map[int][]uint32) []byte {
 	out := make([]byte, len(p.orig))
 	copy(out, p.orig)
 	growth := 0 // 前面已转换轨道的大小增量（原始 → 新）
 	for idx, ti := range p.infos {
-		if growth != 0 && ti.dataOffOff >= 0 {
+		// ⚠️ 只平移 **base 为 moof 起点**的轨（B-1）。base 是"上一轨数据末尾"时，
+		// 那个末尾在输出里同样会跟着 growth 一起往后挪，而 data_offset 是相对它
+		// 的**相对值** —— 本来就该保持不变。不看语义一律平移，就会平移两遍。
+		if growth != 0 && ti.dataOffOff >= 0 && ti.baseIsMoof {
 			cur := int32(binary.BigEndian.Uint32(out[ti.dataOffOff:]))
 			binary.BigEndian.PutUint32(out[ti.dataOffOff:], uint32(cur+int32(growth)))
 		}

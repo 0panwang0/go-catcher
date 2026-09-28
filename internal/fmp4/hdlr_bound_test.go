@@ -9,8 +9,9 @@
 // 恰好是 'vide'/'soun' 就会覆盖 stsd 的正确结论 —— 产物"能播但轨道标记错"，
 // 日志全绿。这正是本项目头号缺陷形态。
 //
-// 同文件另四个盒遍历（stsdMediaType / mvhdTimescale / …）都按各自的 box 末端判断，
-// 这条用例把 hdlr 也钉进同一判据。
+// 同文件另几个盒遍历也只认**自己声明的**末端（stsdMediaType / hdlrMediaType 在内部判，
+// mvhd / tkhd / mdhd 由调用方传 `...[payload : pos+sz]` 限定 —— 后三处是 2026-09-28 的
+// B-4 补齐的，见 initseg_field_bound_test.go），这条用例把 hdlr 也钉进同一判据。
 package fmp4
 
 import (
