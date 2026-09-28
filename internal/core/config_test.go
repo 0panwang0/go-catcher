@@ -168,6 +168,74 @@ func TestResizableSemPreCanceled(t *testing.T) {
 	}
 }
 
+// TestResizableSemBroadcastHoldsLock（新-2 结构守卫）。
+//
+// 缺陷形态：取消分支在**不持 l.mu** 的情况下 Broadcast。合法（sync.Cond 允许），
+// 但不安全 —— 检查 `ctx.Err()` 与 `cond.Wait()` 不在同一临界区，取消恰好落在两者
+// 之间时，广播发生在 `notifyListAdd` 之前、无人可唤醒，随后 Wait 永久睡下去：
+// 任务卡在「排队中」，而 /resume 又因为它还占着队位不放行。
+//
+// 行为用例（上面的 Cancel / 下面的压力版）都只能**概率性**撞到这个窗口 —— 它只有
+// 几十纳秒宽。所以这条结构守卫才是主判据：它确定性地钉住"取消方持同一把锁广播"。
+func TestResizableSemBroadcastHoldsLock(t *testing.T) {
+	body := strings.Join(sourceFuncBody(t, "config.go",
+		"func (l *resizableSem) acquire(ctx context.Context) bool"), "\n")
+
+	i := strings.Index(body, "ctx.Done()")
+	if i < 0 {
+		t.Fatal("找不到 ctx.Done() 分支 —— 切分失效，本断言会恒真")
+	}
+	branch := body[i:]
+
+	iLock := strings.Index(branch, "l.mu.Lock()")
+	iBc := strings.Index(branch, "l.cond.Broadcast()")
+	if iLock < 0 || iBc < 0 {
+		t.Fatal("取消分支里看不到 l.mu.Lock() / l.cond.Broadcast() —— 切分失效")
+	}
+	if iLock > iBc {
+		t.Error("Broadcast 出现在 l.mu.Lock() 之前 —— 等于没持锁，会丢失唤醒")
+	}
+	// 防退化：Broadcast 之后必须 Unlock（否则是"锁住不还"）
+	if !strings.Contains(branch[iBc:], "l.mu.Unlock()") {
+		t.Error("取消分支广播后没有 l.mu.Unlock() —— 会把锁一直握在手里，等待者全醒不来")
+	}
+}
+
+// TestResizableSemNoLostWakeup（新-2 行为，压力版）。
+//
+// 与 TestResizableSemCancel 的区别：**取消前不 sleep**，让"取消"与"主协程进 Wait"
+// 的先后随机化，多轮重复以争取撞进那个窄窗口。修前它**可能**挂死，修后必须恒不挂。
+// 这里断言的是"任何一轮都不许卡住"—— 挂死是最坏的用户可见后果（任务永远停在排队中）。
+func TestResizableSemNoLostWakeup(t *testing.T) {
+	const rounds = 3000
+	var doneRounds int
+	deadline := time.Now().Add(6 * time.Second)
+	for i := 0; i < rounds && time.Now().Before(deadline); i++ {
+		l := newResizableSem(1)
+		if !l.acquire(context.Background()) {
+			t.Fatal("首槽失败")
+		}
+		ctx, cancel := context.WithCancel(context.Background())
+		got := make(chan bool, 1)
+		go func() { got <- l.acquire(ctx) }()
+		cancel()
+		select {
+		case v := <-got:
+			if v {
+				t.Fatalf("第 %d 轮：取消后仍拿到槽位", i)
+			}
+		case <-time.After(500 * time.Millisecond):
+			t.Fatalf("第 %d 轮：取消后 500ms 未返回 —— 丢失唤醒（检查与 Wait 分离）", i)
+		}
+		l.release()
+		doneRounds++
+	}
+	if doneRounds < 50 {
+		t.Fatalf("只跑了 %d 轮（下限 50）—— 压力不足等于没测", doneRounds)
+	}
+	t.Logf("压力轮次: %d", doneRounds)
+}
+
 // TestClamp 边界与越界标记。
 func TestClamp(t *testing.T) {
 	cases := []struct {
@@ -269,6 +337,47 @@ func TestLoadConfigFallsBack(t *testing.T) {
 	testStd.loadConfig()
 	if testStd.cfg.Proxy != "system" || testStd.getProxyAddr() != "system" {
 		t.Fatalf("system 应保持跟随系统: testStd.cfg=%q 运行时=%q", testStd.cfg.Proxy, testStd.getProxyAddr())
+	}
+}
+
+// TestLoadConfigMissingIntFieldsFallBackToDefault（A-7）：
+// 整型键**缺失**要回退默认，而不是被夹到下限。
+//
+// 缺陷形态：读盘路径对三个整型一律 clamp ⇒ 缺字段（= 反序列化成 0）被夹成 1/1/0。
+// 旧配置或手改删过项的配置就会命中：并发变 1、重试变 0（任何一次失败直接放弃），
+// 观感是"下载突然极慢/一失败就停"，而且**没有任何提示**（GUI 无控制台）。
+// 同函数里 port / uiView / proxy 三处本来就是"空值回退默认"，只有这三个不是 ——
+// 同一段代码两套语义，说明是漏改而不是有意设计。
+func TestLoadConfigMissingIntFieldsFallBackToDefault(t *testing.T) {
+	dir := t.TempDir()
+	p := filepath.Join(dir, "gocatcher_config.json")
+	saveRestoreConfig(t, p)
+	def := defaultConfig()
+
+	// 只写 port：三个整型键全缺
+	os.WriteFile(p, []byte(`{"port":8899}`), 0644)
+	testStd.loadConfig()
+	if testStd.cfg.MaxConcurrent != def.MaxConcurrent ||
+		testStd.cfg.SegConcurrency != def.SegConcurrency ||
+		testStd.cfg.MaxRetries != def.MaxRetries {
+		t.Fatalf("整型键缺失应回退默认 %d/%d/%d，实际 %d/%d/%d",
+			def.MaxConcurrent, def.SegConcurrency, def.MaxRetries,
+			testStd.cfg.MaxConcurrent, testStd.cfg.SegConcurrency, testStd.cfg.MaxRetries)
+	}
+	if testStd.cfg.Port != 8899 {
+		t.Fatalf("port 键在，应保留 8899，got %d", testStd.cfg.Port)
+	}
+
+	// 反向：键在且越界仍要夹取（不能把两种处置混成一条"一律回退默认"）
+	// —— 这里同时验"同一次读盘里，键在的夹取、键不在的回退默认"。
+	os.WriteFile(p, []byte(`{"maxConcurrent":999}`), 0644)
+	testStd.loadConfig()
+	if testStd.cfg.MaxConcurrent != 16 {
+		t.Fatalf("键在且越界应夹到 16，got %d", testStd.cfg.MaxConcurrent)
+	}
+	if testStd.cfg.SegConcurrency != def.SegConcurrency || testStd.cfg.MaxRetries != def.MaxRetries {
+		t.Fatalf("同一次读盘里缺失的项仍应回退默认 %d/%d，实际 %d/%d",
+			def.SegConcurrency, def.MaxRetries, testStd.cfg.SegConcurrency, testStd.cfg.MaxRetries)
 	}
 }
 

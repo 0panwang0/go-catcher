@@ -226,7 +226,21 @@ func (r *Runtime) persistDTOOf() persistDTO {
 
 // saveState 把任务快照写入 gocatcher_state.json（临时文件 + rename 原子替换）。
 // 失败会记进 persistHealth，由 /status 暴露给前端提示用户。
+//
+// 全程持 stateSaveMu：debounce goroutine 与 Engine.Stop 是两条独立调用路径，而
+// writeFileAtomic 的临时名是固定的 ⇒ 两个写者会互踩出非法 JSON（见 runtime.go）。
 func (r *Runtime) saveState() {
+	r.stateSaveMu.Lock()
+	defer r.stateSaveMu.Unlock()
+
+	if r.stateOverwriteBlocked {
+		// 载入时一个任务都没恢复出来（文件损坏 / 读不出 / 版本不认识），此刻的
+		// tasks 是空表。写下去 = 拿空表覆盖用户仅有的那份文件。宁可这次不落盘
+		// （A-1）——**保住原文件**比"本次会话的进度能存下来"重要得多。
+		// loadState 已把原因记进 persistHealth，/status 会显示给用户。
+		return
+	}
+
 	list := r.collectPersisted()
 	data, err := json.MarshalIndent(stateFile{Version: stateVersion, Tasks: list}, "", "  ")
 	if err != nil {
@@ -254,20 +268,28 @@ func (r *Runtime) loadState() {
 	data, err := os.ReadFile(p)
 	if err != nil {
 		if !os.IsNotExist(err) {
-			fmt.Printf("[state] 读取失败: %v\n", err)
+			// 读不出来（被别的程序占用 / 权限不足 / 盘拔了）：**不能当成"没有历史"**
+			// —— 后续任何一次 saveState 都会拿空表覆盖它。先改名留档，改不动就本轮不落盘。
+			r.quarantineUnreadableState(p, fmt.Sprintf("读取失败: %v", err))
 		}
 		return
 	}
 	var sf stateFile
 	if err := json.Unmarshal(data, &sf); err != nil {
-		fmt.Printf("[state] 解析失败（忽略）: %v\n", err)
+		// 内容确实坏了（截断 / 非法 JSON）。留档后**允许继续写新状态**：留档那份还能
+		// 人工抢救，"被空表覆盖掉"就没有任何余地了。
+		r.quarantineUnreadableState(p, fmt.Sprintf("解析失败: %v", err))
 		return
 	}
 	// 版本校验（R7）：只写不读的版本号等于没有。未来版本（> stateVersion）的
 	// 字段语义未知，宁可放弃恢复也不要解析出一个半残状态，让用户在界面上看到
 	// 「任务凭空消失」；0（旧文件没有该字段）按当前结构尽力解析。
+	//
+	// ⚠️ 分支处置与上面两种**不同**（A-1）：这里的文件本身是好的，只是当前程序
+	// 不认识它（用户降级了版本）。既不能改名挪走、更不能覆盖 —— 那等于把新版本
+	// 写下的历史弄丢。所以走"本轮不落盘"这条路。
 	if sf.Version > stateVersion {
-		fmt.Printf("[state] 状态文件版本 %d 高于当前支持的 %d，已跳过恢复（请升级程序）\n", sf.Version, stateVersion)
+		r.blockStateOverwrite(fmt.Sprintf("状态文件版本 %d 高于当前支持的 %d（请升级程序）", sf.Version, stateVersion))
 		return
 	}
 	resumed := 0
@@ -324,6 +346,34 @@ func (r *Runtime) loadState() {
 	if len(sf.Tasks) > 0 {
 		fmt.Printf("[state] 已恢复 %d 个历史任务（其中 %d 个可继续下载）\n", len(sf.Tasks), resumed)
 	}
+}
+
+// blockStateOverwrite 让本次进程彻底不再写状态文件，并把原因交给 /status（A-1）。
+// 用在"文件本身可能是好的、只是这次读不了/不认识"的场合 —— 此时宁可不落盘。
+//
+// ⚠️ 这里**不调 recordPersistResult(nil)**，而且 saveState 在置位后直接 return、
+// 也不会清它 ⇒ 这条不健康状态会一直挂在 /status 上直到进程退出。这正是要的效果：
+// 用户得看见"这次没载入历史、也没敢覆盖原文件"。
+func (r *Runtime) blockStateOverwrite(why string) {
+	r.stateSaveMu.Lock()
+	r.stateOverwriteBlocked = true
+	r.stateSaveMu.Unlock()
+	r.recordPersistResult(fmt.Errorf("未载入历史（%s）：本次不覆盖原状态文件", why))
+	fmt.Printf("[state] %s；本次不落盘，以免覆盖原文件\n", why)
+}
+
+// quarantineUnreadableState 把读不出/坏掉的状态文件改名留档，然后允许正常落盘。
+// 留档失败 ⇒ 退回 blockStateOverwrite（保命优先：宁可本次不保存，也不覆盖）。
+//
+// 备份名带时间戳：多次损坏各留一份（也避开"上一次的只读备份挡路"这种 rename 失败）。
+func (r *Runtime) quarantineUnreadableState(p, why string) {
+	bak := fmt.Sprintf("%s.%s.corrupt", p, time.Now().Format("20060102-150405"))
+	if err := os.Rename(p, bak); err != nil {
+		r.blockStateOverwrite(fmt.Sprintf("%s，且留档失败: %v", why, err))
+		return
+	}
+	r.recordPersistResult(fmt.Errorf("原状态文件%s，已留档为 %s", why, filepath.Base(bak)))
+	fmt.Printf("[state] 原状态文件%s，已留档为 %s（本次从空列表开始）\n", why, filepath.Base(bak))
 }
 
 // ============================================================

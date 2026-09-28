@@ -458,9 +458,18 @@ func parsePlaylist(m3u8Text, base string) playlistInfo {
 	return pl
 }
 
-// parseEXTINFDuration 解析 "#EXTINF:10.0," 中的秒数；解析失败或产生非有限值
+// maxExtinfSeconds 单条 #EXTINF 的合理上限（秒）。HLS 规范建议分片 1–10 秒，长分片
+// 也不过几十秒 —— 取 1 小时，留了三个数量级余量。理由见 parseEXTINFDuration。
+const maxExtinfSeconds = 3600
+
+// parseEXTINFDuration 解析 "#EXTINF:10.0," 中的秒数；解析失败、产生非有限值
 // （如 "#EXTINF:NaN," / "#EXTINF:+Inf,"：strconv.ParseFloat 会成功返回但结果是
-// NaN/+Inf，污染 totalDur 与 durs 令下游净时长比较失效）返回 0。
+// NaN/+Inf，污染 totalDur 与 durs 令下游净时长比较失效）或**荒谬的大值**返回 0。
+//
+// 大值这一道是 A-6：`1e300` 是**有限**值，能穿透 NaN/Inf 检查。它一路累加进
+// job.gapMillis（`int64(sec*1000)` 溢出 int64、回绕成负数）⇒ gapSecondsNow()
+// 此后恒为负 ⇒ 缺口提示对**该任务永久关闭**（产物中间有洞却一声不响）。
+// 远端字节是不可信输入，这里必须限量级。
 func parseEXTINFDuration(line string) float64 {
 	rest := strings.TrimPrefix(line, "#EXTINF:")
 	rest = strings.TrimSpace(rest)
@@ -469,6 +478,9 @@ func parseEXTINFDuration(line string) float64 {
 	}
 	d, err := strconv.ParseFloat(rest, 64)
 	if err != nil || math.IsNaN(d) || math.IsInf(d, 0) {
+		return 0
+	}
+	if d > maxExtinfSeconds {
 		return 0
 	}
 	return d

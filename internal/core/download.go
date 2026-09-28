@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"net/url"
 	"os"
@@ -158,12 +159,45 @@ func (j *dlJob) seenWatermark() (uint64, bool) {
 	return j.seenSeq, j.seenAny
 }
 
+// gapMillis 的封顶（A-6）。缺口提示是说给用户听的："产物中间少了约 N 分钟"。
+// 累加器一旦溢出成负数，此后 gapSecondsNow() 恒为负 ⇒ gapText 恒返回空 ⇒ **该任务
+// 的缺口提示永久关闭**（产物有洞却一声不响 —— 头号形态）。而污染源是远端字节：
+// 一条 `#EXTINF:1e300,` 就能让 sec*1000 溢出 int64。
+const (
+	gapMillisPerCallMax = int64(24 * 3600 * 1000)     // 单次上限：一天
+	gapMillisTotalMax   = int64(7 * 24 * 3600 * 1000) // 累计上限：七天
+)
+
 // addGapSeconds 累加产物时间轴上的缺口时长（秒）。
+//
+// 三条防线，缺一条都会被一条畸形的 EXTINF 打穿（A-6）：
+//   - 非有限值直接丢（NaN 会污染后续所有比较）；
+//   - 单次封顶到一天（不是"丢弃"——真少了一天的内容也要如实报）；
+//   - 累计封顶到七天，且用 CAS 而不是 AddInt64：AddInt64 无界，加过头就回绕成负数。
 func (j *dlJob) addGapSeconds(sec float64) {
-	if sec <= 0 {
+	if sec <= 0 || math.IsNaN(sec) || math.IsInf(sec, 0) {
 		return
 	}
-	atomic.AddInt64(&j.gapMillis, int64(sec*1000))
+	ms := int64(sec * 1000)
+	if ms <= 0 {
+		return // 溢出成非正数：输入大到离谱，当脏数据丢掉
+	}
+	if ms > gapMillisPerCallMax {
+		ms = gapMillisPerCallMax
+	}
+	for {
+		cur := atomic.LoadInt64(&j.gapMillis)
+		if cur >= gapMillisTotalMax {
+			return
+		}
+		next := cur + ms
+		if next > gapMillisTotalMax || next < cur {
+			next = gapMillisTotalMax
+		}
+		if atomic.CompareAndSwapInt64(&j.gapMillis, cur, next) {
+			return
+		}
+	}
 }
 
 // gapSecondsNow 返回累计缺口时长（秒）。

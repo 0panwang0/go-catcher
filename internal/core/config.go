@@ -63,7 +63,15 @@ func (l *resizableSem) acquire(ctx context.Context) bool {
 		go func() {
 			select {
 			case <-ctx.Done():
-				l.cond.Broadcast() // 唤醒等待者自查 ctx
+				// ⚠️ 必须**持 l.mu** 广播（新-2）。不持锁时存在丢失唤醒：
+				// 取消恰好落在主协程"检查 ctx.Err()（还是 nil）"与"cond.Wait()"之间，
+				// 广播发生在 Wait 之前、当时无人可唤醒，随后 Wait 永久睡下去 ——
+				// 任务卡在「排队中」，而 resume 又因为它还占着队位不放行。
+				// 持锁后 watcher 会阻塞在 Lock 上直到 Wait 释放锁，广播不可能早于 Wait。
+				// （「不留锁 Broadcast 也合法」是 sync.Cond 的文档事实，但合法 ≠ 安全。）
+				l.mu.Lock()
+				l.cond.Broadcast()
+				l.mu.Unlock()
 			case <-stop:
 			}
 		}()
@@ -211,11 +219,17 @@ func (r *Runtime) loadConfig() {
 	if err == nil {
 		var fileC appConfig
 		if json.Unmarshal(data, &fileC) == nil {
-			// 返回值表示"发生过夹取"。这里按设计忽略：读盘路径对越界值做夹取
-			// （而非回退默认），与 /config 端点用 clamped 提示用户的处理不同。
-			_ = clamp(&fileC.MaxConcurrent, 1, 16)
-			_ = clamp(&fileC.SegConcurrency, 1, 32)
-			_ = clamp(&fileC.MaxRetries, 0, 10)
+			// 键缺失 ≠ 用户填了 0（A-7）。用一份原始键表把两种情况分开：
+			//   · 键不在（旧配置 / 手改删掉了这一项）⇒ 回退默认，与下面
+			//     Port / uiView / proxy 的处置一致；
+			//   · 键在但越界 ⇒ 夹到边界（值是人填的，夹住比悄悄换成默认更贴他的意图）。
+			// 一律按"越界就夹取"处理时，缺字段会被夹到**下限**（并发变 1、重试变 0），
+			// 观感是"下载突然变得极慢 / 一失败就放弃"，而且没有任何提示。
+			var keys map[string]json.RawMessage
+			_ = json.Unmarshal(data, &keys)
+			configInt(keys, "maxConcurrent", &fileC.MaxConcurrent, c.MaxConcurrent, 1, 16)
+			configInt(keys, "segConcurrency", &fileC.SegConcurrency, c.SegConcurrency, 1, 32)
+			configInt(keys, "maxRetries", &fileC.MaxRetries, c.MaxRetries, 0, 10)
 			// 旧配置文件没有 port 字段（反序列化为 0）：回退默认而不是夹取到 1
 			if fileC.Port <= 0 || fileC.Port > 65535 {
 				fileC.Port = c.Port
@@ -256,6 +270,19 @@ func clamp(v *int, lo, hi int) bool {
 		ok = false
 	}
 	return ok
+}
+
+// configInt 处理一个整型配置项（A-7）：**键缺失回退默认，键在才夹取**。
+//
+// 两种处置刻意不同 —— "文件里根本没有这一项"是未知（旧版本写的 / 被人手改删了），
+// 该给默认值；"写了个越界值"是已知，该尽量贴近用户意图（夹到边界）而不是换掉他填的数。
+// 把两者混成一条"越界就夹取"，缺字段就会静默落到下限。
+func configInt(keys map[string]json.RawMessage, key string, v *int, def, lo, hi int) {
+	if _, ok := keys[key]; !ok {
+		*v = def
+		return
+	}
+	_ = clamp(v, lo, hi)
 }
 
 // applyConfigLocked 把 cfg 写入运行时变量（调用方须持 cfgMu）。

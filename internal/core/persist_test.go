@@ -22,6 +22,11 @@ func saveRestoreState(t *testing.T) string {
 		waitStateIdle(t)
 		testStd.statePath, testStd.tasks, testStd.seqID, testStd.stateSaveDelay = oldPath, oldTasks, oldSeq, oldDelay
 		testStd.stateDirty, testStd.stateSaving = false, false
+		// 载入失败标记挂在共享的 testStd 上，不复位会污染后续用例（它们会莫名其妙
+		// 地"落盘不生效"）。
+		testStd.stateSaveMu.Lock()
+		testStd.stateOverwriteBlocked = false
+		testStd.stateSaveMu.Unlock()
 	})
 	testStd.getStatePath() // 触发 once，之后直接覆盖 testStd.statePath
 	dir := t.TempDir()

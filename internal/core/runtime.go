@@ -69,7 +69,17 @@ type Runtime struct {
 	statePathOnce  sync.Once
 	statePath      string
 	stateSaveDelay time.Duration
-	persistHealth  struct {
+	// stateSaveMu 串行化 saveState 本身。debounce goroutine 与 Engine.Stop 是两条
+	// 独立调用路径，而 writeFileAtomic 的临时名是**固定的** `<path>.tmp` ⇒ 两个写者
+	// 会互踩：A 截断临时文件、B 也截断、A 写完 rename 走、B 接着往同一个 inode 写、
+	// B 的 rename 失败 —— 落成一份**非法 JSON**，下次启动解析失败 ⇒ 历史被空表覆盖
+	// （见 stateOverwriteBlocked）。
+	stateSaveMu sync.Mutex
+	// stateOverwriteBlocked 置位后本次进程不再写状态文件。
+	// 载入时"文件读不出 / 解析不了 / 版本不认识"会置它：那些情况下 r.tasks 是
+	// "一个都没恢复"的空表，照常落盘就等于**把用户仅有的那份历史覆盖成空**（A-1）。
+	stateOverwriteBlocked bool
+	persistHealth         struct {
 		mu      sync.Mutex
 		lastErr string
 		lastOK  time.Time
