@@ -72,6 +72,19 @@
   let activeLive = false;
   let analyzing = false;
   let abortController = null;
+  // trackTimer 进度轮询的句柄（trackDownload 起、stopTrack 停）。
+  //
+  // 必须放在**模块级**而不是 trackDownload 的局部：面板可以在不点面板内 X 的情况下
+  // 消失（点灰底、点页面上别处触发重画），而那时局部变量已经不可达 —— 轮询会一直
+  // 跑下去，直到某次查到 complete 又**自己把面板弹回来**（A-5）。
+  let trackTimer = null;
+  // stopTrack 停掉进度轮询。幂等：多次调用安全（面板关闭路径有多条）。
+  function stopTrack() {
+    if (trackTimer !== null) {
+      clearInterval(trackTimer);
+      trackTimer = null;
+    }
+  }
 
   // ============================================================
   // MAIN world fetch 代理桥接
@@ -450,7 +463,17 @@
       const el = target.src ? target.el : null;
       const options = await expandVideoOptions(resp.sources, pageUrl, el);
       if (!options.length) {
-        showPanel("error", "候选链接均无法解析（可能被 CDN 阻断），请稍后重试。");
+        // 候选拿到了、但一条都展开不出画质。**这里不能只传一句字符串**：
+        // showPanel 的 error 分支要据此拼"手动兜底命令"，缺 --url 的命令跑不通，
+        // 而这条兜底命令正是"本地服务没起来时用户唯一的手段"（A-4）。
+        // 用原始候选的第一条拼：它至少指向同一个播放列表/直链。
+        const first = resp.sources[0] || {};
+        showPanel("error", {
+          message: "候选链接均无法解析（可能被 CDN 阻断），请稍后重试。",
+          m3u8Url: first.url || "",
+          pageUrl: first.pageUrl || pageUrl || location.href,
+          title: first.title || document.title || "",
+        });
         return;
       }
 
@@ -1202,7 +1225,10 @@
     // 首帧的 live 标记由 triggerDownload 在进面板前按本任务重算（嗅探启发式），
     // 服务端的权威标记要等第一次轮询才到；任一状态变化都会重画控件。
     let misses = 0; // 连续查不到任务的次数（上限见 pollGiveUp）
-    const interval = setInterval(async () => {
+    // 先停掉上一个轮询：不这样，同一页面里"关掉再开另一个任务"会留下两个 interval
+    // 同时往同一块面板写（旧任务的状态把新面板刷成别的样子）。
+    stopTrack();
+    trackTimer = setInterval(async () => {
       try {
         const resp = await chrome.runtime.sendMessage({ type: "queryDownload", taskId: activeTaskId });
         if (!resp || !resp.exists) {
@@ -1211,7 +1237,7 @@
           // 不许继续静默轮询（那会让面板永停在「正在连接…」，用户看不出已失败）。
           // 判据与 downloader.js 的 pollTask 同口径。
           if (pollGiveUp(++misses)) {
-            clearInterval(interval);
+            stopTrack();
             showPanel("error", {
               message: "任务状态丢失（本地服务可能已重启）",
               m3u8Url: source.url,
@@ -1236,14 +1262,14 @@
           }
           updateInitiatedProgress(pct, stage, resp);
         } else if (state === "complete") {
-          clearInterval(interval);
+          stopTrack();
           showPanel("completed", {
             ...source,
             finalPath: resp.finalPath,
             filename: resp.filename,
           });
         } else if (state === "error" || state === "interrupted" || state === "canceled") {
-          clearInterval(interval);
+          stopTrack();
           if (state === "canceled") {
             showPanel("cancelled");
           } else {
@@ -1260,7 +1286,9 @@
       }
     }, 700);
 
-    const stopTracking = () => clearInterval(interval);
+    // 面板内 X 与"点灰底关面板"必须走**同一条**清理路径（A-5）：这里只做别名，
+    // 不再自己 clearInterval —— 局部句柄正是"关掉后轮询还在跑"的成因。
+    const stopTracking = stopTrack;
     if (panel) {
       const closeBtn = panel.querySelector("#m3u8-catcher-close");
       if (closeBtn) closeBtn.addEventListener("click", stopTracking, { once: true });
@@ -1396,6 +1424,10 @@
   }
 
   function closePanel() {
+    // 关面板 = 连轮询一起停（A-5）。不这样，点灰底/点页面别处关掉面板后，
+    // interval 仍在每 700ms 查一次任务：查到 complete 就把面板**自己弹回来**，
+    // 页面开着期间也一直白跑。
+    stopTrack();
     if (panel) {
       panel.remove();
       panel = null;

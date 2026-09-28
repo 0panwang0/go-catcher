@@ -132,12 +132,26 @@ check("查到任务后重置计数（否则一次网络抖动会一路累计到�
 check("miss 分支不再是裸 return（回退到 P2-2 的老写法会红）",
   /if \(!resp \|\| !resp\.exists\) \{/.test(src) &&
   !/if \(!resp \|\| !resp\.exists\) return;/.test(src));
-check("放弃时清掉 interval（真停轮询）",
-  /pollGiveUp\([\s\S]{0,400}?clearInterval\(interval\)/.test(src));
+check("放弃时真停轮询（走统一的 stopTrack）",
+  /pollGiveUp\([\s\S]{0,400}?stopTrack\(\)/.test(src));
 check("放弃时落到 error 面板（不是静默停 —— 用户要能看出失败了）",
   /pollGiveUp\([\s\S]{0,700}?showPanel\("error"/.test(src));
 check("失败文案点明原因（服务重启 / 任务被清理）",
   /任务状态丢失（本地服务可能已重启）/.test(src));
+
+// ---------- C2. A-5：面板消失必须连带停轮询 ----------
+// 缺陷形态：轮询句柄原先只住在 trackDownload 的局部作用域里，只有"面板内 X"这条
+// 路径接得到它。点灰底关面板（createPanel 的点击监听）走 closePanel，句柄已不可达
+// ⇒ interval 继续每 700ms 查一次，查到 complete 又把面板弹回来。
+console.log("C2. 面板消失时轮询也要停（A-5）");
+check("轮询句柄在模块级（局部句柄正是关面板那条路清不掉的原因）",
+  /\n\s*let trackTimer = null;/.test(src));
+check("closePanel 真的停轮询", /function closePanel\(\)[\s\S]{0,400}?stopTrack\(\)/.test(src));
+// 这条守"清理路径不许再分裂"：多一处 clearInterval 就等于多一条会漏掉某个关闭入口
+// 的路径 —— 本缺陷就是这么来的。只有 stopTrack 里那唯一一处才合法。
+check("全文件只有一处 clearInterval（清理入口收口到 stopTrack）",
+  (src.match(/clearInterval\(/g) || []).length === 1,
+  (src.match(/clearInterval\(/g) || []).length);
 
 // ---------- D. P3-3 真跑：hideButton 必须让在途检查作废 ----------
 console.log("D. hideButton 作废在途检查（真跑，不是扫字符串）");

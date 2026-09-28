@@ -174,15 +174,16 @@
   function sanitizeFileName(name) {
     return String(name == null ? "" : name).replace(CONTROL_CHARS, "").replace(/[\\/:*?"<>|]/g, "_").replace(/_{2,}/g, "_").replace(/\s*_\s*/g, "_").replace(/\s+/g, " ").replace(/^[_\s]+|[_\s]+$/g, "").trim();
   }
+  var SHELL_METACHARS = /["`$!]/g;
   function quoteArg(v) {
-    return String(v == null ? "" : v).replace(CONTROL_CHARS, "").replace(/"/g, "").trim();
+    return String(v == null ? "" : v).replace(CONTROL_CHARS, "").replace(SHELL_METACHARS, "").trim();
   }
   function assembleGoCommand(m3u8URL, pageURL, outName, exePath) {
     const exe = quoteArg(exePath) || "go-catcher.exe";
     const args = [`"${exe}"`];
     if (m3u8URL) args.push(`--url="${quoteArg(m3u8URL)}"`);
     if (pageURL) args.push(`--referer="${quoteArg(pageURL)}"`);
-    if (outName) args.push(`-o "${outName}"`);
+    if (outName) args.push(`-o "${quoteArg(outName)}"`);
     return ["chcp 65001", args.join(" ")].join(" ; ");
   }
 

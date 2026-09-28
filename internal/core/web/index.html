@@ -306,9 +306,15 @@ function stageText(t){
   // 直播没有"暂停后接着录"这回事：暂停期间的流已经从列表滚走，接着录只会
   // 在产物中间留一个时间轴空洞。所以这里不给"暂停后还能接着录"的承诺。
   // 时长与片数由指标行给，这里只说"该怎么办"。
+  // 暂停文案按**这个任务真正在数什么**分流（A-3）：分片任务的进度分母是分片数，
+  // 直链任务的计数器是字节（segTot 恒 0）。照分片数写会让直链显示"已下载 0 个分片"
+  // ——与同一张卡左侧的百分比自相矛盾，用户会以为什么都没下到、去点「取消」，
+  // 把已经下好的 .part 删掉。指标行的 seg 早就是这么分流写的（见 card 的 seg）。
   if(t.paused) return t.live
     ? '<span class="stage pause">录制已中断 · 点「停止」保存已录部分</span>'
-    : '<span class="stage pause">已暂停 · 已下载 '+t.segDone+' 个分片，可从断点继续</span>';
+    : (t.segTot > 0
+        ? '<span class="stage pause">已暂停 · 已下载 '+t.segDone+' 个分片，可从断点继续</span>'
+        : '<span class="stage pause">已暂停 · 可从断点继续</span>');
   if(t.queued) return '<span class="stage">排队中…（最多同时 '+esc(curCfg.maxConcurrent)+' 个在下载）</span>';
   // 直播完成态：stage 已经是"已保存（用户停止录制）"这类完整说法，不再套"完成 · "；
   // 点播仍用"完成 · 已保存"。
