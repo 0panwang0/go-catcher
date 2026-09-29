@@ -32,6 +32,7 @@ import (
 // "载入失败就留档"会把用户降级期间的历史挪到 .corrupt 里，升回新版本也用不上。
 func TestLoadStateUnknownVersionDoesNotWipeHistory(t *testing.T) {
 	p := saveRestoreState(t)
+	resetPersistHealth(t)
 	orig := []byte(`{"version":99,"tasks":[{"id":"t1","done":true,"filename":"a.ts"}]}`)
 	if err := os.WriteFile(p, orig, 0644); err != nil {
 		t.Fatal(err)
@@ -59,9 +60,15 @@ func TestLoadStateUnknownVersionDoesNotWipeHistory(t *testing.T) {
 		t.Fatalf("载入失败后仍写了盘（历史被空表覆盖）: err=%v content=%s", err, got2)
 	}
 
-	// 3) 必须留下可被 /status 看到的不健康记录（GUI 无控制台，日志等于没写）
-	if d := testStd.persistDTOOf(); d.OK || d.Error == "" {
-		t.Fatalf("未载入历史时 /status 应报不健康，实际: %+v", d)
+	// 3) 必须留下可被 /status 看到的记录（GUI 无控制台，日志等于没写）。
+	//    走的是 notice 槽位而非 lastErr（S1）：本函数让进程从此不再写盘，saveState
+	//    直接 return ⇒ 若写进 lastErr，它的存活只依赖"再也走不到那句清理代码"这个
+	//    巧合；notice 槽位则由 recordPersistNotice 保证不被后续成功落盘清空。
+	if d := testStd.persistDTOOf(); d.Notice == "" {
+		t.Fatalf("未载入历史时 /status 应给出可见通知，实际: %+v", d)
+	}
+	if d := testStd.persistDTOOf(); !strings.Contains(d.Notice, "未载入历史") {
+		t.Fatalf("通知应说明原因（未载入历史），实际: %+v", d)
 	}
 }
 
@@ -70,6 +77,7 @@ func TestLoadStateUnknownVersionDoesNotWipeHistory(t *testing.T) {
 // 只有"拦住覆盖"是不够的：那会让用户在坏文件面前**永远存不了新进度**。
 func TestLoadStateGarbageIsQuarantinedThenWritable(t *testing.T) {
 	p := saveRestoreState(t)
+	resetPersistHealth(t)
 	broken := []byte("{broken")
 	if err := os.WriteFile(p, broken, 0644); err != nil {
 		t.Fatal(err)
@@ -100,6 +108,13 @@ func TestLoadStateGarbageIsQuarantinedThenWritable(t *testing.T) {
 	var sf stateFile
 	if err := json.Unmarshal(data, &sf); err != nil || len(sf.Tasks) != 1 {
 		t.Fatalf("留档后的状态文件不合法: err=%v content=%s", err, data)
+	}
+
+	// 留档通知必须活过紧随其后的这次成功落盘（S1）。本路径明说"允许继续正常落盘"，
+	// 若通知写在 lastErr 槽位，上面那次 saveState 就把它清掉了 —— 用户看不到
+	// "你的记录损坏、已留档"。
+	if d := testStd.persistDTOOf(); !strings.Contains(d.Notice, "已留档") {
+		t.Fatalf("状态文件留档通知被紧随其后的成功落盘冲掉了（S1）: %+v", d)
 	}
 }
 

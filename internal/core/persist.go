@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"time"
 )
 
@@ -201,23 +202,54 @@ func (r *Runtime) recordPersistResult(err error) {
 	r.persistHealth.mu.Unlock()
 }
 
-// persistStatus 返回 (最近一次落盘错误, 最近一次落盘成功时间)。
-func (r *Runtime) persistStatus() (string, time.Time) {
+// recordPersistNotice 记一条"需要用户知晓"的通知 —— 配置 / 状态文件损坏后已留档、
+// 或"未载入历史，本次不覆盖原状态文件"这类**一次性既成事实**。
+//
+// 与 recordPersistResult 的分工（S1）：lastErr 表达"最近一次落盘健不健康"，成功落盘
+// 时**应当**清空；notice 表达"发生过一件用户该知道的事"，成功落盘**不该**清。两者
+// 先前共用一个槽位 ⇒ 留档消息被随后任一次成功 saveState 冲掉，用户一个字都看不到。
+//
+// 多条通知**累加**而非覆盖：同一次启动里"配置损坏"（loadConfig 期）与"状态文件损坏"
+// （loadState 期，紧随其后）可以同时发生 —— 单槽位覆盖会让后写的那条把先写的挤掉，
+// 而被挤掉的恰恰可能是后果更重的一条。内容相同则不重复追加（同一进程内重复调用）。
+func (r *Runtime) recordPersistNotice(text string) {
+	if text == "" {
+		return
+	}
+	r.persistHealth.mu.Lock()
+	switch {
+	case r.persistHealth.notice == "":
+		r.persistHealth.notice = text
+	case !strings.Contains(r.persistHealth.notice, text):
+		r.persistHealth.notice += "；" + text
+	}
+	r.persistHealth.mu.Unlock()
+}
+
+// persistStatus 返回 (最近一次落盘错误, 最近一次落盘成功时间, 待用户知晓的通知)。
+func (r *Runtime) persistStatus() (string, time.Time, string) {
 	r.persistHealth.mu.Lock()
 	defer r.persistHealth.mu.Unlock()
-	return r.persistHealth.lastErr, r.persistHealth.lastOK
+	return r.persistHealth.lastErr, r.persistHealth.lastOK, r.persistHealth.notice
 }
 
 // persistDTO 是 /status 里暴露的持久化健康信息。
+//
+// Notice 与 Error 是**两种不同语义**，消费方（web/index.html、扩展）必须分开渲染：
+// Error 是"最近一次落盘失败"，只有一种后果（进度可能回退）；Notice 是后端拼好的
+// 面向用户的整句，涵盖配置留档 / 状态留档 / 本次不覆盖等多种事件，前端**原样显示**、
+// 不得套用 Error 的固定文案（S2：先前前端把该字段硬编码成"断点状态写入磁盘失败"，
+// 于是"配置被重置"这类事件被显示成"进度可能回退"，真正后果一个字都没说）。
 type persistDTO struct {
 	OK     bool   `json:"ok"`
 	Error  string `json:"error,omitempty"`
+	Notice string `json:"notice,omitempty"`
 	LastOK string `json:"lastOK,omitempty"`
 }
 
 func (r *Runtime) persistDTOOf() persistDTO {
-	errMsg, lastOK := r.persistStatus()
-	d := persistDTO{OK: errMsg == "", Error: errMsg}
+	errMsg, lastOK, notice := r.persistStatus()
+	d := persistDTO{OK: errMsg == "", Error: errMsg, Notice: notice}
 	if !lastOK.IsZero() {
 		d.LastOK = lastOK.Format(time.RFC3339)
 	}
@@ -356,17 +388,20 @@ func (r *Runtime) loadState() {
 	}
 }
 
-// blockStateOverwrite 让本次进程彻底不再写状态文件，并把原因交给 /status（A-1）。
+// blockStateOverwrite 让本次进程彻底不再写状态文件，并把原因交给用户（A-1）。
 // 用在"文件本身可能是好的、只是这次读不了/不认识"的场合 —— 此时宁可不落盘。
 //
-// ⚠️ 这里**不调 recordPersistResult(nil)**，而且 saveState 在置位后直接 return、
-// 也不会清它 ⇒ 这条不健康状态会一直挂在 /status 上直到进程退出。这正是要的效果：
-// 用户得看见"这次没载入历史、也没敢覆盖原文件"。
+// ⚠️ 走 recordPersistNotice 而非 recordPersistResult：notice 槽位**不会被后续成功落盘
+// 清空**（saveState 成功只清 lastErr），所以这条提醒能一直挂在 /status 上直到进程退出。
+// 这正是要的效果：用户得看见"这次没载入历史、也没敢覆盖原文件"。
+//
+// （历史坑：本函数一度靠"置位后 saveState 直接 return、走不到 recordPersistResult(nil)"
+// 来保住消息。那个保护只在这一条路径上成立；另两处留档照常落盘，消息就被冲掉了。）
 func (r *Runtime) blockStateOverwrite(why string) {
 	r.stateSaveMu.Lock()
 	r.stateOverwriteBlocked = true
 	r.stateSaveMu.Unlock()
-	r.recordPersistResult(fmt.Errorf("未载入历史（%s）：本次不覆盖原状态文件", why))
+	r.recordPersistNotice(fmt.Sprintf("未载入历史（%s）：本次不覆盖原状态文件", why))
 	fmt.Printf("[state] %s；本次不落盘，以免覆盖原文件\n", why)
 }
 
@@ -374,13 +409,16 @@ func (r *Runtime) blockStateOverwrite(why string) {
 // 留档失败 ⇒ 退回 blockStateOverwrite（保命优先：宁可本次不保存，也不覆盖）。
 //
 // 备份名带时间戳：多次损坏各留一份（也避开"上一次的只读备份挡路"这种 rename 失败）。
+//
+// 提醒必须走 recordPersistNotice：本函数的后半句就是"允许继续正常落盘"，若把提醒写进
+// lastErr 槽位，它会被紧接着的第一次成功 saveState 秒清 ⇒ 用户看不到"记录损坏已留档"。
 func (r *Runtime) quarantineUnreadableState(p, why string) {
 	bak := fmt.Sprintf("%s.%s.corrupt", p, time.Now().Format("20060102-150405"))
 	if err := os.Rename(p, bak); err != nil {
 		r.blockStateOverwrite(fmt.Sprintf("%s，且留档失败: %v", why, err))
 		return
 	}
-	r.recordPersistResult(fmt.Errorf("原状态文件%s，已留档为 %s", why, filepath.Base(bak)))
+	r.recordPersistNotice(fmt.Sprintf("原状态文件%s，已留档为 %s（本次从空列表开始）", why, filepath.Base(bak)))
 	fmt.Printf("[state] 原状态文件%s，已留档为 %s（本次从空列表开始）\n", why, filepath.Base(bak))
 }
 

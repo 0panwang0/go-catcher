@@ -89,6 +89,14 @@ type Runtime struct {
 		mu      sync.Mutex
 		lastErr string
 		lastOK  time.Time
+		// notice 是"需要用户知晓、且**不该**被后续落盘抹掉"的一次性事件：配置 /
+		// 状态文件损坏后已留档、或"本次不覆盖原状态文件"。
+		//
+		// 与 lastErr 的分工（S1）：lastErr 表达"最近一次落盘健不健康"，成功落盘时
+		// **应当**清空；notice 表达"发生过一件用户该知道的事"，成功落盘**不该**清。
+		// 先前两者共用一个槽位 ⇒ 留档消息被随后任一次成功 saveState 冲掉（GUI 有
+		// 任务时秒级发生），用户一个字都看不到。写入见 recordPersistNotice。
+		notice string
 	}
 
 	// ---- 网络（原 net.go 包级变量）----

@@ -274,15 +274,19 @@ func (r *Runtime) loadConfig() {
 // 钉着），但随后 saveConfigLocked 会把默认值写回同一个路径 —— 那是**静默销毁**
 // 用户改过的设置。留一份带时间戳的 .bak，至少还能人工恢复。
 //
+// ⚠️ 提醒走 recordPersistNotice（**不是** recordPersistResult）：本函数之后程序照常
+// 运行、照常落盘，若把提醒写进 lastErr 槽位，它会被紧接着的第一次成功 saveState 秒清，
+// 用户看不到"你的设置被重置了"（S1）。
+//
 // 留档失败不影响继续运行（最坏：这次用默认值且原文件仍在，下次启动会再报一次）。
 func (r *Runtime) quarantineUnreadableConfig(p, why string) {
 	bak := fmt.Sprintf("%s.%s.bak", p, time.Now().Format("20060102-150405"))
 	if err := os.Rename(p, bak); err != nil {
-		r.recordPersistResult(fmt.Errorf("配置%s，且留档失败: %v（本次用默认配置，原文件未动）", why, err))
+		r.recordPersistNotice(fmt.Sprintf("配置%s，且留档失败: %v（本次用默认配置，原文件未动）", why, err))
 		fmt.Printf("[config] 配置%s，且留档失败: %v（本次用默认配置）\n", why, err)
 		return
 	}
-	r.recordPersistResult(fmt.Errorf("配置文件%s，已留档为 %s（本次用默认配置）", why, filepath.Base(bak)))
+	r.recordPersistNotice(fmt.Sprintf("配置文件%s，已留档为 %s（本次用默认配置）", why, filepath.Base(bak)))
 	fmt.Printf("[config] 配置文件%s，已留档为 %s（本次从默认配置开始）\n", why, filepath.Base(bak))
 }
 

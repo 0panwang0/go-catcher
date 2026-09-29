@@ -200,12 +200,15 @@ async function poll() {
     const r = await fetch(api('/status'), {cache:'no-store'});
     const d = await r.json();
     tasks = d.tasks || [];
-    // 持久化健康：断点写盘失败时必须让用户看到，否则"以为存了、重启发现进度回退"
-    if (d.persist && d.persist.ok === false) {
-      setErr('断点状态写入磁盘失败：' + (d.persist.error || '未知原因') + '（恢复下载后进度可能回退）');
-    } else {
-      setErr('');
-    }
+    // 持久化健康，两类语义分开渲染（S2）：
+    //  • notice：需要用户知晓的一次性事件（配置/任务记录损坏已留档、本次不覆盖原文件）。
+    //    后端刻意不随成功落盘清它，这里**原样显示后端拼好的整句** —— 不许套用下面那句
+    //    "写盘失败"文案：那会把"你的设置被重置了"说成"进度可能回退"，真正后果一字不提。
+    //  • error：最近一次落盘失败，后果确实就是进度可能回退。
+    var pmsg = [];
+    if (d.persist && d.persist.notice) pmsg.push(d.persist.notice);
+    if (d.persist && d.persist.ok === false) pmsg.push('断点状态写入磁盘失败：' + (d.persist.error || '未知原因') + '（恢复下载后进度可能回退）');
+    setErr(pmsg.join('　｜　'));
     updateStats();
     const sig = tasks.map(t=>t.id+t.stage+t.segDone+t.pct+t.paused+t.canceled+t.done+t.fileMissing+(t.error||'')+(t.live&&t.running?Math.floor((Date.now()-(t.started?new Date(t.started).getTime():Date.now()))/1000):'')).join('|');
     if (sig !== lastSig && Date.now() - lastAction > 1200) {

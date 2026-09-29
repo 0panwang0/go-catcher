@@ -26,8 +26,10 @@ func TestLoadConfigQuarantinesBrokenFile(t *testing.T) {
 	dir := t.TempDir()
 	p := filepath.Join(dir, "gocatcher_config.json")
 	saveRestoreConfig(t, p)
-	// persistHealth 是共享状态，记了错要在本用例结束后清掉，免得污染后续用例。
-	t.Cleanup(func() { testStd.recordPersistResult(nil) })
+	// persistHealth 是共享状态，记了通知要在本用例结束后清掉，免得污染后续用例。
+	// ⚠️ 必须用 resetPersistHealth 而不是 recordPersistResult(nil)：后者清不掉
+	// notice 槽位（这正是不通知被冲掉的原因）。
+	resetPersistHealth(t)
 
 	broken := []byte(`{"maxConcurrent":5,"proxy":"http://127.0.0.1:8888"`) // 截断的 JSON
 	if err := os.WriteFile(p, broken, 0644); err != nil {
@@ -57,9 +59,16 @@ func TestLoadConfigQuarantinesBrokenFile(t *testing.T) {
 		t.Fatalf("留档后应能正常保存配置: %v", err)
 	}
 
-	// 4) /status 必须看得到（GUI 是 windowsgui、无控制台，只 Printf 等于没写）
-	if d := testStd.persistDTOOf(); d.OK || d.Error == "" {
-		t.Fatalf("配置留档应经 persistHealth 上报 /status，实际: %+v", d)
+	// 4) /status 必须看得到（GUI 是 windowsgui、无控制台，只 Printf 等于没写），
+	//    且必须**活得过后续的成功落盘** —— 后半句才是 S1 的判据：写进 lastErr 槽位
+	//    的话，saveState 成功时的 recordPersistResult(nil) 会把它冲掉，用户一个字都看不到。
+	//    （旧断言在 loadConfig 之后立刻检查，只证明"写得进去"、不能证明"留得住"。）
+	if d := testStd.persistDTOOf(); d.Notice == "" {
+		t.Fatalf("配置留档应经 persistHealth 的 notice 上报 /status，实际: %+v", d)
+	}
+	testStd.saveState() // 一次真正成功的落盘
+	if d := testStd.persistDTOOf(); d.Notice == "" {
+		t.Fatalf("配置留档通知被一次成功落盘冲掉了（S1）: %+v", d)
 	}
 }
 
