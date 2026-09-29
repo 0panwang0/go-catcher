@@ -853,6 +853,20 @@ var __m3u8catcher = (() => {
       }
       if (!t) return { exists: false };
       if (t.done) {
+        if (t.interrupted) {
+          return {
+            exists: true,
+            id: t.id,
+            state: "interrupted",
+            finalPath: t.finalPath || "",
+            filename: t.finalPath ? t.finalPath.split(/[\\/]/).pop() : "",
+            pct: 100,
+            stage: t.stage || "\u5F55\u5236\u4E2D\u65AD \xB7 \u5DF2\u4FDD\u5B58",
+            error: t.error || "",
+            gapSeconds: typeof t.gapSeconds === "number" ? t.gapSeconds : 0,
+            fileMissing: !!t.fileMissing
+          };
+        }
         if (t.finalPath) {
           return {
             exists: true,
@@ -870,6 +884,14 @@ var __m3u8catcher = (() => {
             id: t.id,
             state: "canceled",
             stage: t.stage || "\u5DF2\u53D6\u6D88"
+          };
+        }
+        if (!t.error) {
+          return {
+            exists: true,
+            id: t.id,
+            state: "stoppedEmpty",
+            stage: t.stage || "\u5DF2\u505C\u6B62\uFF08\u65E0\u5185\u5BB9\uFF09"
           };
         }
         return {

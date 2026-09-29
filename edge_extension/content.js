@@ -1001,6 +1001,43 @@
       );
       const doneBtn = panel.querySelector("#completed-close");
       if (doneBtn) doneBtn.addEventListener("click", closePanel);
+    } else if (state === "interrupted") {
+      // 直播故障中断：成品**已保存但没录完**，绝不能显示成 🎉「下载完成」——
+      // 那会把"产物不完整"藏起来（R2，本项目头号缺陷形态）。如实说明已保存、
+      // 中断原因（后端 stage）与时间轴上的缺口（gapSeconds）。
+      const fn = (payload && payload.filename) || "video.ts";
+      const gap = Math.round((payload && payload.gapSeconds) || 0);
+      // 缺口 / 失效提示先算成**纯文本**，再在模板里过 escapeHtml —— 不在模板外拼
+      // HTML 片段（xss-guard 的白名单只给"本地字面量"留位，不为了省事扩它）。
+      const gapNote = gap > 0 ? (gap >= 60 ? "中间缺失约 " + (gap / 60).toFixed(1) + " 分钟" : "中间缺失约 " + gap + " 秒") : "";
+      const staleNote = payload && payload.fileMissing ? "文件已被移动或删除" : "";
+      panel.innerHTML = panelShell(
+        "下载该视频",
+        `<div style="padding:30px 28px;text-align:center;">
+          <div style="font-size:30px;margin-bottom:10px;">⚠️</div>
+          <div style="color:#d97706;font-weight:600;font-size:16px;margin-bottom:8px;">已保存（录制中断）</div>
+          <div style="font-size:13px;color:#374151;margin-bottom:6px;">文件名：<code style="background:#f3f4f6;padding:2px 6px;border-radius:3px;font-family:Menlo,Consolas,monospace;">${P.escapeHtml(fn)}</code></div>
+          ${payload && payload.finalPath ? `<div style="font-size:12px;color:#6b7280;margin-bottom:8px;word-break:break-all;">位置：${P.escapeHtml(payload.finalPath)}</div>` : ""}
+          <div style="font-size:12px;color:#92400e;margin-bottom:6px;">${P.escapeHtml((payload && payload.stage) || "录制中断 · 已保存")}</div>
+          ${gapNote ? `<div style="font-size:12px;color:#92400e;margin-bottom:6px;">${P.escapeHtml(gapNote)}</div>` : ""}
+          ${staleNote ? `<div style="font-size:12px;color:#d32f2f;margin-bottom:6px;">${P.escapeHtml(staleNote)}</div>` : ""}
+          <button id="interrupted-close" style="margin-top:10px;padding:8px 20px;font-size:13px;border:none;background:#d97706;color:#fff;border-radius:5px;cursor:pointer;">知道了</button>
+        </div>`
+      );
+      const itBtn = panel.querySelector("#interrupted-close");
+      if (itBtn) itBtn.addEventListener("click", closePanel);
+    } else if (state === "stoppedEmpty") {
+      // 用户主动停止但没录到内容（R3）：既不是完成也不是失败 ——
+      // 旧代码落到 error 分支，显示成「下载失败：下载失败」。给一句中性说明即可。
+      panel.innerHTML = panelShell(
+        "下载该视频",
+        `<div style="padding:32px 28px;text-align:center;">
+          <div style="font-size:13px;color:#6b7280;margin-bottom:10px;">已停止，未录制到内容。</div>
+          <button id="stopped-empty-close" style="padding:8px 20px;font-size:13px;border:none;background:#6b7280;color:#fff;border-radius:5px;cursor:pointer;">关闭</button>
+        </div>`
+      );
+      const seBtn = panel.querySelector("#stopped-empty-close");
+      if (seBtn) seBtn.addEventListener("click", closePanel);
     } else if (state === "cancelled") {
       panel.innerHTML = panelShell(
         "下载该视频",
@@ -1268,7 +1305,24 @@
             finalPath: resp.finalPath,
             filename: resp.filename,
           });
-        } else if (state === "error" || state === "interrupted" || state === "canceled") {
+        } else if (state === "interrupted") {
+          // 中断收尾：成品已保存但没录完 —— 走"已保存（录制中断）"面板。
+          // **不能**落到下面的 error 分支：那条拼的是「下载失败：…」，语义正好反了
+          // （产物明明保存下来了，R2）。
+          stopTrack();
+          showPanel("interrupted", {
+            ...source,
+            finalPath: resp.finalPath,
+            filename: resp.filename,
+            stage: resp.stage,
+            gapSeconds: resp.gapSeconds,
+            fileMissing: resp.fileMissing,
+          });
+        } else if (state === "stoppedEmpty") {
+          // 用户主动停止但没录到内容（R3）：中性收尾面板，不是「下载失败」。
+          stopTrack();
+          showPanel("stoppedEmpty", { ...source });
+        } else if (state === "error" || state === "canceled") {
           stopTrack();
           if (state === "canceled") {
             showPanel("cancelled");

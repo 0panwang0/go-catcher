@@ -252,7 +252,12 @@ function badge(t){
   if(t.queued) return '<span class="badge que">排队中</span>';
   if(t.running && t.live) return '<span class="badge run">录制中</span>';
   if(t.running) return '<span class="badge run">下载中</span>';
-  if(t.done) return t.fileMissing ? '<span class="badge cancel">已失效</span>' : '<span class="badge done">已完成</span>';
+  // done 但没成品、且非取消/中断/失败 ⇒ 用户主动停止却什么都没录到（R3）。
+  // 旧写法一律给「已完成」，与状态行的「已停止（无内容）」自相矛盾；
+  // 到了这里 t.error / t.canceled / t.interrupted 都已在上方排掉。
+  if(t.done) return t.fileMissing
+    ? '<span class="badge cancel">已失效</span>'
+    : (t.finalPath ? '<span class="badge done">已完成</span>' : '<span class="badge pause">已停止</span>');
   return '<span class="badge que">等待</span>';
 }
 function fnameOf(t){ return t.filename || (t.finalPath? t.finalPath.split(/[\\/]/).pop() : ('任务 '+t.id)); }
