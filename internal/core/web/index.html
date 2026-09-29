@@ -11,6 +11,7 @@
     font-family:"Segoe UI Variable","Segoe UI","Microsoft YaHei UI","Microsoft YaHei",-apple-system,Roboto,sans-serif;
     background:var(--bg);color:var(--txt);
     min-height:100vh;padding:28px 20px 60px;
+    display:flex;flex-direction:column;   /* 竖向拉伸：空列表时那一段要吃满剩余高度 */
     font-feature-settings:"ss01","cv02";
     -webkit-font-smoothing:antialiased;
     -moz-osx-font-smoothing:grayscale;
@@ -25,7 +26,7 @@
   *{scrollbar-color:#334155 transparent;scrollbar-width:thin}
   /* 修复遮罩/弹层导致的页面双重抖动 */
   html{scroll-behavior:auto}
-  .wrap{max-width:900px;margin:0 auto}
+  .wrap{max-width:900px;margin:0 auto;width:100%;flex:1;display:flex;flex-direction:column}
   .hd{display:flex;align-items:center;gap:10px;margin-bottom:4px}
   h1{font-size:20px}
   .hd .dot{width:10px;height:10px;border-radius:50%;background:var(--muted);display:inline-block;flex:none}
@@ -108,7 +109,21 @@
   button:disabled{opacity:.4;cursor:not-allowed}
   button.ghost{background:transparent;border:1px solid var(--line);color:var(--muted)}
   button.danger{background:rgba(239,68,68,.16);border:1px solid rgba(239,68,68,.5);color:#fca5a5}
-  .empty{color:var(--muted);text-align:center;padding:50px 0;font-size:14px;background:var(--card);border:1px dashed var(--line);border-radius:14px}
+  /* 列表容器：作为 .wrap 的子项吃掉剩余高度（任务少时列表不塌）。 */
+  #list{flex:1}
+  /* 空状态：窗口高、任务少时原来只占一小条、下面空一大片 ⇒ 让它吃满整个列表区。
+     ⚠️ 只有"列表里只剩空态框"时才把它变成 flex —— 若非空态也 flex，#list 的子项之间
+     不再折叠 margin，卡片与日期分割线的间距会整体变大（回归）。:has() 不支持时只是
+     退化成"框不撑满"，不会坏。 */
+  #list:has(> .empty){display:flex;flex-direction:column}
+  /* ⚠️ flex-direction:column 必须留着：没有它，图标与两行文案会被摆成一行（踩过）。
+     padding 是兜底：万上一条的 :has() 不生效，框也不至于扁成一条线。 */
+  .empty{flex:1;display:flex;flex-direction:column;align-items:center;justify-content:center;
+         padding:40px 0;color:var(--muted);text-align:center;font-size:14px;
+         background:var(--card);border:1px solid #243044;border-radius:14px}
+  .empty .emic{line-height:1}
+  .empty .emt{font-size:15px;font-weight:600;color:#cbd5e1;margin-top:16px}
+  .empty .ems{font-size:12.5px;color:var(--muted);margin-top:7px}
   /* 页面级告警横幅：配置/任务记录损坏已留档、落盘失败、连不上本机服务都走这里。
      每条一张卡片，与 .stats / .card 同一套圆角语言；左侧 3px 竖色条按类型着色
      （与 .rowstrip 用竖条表达状态是同一做法），不再把两句话拼成一行细红字。 */
@@ -687,7 +702,12 @@ function dayLabel(key){
 }
 function render(){
   if (!tasks.length){
-    el('list').innerHTML='<div class="empty">暂无下载任务。<br>到视频页点「下载该视频」开始</div>';
+    // 空态：吃满列表区（见 .empty 的样式注释），图标 + 主副两行文案。
+    el('list').innerHTML='<div class="empty">'
+      + '<span class="emic"><svg width="42" height="42" viewBox="0 0 24 24" fill="none" stroke="#475569" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v12"/><path d="M7 10l5 5 5-5"/><path d="M4 19h16"/></svg></span>'
+      + '<div class="emt">暂无下载任务</div>'
+      + '<div class="ems">到视频页点「下载该视频」开始</div>'
+      + '</div>';
     return;
   }
   const groups = {}, order = [];
