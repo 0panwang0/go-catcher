@@ -18,6 +18,13 @@ func saveRestoreState(t *testing.T) string {
 	t.Helper()
 	oldPath, oldTasks, oldSeq, oldDelay := testStd.statePath, testStd.tasks, testStd.seqID, testStd.stateSaveDelay
 	testStd.stateSaveDelay = 5 * time.Millisecond
+	testStd.getStatePath() // 触发 once，之后直接覆盖 testStd.statePath
+	dir := t.TempDir()
+	// ⚠️ 这段 cleanup 必须**注册在 t.TempDir() 之后**：t.Cleanup 是 LIFO，先注册的会后跑。
+	// 写在前面（原样）时，TempDir 的删除会抢在"等待落盘"之前 —— 在途的 debounce
+	// goroutine 醒来时目录已没了，往 <已删目录>/gocatcher_state.json.tmp 写 ⇒ 刷
+	// "cannot find the path specified"，并把整个包的 -race 结果偶发拖红
+	// （2026-09-29 排查：14 绿 1 红，已用探针复现该顺序缺陷）。
 	t.Cleanup(func() {
 		waitStateIdle(t)
 		testStd.statePath, testStd.tasks, testStd.seqID, testStd.stateSaveDelay = oldPath, oldTasks, oldSeq, oldDelay
@@ -28,8 +35,6 @@ func saveRestoreState(t *testing.T) string {
 		testStd.stateOverwriteBlocked = false
 		testStd.stateSaveMu.Unlock()
 	})
-	testStd.getStatePath() // 触发 once，之后直接覆盖 testStd.statePath
-	dir := t.TempDir()
 	testStd.statePath = filepath.Join(dir, "gocatcher_state.json")
 	testStd.tasks = map[string]*taskEntry{}
 	testStd.seqID = 0
