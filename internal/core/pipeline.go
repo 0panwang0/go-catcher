@@ -423,6 +423,20 @@ func runDiskPipeline(te *taskEntry) {
 	}
 }
 
+// correctedDirectName 返回直链输出的修正文件名：扩展名跟随 URL（如 .mp4）。
+//
+// 与 HLS 那条 correctExtName（探容器后修正）不同：直链的媒体类型由 URL 后缀指示，
+// 不做容器探测。**GUI 直链（runDirectDownload）与 CLI 直链共用这一条规则** ——
+// 抽出来就是为了避免"一边修了另一边漏"（R6：CLI 曾经完全没调，MP4 存成 output.ts）。
+// 已是目标扩展名（大小写不敏感）或 URL 后缀认不出时，原样返回。
+func correctedDirectName(filename, rawURL string) string {
+	ext := directExtFromURL(rawURL)
+	if ext == "" || strings.HasSuffix(strings.ToLower(filename), ext) {
+		return filename
+	}
+	return strings.TrimSuffix(filename, filepath.Ext(filename)) + ext
+}
+
 // runDirectDownload 处理"URL 直接指向媒体文件"（MP4 等）的下载路径：
 // 扩展名跟随 URL → 整体流式下载 → 改名为成品 → 按磁盘事实对齐字节进度 → 置完成态。
 //
@@ -439,9 +453,11 @@ func runDirectDownload(ctx context.Context, te *taskEntry, job *dlJob, st *taskS
 	}
 	partPath := st.finalPath + ".part"
 
-	// 输出扩展名跟随 URL（如 .mp4），避免 MP4 内容存成 .ts
-	if ext := directExtFromURL(st.m3u8URL); ext != "" && !strings.HasSuffix(strings.ToLower(st.filename), ext) {
-		st.filename = strings.TrimSuffix(st.filename, filepath.Ext(st.filename)) + ext
+	// 输出扩展名跟随 URL（如 .mp4），避免 MP4 内容存成 .ts。
+	// 规则抽成 correctedDirectName 与 CLI 直链共用 —— 两条路径各写一份
+	// "取扩展名 + TrimSuffix" 正是 R6 的成因（CLI 那份整个漏了）。
+	if nf0 := correctedDirectName(st.filename, st.m3u8URL); nf0 != st.filename {
+		st.filename = nf0
 		nf, rerr := reclaimPath(st.saveDir, st.filename, st.finalPath)
 		if rerr != nil {
 			fail(rerr.Error())
@@ -471,6 +487,17 @@ func runDirectDownload(ctx context.Context, te *taskEntry, job *dlJob, st *taskS
 		return
 	}
 	publishRestartNote(te, job)
+	// 直链没有 HLS 那套容器探测（probeContainer），成品可能只是一张错误页
+	// （CDN 的 403/502 HTML 被 Content-Type 撒谎掩盖）。改名前做一次拒绝式校验：
+	// 明显不是媒体就判失败，绝不把 HTML 当视频存成"已完成"（R8，头号缺陷形态）。
+	// 判失败前把这份垃圾 .part 清掉 —— 非空的 .part 会被下一次 downloadDirect 当成
+	// 可续传前缀（模式 3），留着它等于让错误页冒充"已下载的头部"，成品成了拼接体。
+	if verr := validateDirectMedia(partPath); verr != nil {
+		os.Remove(partPath)
+		removeChunkMeta(partPath)
+		fail("直链产物校验失败: " + verr.Error())
+		return
+	}
 	if err := moveFile(partPath, st.finalPath); err != nil {
 		fail("保存文件失败: " + err.Error())
 		return
@@ -604,8 +631,16 @@ func finalizeRecording(te *taskEntry, job *dlJob, partPath string, cause finaliz
 		return fmt.Errorf("%w（已丢弃损坏的临时文件）", verr)
 	}
 
+	// 容器收尾（fMP4 回填 mehd/mvhd 总时长）失败**不改成功语义**：文件已合法可播，
+	// 只是播放器预知不了时长、不能拖动进度条（见 internal/fmp4/initseg.go 文件头）。
+	// 判成失败会让用户去点「取消」把可播文件删掉（本项目红线）；静默吞掉则用户
+	// 永远不知道时长信息缺失。折中：文件保留、完成态照旧，只把这件事写进 stage（R4）。
+	// ⚠️ 不能写 errorMsg —— 前端 badge 先判 t.error（web/index.html 的 badge），
+	// 会把已完成的记录显示成「失败」，还会被算进"失败"统计。
+	backfillNote := ""
 	if jerr := job.backfill(partPath); jerr != nil {
 		fmt.Printf("[disk] WARN: 容器收尾处理失败: %v\n", jerr)
+		backfillNote = "时长信息缺失"
 	}
 	if err := moveFile(partPath, finalPath); err != nil {
 		return fmt.Errorf("保存文件失败: %w", err)
@@ -634,13 +669,18 @@ func finalizeRecording(te *taskEntry, job *dlJob, partPath string, cause finaliz
 	} else {
 		te.st.segDone = job.segFlushedNow()
 	}
+	// 容器收尾降级说明（R4）：拼进 stage，**不碰 errorMsg**（见 backfillNote 的说明）。
+	bfSuffix := ""
+	if backfillNote != "" {
+		bfSuffix = " · " + backfillNote
+	}
 	if interrupted {
-		te.st.stage = "录制中断 · 已保存"
+		te.st.stage = "录制中断 · 已保存" + bfSuffix
 		te.st.errorMsg = note
 	} else if cause.outcome == finalizeStopped {
 		// 用户主动点「停止」：这是"录到这里收工"，不是故障。stage 写清是谁结束的，
 		// errorMsg 必须留空——否则前端的"失败"统计会把它算进去（学徒 2026-09-15 定）。
-		te.st.stage = "已保存（用户停止录制）"
+		te.st.stage = "已保存（用户停止录制）" + bfSuffix
 		te.st.errorMsg = ""
 	} else {
 		// 正常结束。note 在这里是"结束方式"的说明（见 finalizeCause.note）：直播会给
@@ -650,6 +690,7 @@ func finalizeRecording(te *taskEntry, job *dlJob, partPath string, cause finaliz
 		if note != "" {
 			te.st.stage = "已保存（" + note + "）"
 		}
+		te.st.stage += bfSuffix
 		te.st.errorMsg = ""
 	}
 	// interrupted 标记决定前端把这条记录显示成「已中断」还是「已完成」

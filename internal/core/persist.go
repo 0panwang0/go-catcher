@@ -233,6 +233,14 @@ func (r *Runtime) saveState() {
 	r.stateSaveMu.Lock()
 	defer r.stateSaveMu.Unlock()
 
+	// 进程级拦截：CLI 的 Runtime 没有持久化语义（从不 loadState），写下去只会把
+	// 空表覆盖进与 GUI 共用的状态文件（R1）。这与下面的"载入失败"是两回事 ——
+	// 那条管"这次载入失败"，这条管"本 Runtime 永远不写"。放在唯一写盘咽喉上，
+	// 所以任何到达 saveState 的路径（debounce goroutine / Engine.Stop）都被拦下。
+	if r.persistDisabled {
+		return
+	}
+
 	if r.stateOverwriteBlocked {
 		// 载入时一个任务都没恢复出来（文件损坏 / 读不出 / 版本不认识），此刻的
 		// tasks 是空表。写下去 = 拿空表覆盖用户仅有的那份文件。宁可这次不落盘

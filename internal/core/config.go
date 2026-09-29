@@ -6,10 +6,12 @@ package core
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/0panwang0/go-catcher/internal/platform"
 )
@@ -215,10 +217,22 @@ func (r *Runtime) getConfigPath() string {
 // loadConfig 启动时读取配置并应用（校验范围，越界/损坏回退默认）。
 func (r *Runtime) loadConfig() {
 	c := defaultConfig()
-	data, err := os.ReadFile(r.getConfigPath())
+	p := r.getConfigPath()
+	data, err := os.ReadFile(p)
+	// 读不出来（被占用 / 权限不足 / 盘拔了）：**不能当成"没有配置"** —— 随后
+	// saveConfigLocked（ensureAPIToken 触发）会把默认值写回、**覆盖用户原文件**
+	// （含代理设置）。先留档（R7），留档成败都会经 persistHealth 上报 /status。
+	if err != nil && !os.IsNotExist(err) {
+		r.quarantineUnreadableConfig(p, fmt.Sprintf("读取失败: %v", err))
+	}
 	if err == nil {
 		var fileC appConfig
-		if json.Unmarshal(data, &fileC) == nil {
+		if uerr := json.Unmarshal(data, &fileC); uerr != nil {
+			// 内容确实坏了（截断 / 非法 JSON）：留档后从默认值开始 —— 留档那份
+			// 还能人工抢救，"被默认值覆盖掉"就没有任何余地了（R7）。
+			// ⚠️ 留档必须发生在"回退默认"之前，晚了原文件已被盖掉。
+			r.quarantineUnreadableConfig(p, fmt.Sprintf("解析失败: %v", uerr))
+		} else {
 			// 键缺失 ≠ 用户填了 0（A-7）。用一份原始键表把两种情况分开：
 			//   · 键不在（旧配置 / 手改删掉了这一项）⇒ 回退默认，与下面
 			//     Port / uiView / proxy 的处置一致；
@@ -251,6 +265,25 @@ func (r *Runtime) loadConfig() {
 	}
 	r.cfg = c
 	r.applyConfigLocked() // 无论默认还是读盘，都写入限制器与运行时变量
+}
+
+// quarantineUnreadableConfig 把读不出 / 坏掉的配置文件改名留档（R7），并把原因
+// 记进 persistHealth 让 /status 可见（GUI 是 windowsgui 子系统，Printf 等于没写）。
+//
+// 为什么要留档而不是只"回退默认"：回退默认本身是既有行为（TestLoadConfigFallsBack
+// 钉着），但随后 saveConfigLocked 会把默认值写回同一个路径 —— 那是**静默销毁**
+// 用户改过的设置。留一份带时间戳的 .bak，至少还能人工恢复。
+//
+// 留档失败不影响继续运行（最坏：这次用默认值且原文件仍在，下次启动会再报一次）。
+func (r *Runtime) quarantineUnreadableConfig(p, why string) {
+	bak := fmt.Sprintf("%s.%s.bak", p, time.Now().Format("20060102-150405"))
+	if err := os.Rename(p, bak); err != nil {
+		r.recordPersistResult(fmt.Errorf("配置%s，且留档失败: %v（本次用默认配置，原文件未动）", why, err))
+		fmt.Printf("[config] 配置%s，且留档失败: %v（本次用默认配置）\n", why, err)
+		return
+	}
+	r.recordPersistResult(fmt.Errorf("配置文件%s，已留档为 %s（本次用默认配置）", why, filepath.Base(bak)))
+	fmt.Printf("[config] 配置文件%s，已留档为 %s（本次从默认配置开始）\n", why, filepath.Base(bak))
 }
 
 // clamp 把 v 夹取到 [lo,hi]，并报告原值是否本来就合法：

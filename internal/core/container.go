@@ -365,6 +365,52 @@ func validateOutput(c *Container, path string, info ProbeInfo) error {
 	return c.Validate(head, mid, info)
 }
 
+// directHeadProbeBytes 直链产物校验只看开头这么多个字节（够认出错误页特征）。
+const directHeadProbeBytes = 512
+
+// validateDirectMedia 直链整体下载（MP4 等）产物的**拒绝式**轻量校验（R8）。
+//
+// 为什么直链需要它：HLS 路径有三层 validateOutput（探测期守卫 / 收尾抽样 / 同步
+// 字节），而直链既没有容器探测也没有抽样校验 —— Content-Type 一撒谎（把 CDN 的
+// 403/404/502 错误页当视频发回来），一张 HTML 就会被当作成品保存、界面显示成功，
+// 正是本项目的头号缺陷形态。
+//
+// 为什么是拒绝式而不是"必须命中已知媒体魔数"：直链的容器种类无法预知
+// （MP4 / MKV / WebM / FLV / 伪装成 application/octet-stream 的流…），写成白名单
+// 会把合法直链误判为失败 —— 那又开了"把好产物报成坏的"这个新形态（用户会去点
+// 「取消」，把可播文件删掉）。所以只封堵**明显不是媒体**的形态：
+//
+//   - 0 字节：任何媒体文件都不可能为空；
+//   - 以 `<` 开头（跳过 UTF-8 BOM 与前导空白）：HTML/XML；
+//   - 以 `{` / `[` 开头：JSON 错误体。
+//
+// 其余一律放行 —— 这里宁可"放过可疑"，也不"误杀合法"。
+//
+// ⚠️ 判据只能取这些**开头**特征：绝不能顺手把"首字节是 NUL"当异常 —— MP4 的
+// 第一个 box 长度大端序就是 `00 00 00 20`，首字节本来就是 0x00，那样会误杀所有 MP4。
+func validateDirectMedia(path string) error {
+	head, err := readHead(path, directHeadProbeBytes)
+	if err != nil {
+		return fmt.Errorf("直链产物校验：读取失败: %w", err)
+	}
+	if len(head) == 0 {
+		return fmt.Errorf("直链产物为空（0 字节），不是有效的媒体文件")
+	}
+	// 跳过 UTF-8 BOM 与前导空白：错误页常以换行开头
+	head = bytes.TrimPrefix(head, []byte{0xEF, 0xBB, 0xBF})
+	head = bytes.TrimLeft(head, " \t\r\n")
+	if len(head) == 0 {
+		return fmt.Errorf("直链产物开头全是空白字符，不是有效的媒体文件")
+	}
+	switch head[0] {
+	case '<':
+		return fmt.Errorf("直链产物以 '<' 开头，疑似 HTML/XML 错误页（下载失败却被当成媒体保存）")
+	case '{', '[':
+		return fmt.Errorf("直链产物以 %q 开头，疑似 JSON 错误体（下载失败却被当成媒体保存）", head[0])
+	}
+	return nil
+}
+
 // detectContainer 根据首个分片的开头字节 + 播放列表元信息识别容器。
 //
 // 规则：

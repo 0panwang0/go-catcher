@@ -124,6 +124,68 @@ func TestSaveStateHoldsMutex(t *testing.T) {
 	if !strings.Contains(body, "stateOverwriteBlocked") {
 		t.Error("saveState 没有检查 stateOverwriteBlocked —— 载入失败后会把历史覆盖成空表")
 	}
+	// R1：CLI 的 Runtime（persistDisabled）从不 loadState，落盘只会把空表写进与
+	// GUI 共用的状态文件。这条钉住 saveState 仍留着那道进程级拦截。
+	if !strings.Contains(body, "persistDisabled") {
+		t.Error("saveState 没有检查 persistDisabled —— CLI 落盘会把 GUI 历史覆盖成空表（R1）")
+	}
+}
+
+// TestRunCLIDisablesStatePersist（R1 结构守卫）：
+// RunCLI 的一次性 Runtime 必须置 persistDisabled —— 它从不 loadState，一旦落盘
+// 就是把空表覆盖 GUI 的历史。行为用例（下一条）只证明"置位后不写"，这条钉住
+// **CLI 真的置了位**：有人删掉那行赋值，行为用例照样全绿。
+func TestRunCLIDisablesStatePersist(t *testing.T) {
+	body := strings.Join(sourceFuncBody(t, "cli.go", "func RunCLI(o CLIOptions) int"), "\n")
+	if !strings.Contains(body, "persistDisabled") {
+		t.Error("RunCLI 没有置 persistDisabled —— CLI 会落盘空表覆盖 GUI 的历史（R1）")
+	}
+}
+
+// TestPersistDisabledSuppressesStateWrite（R1 行为，成对）：
+// 前半：置了 persistDisabled 的 Runtime 绝不写状态文件（否则空表覆盖 GUI 历史）；
+// 后半：未置位的 Runtime 照常落盘 —— 少了后半条，"永不写"就成了一个无法区分的效果
+// （把 saveState 整个删掉也能让前半条绿）。
+func TestPersistDisabledSuppressesStateWrite(t *testing.T) {
+	orig := []byte(`{"version":1,"tasks":[{"id":"t1","done":true,"filename":"a.ts"}]}`)
+	newTask := func(rt *Runtime) {
+		rt.tasks["tNEW"] = &taskEntry{rt: rt, st: taskState{id: "tNEW", done: true, filename: "new.ts", stage: "已保存"}}
+	}
+
+	t.Run("CLI 的 Runtime 不落盘", func(t *testing.T) {
+		p := saveRestoreState(t)
+		if err := os.WriteFile(p, orig, 0644); err != nil {
+			t.Fatal(err)
+		}
+		// 与 RunCLI 同款：一次性 Runtime + statePath 覆盖 + persistDisabled。
+		rt := newRuntime()
+		rt.statePath = p
+		rt.persistDisabled = true
+		newTask(rt)
+		rt.saveState()
+
+		got, err := os.ReadFile(p)
+		if err != nil || !bytes.Equal(got, orig) {
+			t.Fatalf("persistDisabled 的 Runtime 仍写了状态文件（GUI 历史会被空表覆盖）: err=%v content=%s", err, got)
+		}
+	})
+
+	t.Run("普通 Runtime 照常落盘", func(t *testing.T) {
+		p := saveRestoreState(t)
+		rt := newRuntime()
+		rt.statePath = p
+		newTask(rt)
+		rt.saveState()
+
+		data, err := os.ReadFile(p)
+		if err != nil {
+			t.Fatalf("普通 Runtime 应能落盘: %v", err)
+		}
+		var sf stateFile
+		if err := json.Unmarshal(data, &sf); err != nil || len(sf.Tasks) != 1 {
+			t.Fatalf("落盘内容不合法: err=%v content=%s", err, data)
+		}
+	})
 }
 
 // TestSaveStateConcurrentStaysValid（A-2 行为）：

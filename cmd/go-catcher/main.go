@@ -27,10 +27,18 @@ import (
 func main() {
 	// 必须先解析参数再决定挂不挂控制台：原生消息宿主用 stdin/stdout 走二进制帧
 	// 协议，而 AttachParentConsole 会把 os.Stdout 换成 CONOUT$——一挂就毁掉那条通道。
-	opts := core.ParseCLI(os.Args[1:])
+	// ParseCLI 用 ContinueOnError（不再自己 os.Exit，见其注释）：解析失败的错误先留着，
+	// 等控制台挂好再报——否则那句报错会落进尚不存在的 stderr，用 start / 快捷方式起进程
+	// （句柄未继承）时用户只看到窗口"闪一下"，错误与用法全丢（R10）。
+	opts, perr := core.ParseCLI(os.Args[1:])
 	if len(os.Args) > 1 && !opts.NativeHostMode {
-		// 带参数启动的都不是 GUI 路径：先把标准输出挂回父终端（flag 报错、CLI 进度都要可见）。
+		// 带参数启动的都不是 GUI 路径：先把标准输出挂回父终端（解析报错、CLI 进度都要可见）。
 		platform.AttachParentConsole()
+	}
+	if perr != nil {
+		fmt.Fprintf(os.Stderr, "参数解析失败: %v\n", perr)
+		core.PrintUsage()
+		os.Exit(2)
 	}
 
 	switch {

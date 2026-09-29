@@ -79,7 +79,13 @@ type Runtime struct {
 	// 载入时"文件读不出 / 解析不了 / 版本不认识"会置它：那些情况下 r.tasks 是
 	// "一个都没恢复"的空表，照常落盘就等于**把用户仅有的那份历史覆盖成空**（A-1）。
 	stateOverwriteBlocked bool
-	persistHealth         struct {
+	// persistDisabled 置位后本 Runtime **从不**写状态文件。CLI 的 RunCLI 用它
+	// （见 cli.go 的 RunCLI）：CLI 的一次性 Runtime 从不 loadState，而它仍会经
+	// markDirty → saveState 落盘 —— 落下去的就是一份**空表**，会把 exe 同目录里
+	// GUI 的历史整个覆盖掉（R1）。与 stateOverwriteBlocked 的区别：那条是"这次
+	// 载入失败，本轮别写"，这条是"本 Runtime 根本没有持久化语义，永远别写"。
+	persistDisabled bool
+	persistHealth   struct {
 		mu      sync.Mutex
 		lastErr string
 		lastOK  time.Time
