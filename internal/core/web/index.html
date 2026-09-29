@@ -109,9 +109,23 @@
   button.ghost{background:transparent;border:1px solid var(--line);color:var(--muted)}
   button.danger{background:rgba(239,68,68,.16);border:1px solid rgba(239,68,68,.5);color:#fca5a5}
   .empty{color:var(--muted);text-align:center;padding:50px 0;font-size:14px;background:var(--card);border:1px dashed var(--line);border-radius:14px}
-  .foot{color:#64748b;font-size:11.5px;margin-top:8px;display:flex;justify-content:space-between;flex-wrap:wrap;gap:6px}
-  #errline{color:var(--err)}
-  /* 操作反馈 toast：独立于 errline，避免被 poll 清掉 */
+  /* 页面级告警横幅：配置/任务记录损坏已留档、落盘失败、连不上本机服务都走这里。
+     每条一张卡片，与 .stats / .card 同一套圆角语言；左侧 3px 竖色条按类型着色
+     （与 .rowstrip 用竖条表达状态是同一做法），不再把两句话拼成一行细红字。 */
+  #banners:empty{display:none}
+  .bn{position:relative;display:flex;align-items:flex-start;gap:10px;overflow:hidden;
+      background:var(--card);border:1px solid var(--line);border-radius:12px;
+      padding:11px 14px;margin-bottom:8px;font-size:12.5px;line-height:1.6}
+  .bn::before{content:'';position:absolute;left:0;top:0;bottom:0;width:3px;background:var(--muted)}
+  .bn .ic{flex:none;font-size:14px;line-height:1.4}
+  .bn .bd{flex:1;min-width:0;word-break:break-word;overflow-wrap:anywhere}
+  .bn.warn{border-color:rgba(245,158,11,.42);background:rgba(245,158,11,.10)}
+  .bn.warn::before{background:var(--warn)}
+  .bn.warn .ic{color:#fcd34d}
+  .bn.err{border-color:rgba(239,68,68,.42);background:rgba(239,68,68,.10)}
+  .bn.err::before{background:var(--err)}
+  .bn.err .ic{color:#fca5a5}
+  /* 操作反馈 toast：与 #banners 横幅分工不同 —— 这个只说"你刚点的那一下成了没"，5s 自散 */
   #toast{position:fixed;left:50%;bottom:22px;transform:translateX(-50%);z-index:999;
          background:var(--card);border:1px solid var(--line);border-radius:10px;
          padding:9px 16px;font-size:13px;box-shadow:0 6px 24px rgba(0,0,0,.4);
@@ -169,10 +183,9 @@
 <div class="wrap">
   <div class="hd"><span class="dot" id="dot"></span><h1>GoCatcher 下载监控</h1></div>
 
+  <div id="banners"></div>
   <div class="stats" id="stats"></div>
   <div id="list"></div>
-
-  <div class="foot"><span id="errline"></span></div>
 </div>
 <div id="toast"></div>
 <button id="setbtn" title="设置">⚙</button>
@@ -205,10 +218,11 @@ async function poll() {
     //    后端刻意不随成功落盘清它，这里**原样显示后端拼好的整句** —— 不许套用下面那句
     //    "写盘失败"文案：那会把"你的设置被重置了"说成"进度可能回退"，真正后果一字不提。
     //  • error：最近一次落盘失败，后果确实就是进度可能回退。
+    // 两条各占一张横幅、按类型分色（warn / err），不再用全角竖线拼成一行。
     var pmsg = [];
-    if (d.persist && d.persist.notice) pmsg.push(d.persist.notice);
-    if (d.persist && d.persist.ok === false) pmsg.push('断点状态写入磁盘失败：' + (d.persist.error || '未知原因') + '（恢复下载后进度可能回退）');
-    setErr(pmsg.join('　｜　'));
+    if (d.persist && d.persist.notice) pmsg.push({kind:'warn', text:d.persist.notice});
+    if (d.persist && d.persist.ok === false) pmsg.push({kind:'err', text:'断点状态写入磁盘失败：' + (d.persist.error || '未知原因') + '（恢复下载后进度可能回退）'});
+    setBanners(pmsg);
     updateStats();
     const sig = tasks.map(t=>t.id+t.stage+t.segDone+t.pct+t.paused+t.canceled+t.done+t.fileMissing+(t.error||'')+(t.live&&t.running?Math.floor((Date.now()-(t.started?new Date(t.started).getTime():Date.now()))/1000):'')).join('|');
     if (sig !== lastSig && Date.now() - lastAction > 1200) {
@@ -216,11 +230,26 @@ async function poll() {
       render();
     }
   } catch(e) {
-    setErr('无法连接本地服务，请确认 go-catcher.exe 已启动');
+    setBanners([{kind:'err', text:'无法连接本地服务，请确认 go-catcher.exe 已启动'}]);
   }
 }
 function el(id){return document.getElementById(id)}
-function setErr(m){el('errline').textContent=m||''}
+// 页面级告警横幅：list = [{kind:'warn'|'err', text}]，空数组（或 null）表示没有告警。
+// 内容没变就不重建 DOM —— poll 每 900ms 跑一轮，否则每轮都把节点重写一次。
+// 文本一律 esc() 后拼进模板（文案里带文件名/路径，是不可信输入）。
+var bannerSig = null;
+function setBanners(list){
+  var sig = JSON.stringify(list || []);
+  if (sig === bannerSig) return;
+  bannerSig = sig;
+  var box = el('banners');
+  if (!list || !list.length){ box.innerHTML = ''; return; }
+  box.innerHTML = list.map(function(b){
+    var k = b.kind === 'warn' ? 'warn' : 'err';
+    return '<div class="bn ' + k + '"><span class="ic">' + (k === 'warn' ? '⚠' : '⛔') + '</span>'
+         + '<span class="bd">' + esc(b.text) + '</span></div>';
+  }).join('');
+}
 function esc(s){ return String(s==null?'':s).replace(/[&<>"]/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c];}); }
 
 function updateStats(){
@@ -682,7 +711,8 @@ function render(){
 
 // —— 操作 ——
 // 反馈用独立 toast（固定悬浮，停留 5s，不随 poll 清除）。
-// 旧实现把错误写进 errline，会被 poll() 每 900ms setErr('') 秒清，用户根本看不到报错。
+// 页面级告警走 #banners 横幅，两者分工不同：横幅说"这台机器的状态出了什么事"
+// （配置/记录损坏、落盘失败、连不上服务），toast 说"你刚点的那一下成了没"。
 var toastTimer=null;
 function toast(msg,isErr){
   var t=el('toast');
