@@ -52,6 +52,12 @@
   }
 
   let currentBtn = null;
+  // btnDismissed 用户点过按钮上的 ✕：本页（本次文档会话）不再自动弹出下载按钮。
+  //
+  // 刻意**不落盘、不进 storage**：这是"这次页面上我不想看见它"的临时意愿，刷新页面即复位 ——
+  // 跨会话记住它反而会让用户下次找不到按钮（"按钮去哪了"比"按钮碍事"更难排查）。
+  // 作用范围是本 frame：嵌入式播放器的按钮由那个 frame 自己的这份变量管，两边各关各的。
+  let btnDismissed = false;
   // currentTarget 悬停目标：{el, src, pageUrl}。
   //   video 场景：本 frame 内的 video 元素，pageUrl = location.href
   //   iframe 场景：跨域播放器 iframe（video 在 frame 内，本 frame 拿不到），
@@ -276,6 +282,10 @@
   //           另外把 src 里 ?url= 编码的目标地址作为 embedUrl 传下去，供后台
   //           精确命中（解析页跳转到别的主机播放时，同站匹配会全部落空）
   async function showButtonIfSniffed(target) {
+    // 用户已经点过 ✕：本页后续一律不弹（悬停 / 定时复查 / 在途回调都走这里进来）。
+    // 挡在**最前面**：晚到的 async 检查回来时也要被这条挡住，不能靠"hideButton 把
+    // 按钮删了"就算完 —— 它只是删了当前那个元素，下一次悬停照样会建一个新的。
+    if (btnDismissed) return;
     if (currentTarget && currentTarget.el === target.el) return;
     if (gatePending === target.el) return; // 同一目标的检查在途
     if (deniedEl === target.el && Date.now() - deniedAt < SRC_RECHECK_MS) return;
@@ -301,6 +311,12 @@
     }
     if (gatePending === target.el) gatePending = null;
     if (token !== gateToken) return; // 期间鼠标已移到别的目标
+    // 期间用户点了 ✕：一样不再显示。
+    // 与入口那条分工：入口挡的是"进函数时就已经关掉"（连消息都不发），这条挡的是
+    // "检查已经发出去、等待期间才关掉"。上面 token 那条判据其实**也**能挡住这一档
+    // （dismissButton 会前移 token），但 token 管的是"鼠标移到别处"——让它兼管用户意图
+    // 是巧合而不是设计，所以在这里把意图显式写一遍。
+    if (btnDismissed) return;
     if (found) {
       dbg("命中链接，显示按钮", target.pageUrl);
       showButton(target);
@@ -337,7 +353,14 @@
 
     const btn = document.createElement("div");
     btn.className = "m3u8-catcher-btn";
-    btn.innerHTML = `<span class="ic">⬇</span><span class="txt">下载该视频</span>`;
+    // ✕ 常驻在按钮右侧、用一条竖线隔开（学徒 2026-09-30 拍的形态）：
+    // 常驻才看得见"这玩意能关"，宽度恒定不会因为 hover 抖一下。
+    // 两侧负 margin 与 padding 等量抵消：视觉位置与占位宽度都跟不加 padding 时一模一样，
+    // 但命中区从 13×13 撑到 23×21 —— 13px 的 ✕ 实在太难点中（按钮高才 32px）。
+    btn.innerHTML =
+      `<span class="ic">⬇</span><span class="txt">下载该视频</span>` +
+      `<span class="sep" style="width:1px;height:13px;background:rgba(255,255,255,.4);margin:0 3px 0 4px"></span>` +
+      `<span class="cls" style="font-size:13px;opacity:.9;line-height:1;padding:4px 5px;margin:-4px -5px">✕</span>`;
     Object.assign(btn.style, {
       position: "fixed",
       zIndex: "2147483647",
@@ -368,6 +391,17 @@
       await onDownloadClick(target);
     });
 
+    // ✕ 是按钮的子节点：不把事件拦在这里，它会冒泡到上面那个 click，
+    // 变成"点关闭反而开始下载"。必须在 ✕ 自己的监听里 stopPropagation。
+    const closeEl = btn.querySelector(".cls");
+    if (closeEl) {
+      closeEl.addEventListener("click", (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        dismissButton();
+      });
+    }
+
     document.body.appendChild(btn);
     currentBtn = btn;
     repositionButton();
@@ -384,6 +418,14 @@
     }
     currentTarget = null;
     lastRect = null; // 换了目标就从零开始，别拿上一个视频的矩形撑按钮区
+  }
+
+  // dismissButton 用户点了按钮上的 ✕：撤掉按钮，并让本页**后续**也不再自动弹。
+  // 只 hideButton 是不够的 —— 那只是删掉当前这个元素，下一次悬停（或 700ms 一次的
+  // 定时复查）照样把新按钮建出来。抑制开关在 showButtonIfSniffed 的最前面拦。
+  function dismissButton() {
+    btnDismissed = true;
+    hideButton();
   }
 
   function repositionButton() {
@@ -1670,6 +1712,9 @@
         lastPointer.x = x;
         lastPointer.y = y;
       },
+      // 按钮上的 ✕：真跑断言用（tests/buttondismiss.test.js 施加"用户点了关闭"）
+      dismissButton,
+      btnDismissedNow: () => btnDismissed,
       panelShell,
       renderConfirmPanel,
       showPanel,

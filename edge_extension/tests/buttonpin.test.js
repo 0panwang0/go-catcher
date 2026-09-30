@@ -38,6 +38,9 @@ function makeNode() {
     removeEventListener() {},
     setAttribute() {},
     contains: () => false,
+    // 桩里没有真解析器：本文件不碰按钮上的 ✕，返回 null 即可
+    // （showButton 对它是 `if (closeEl)` 的用法，null 走得通）。
+    querySelector: () => null,
     getBoundingClientRect: () => ({ left: 0, top: 0, right: 0, bottom: 0, width: 0, height: 0 }),
   };
   Object.defineProperty(node, "innerHTML", {
