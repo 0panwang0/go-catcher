@@ -881,14 +881,27 @@
     document.body.appendChild(panel);
   }
 
-  function panelShell(title, bodyHTML) {
+  // 面板外壳：卡片 = 标题栏 + **自己会滚的主体** + **钉底的 footer**。
+  //
+  // 为什么主体必须自己滚（2026-09-30 学徒实测报出）：卡片封顶 max-height:85vh 且
+  // overflow:hidden，主体原先直接当 flex 子项 ⇒ 内容一旦超过 85vh 就被**静默裁掉**，
+  // 而且当时没有任何滚动容器 —— 滚都滚不到。浏览器窗口一变小（内容 554px 时窗口高
+  // ≤652 就触发），「确认下载 / 取消」整行凭空消失，用户只能看到半个面板。
+  //
+  // 所以：内容进滚动区，**所有"必须够得着"的按钮走第三个参数**（footer 是 flex:none
+  // 且排在滚动区之外），任何窗口高度下按钮都留在卡片里。窗口够大时滚动区不滚，
+  // 外观与从前只差按钮上面那条分隔线。
+  // ⚠️ min-height:0 不能省：flex 子项的 min-height 默认是 auto，缺了它滚动区不肯收缩，
+  // 照样把 footer 顶出卡片（真机上量过：去掉它等于没修）。
+  function panelShell(title, bodyHTML, footerHTML) {
     return `
       <div style="max-width:720px;width:90%;max-height:85vh;background:#fff;border-radius:8px;box-shadow:0 8px 32px rgba(0,0,0,0.35);display:flex;flex-direction:column;overflow:hidden;">
         <div style="display:flex;align-items:center;justify-content:space-between;padding:14px 18px;border-bottom:1px solid #e5e7eb;background:#f8f9fb;">
           <div style="font-size:16px;font-weight:700;color:#111;">${P.escapeHtml(title)}</div>
           <button id="m3u8-catcher-close" style="border:none;background:transparent;font-size:20px;color:#6b7280;cursor:pointer;line-height:1;">×</button>
         </div>
-        ${bodyHTML}
+        <div style="flex:1 1 auto;min-height:0;overflow-y:auto;">${bodyHTML}</div>
+        ${footerHTML || ""}
       </div>
     `;
   }
@@ -935,10 +948,12 @@
          <div style="padding:0 28px 20px;">
            <div style="background:#1f2937;color:#e5e7eb;padding:12px;border-radius:6px;font-family:Menlo,Consolas,monospace;font-size:12px;line-height:1.6;word-break:break-all;white-space:pre-wrap;" id="go-cmd-text">${P.escapeHtml(goCmd)}</div>
            <div style="margin-top:6px;color:#9ca3af;font-size:11.5px;line-height:1.5;">exe 路径由本地服务运行时自动检测；显示为裸文件名时，先打开一次 GoCatcher 客户端即可，或在扩展设置里手动配置。</div>
-           <div style="margin-top:10px;display:flex;gap:8px;align-items:center;">
-             <button id="copy-go-cmd" style="padding:6px 14px;font-size:13px;border:none;background:#3b82f6;color:#fff;border-radius:4px;cursor:pointer;font-weight:600;">复制命令</button>
-             <span id="copy-feedback" style="color:#22c55e;font-size:12px;display:none;">✓ 已复制到剪贴板</span>
-           </div>
+         </div>`,
+        // 命令越长面板越高（命令块自身无滚动上限）⇒ 「复制命令」同样钉底，
+        // 否则超长 URL 一进来按钮就被推出卡片，而它正是这块面板唯一的可用出口
+        `<div style="flex:none;padding:12px 28px;border-top:1px solid #e5e7eb;background:#fff;display:flex;gap:8px;align-items:center;">
+           <button id="copy-go-cmd" style="padding:6px 14px;font-size:13px;border:none;background:#3b82f6;color:#fff;border-radius:4px;cursor:pointer;font-weight:600;">复制命令</button>
+           <span id="copy-feedback" style="color:#22c55e;font-size:12px;display:none;">✓ 已复制到剪贴板</span>
          </div>`
       );
       const btn = panel.querySelector("#copy-go-cmd");
@@ -1165,15 +1180,15 @@
           <div style="margin-top:4px;font-size:11px;color:#9ca3af;">下载时可改名字 / 改位置</div>
         </div>
 
-        <div style="display:flex;gap:10px;">
-          <button id="confirm-cancel" style="flex:1;padding:11px;border:1px solid #d1d5db;background:#fff;border-radius:5px;cursor:pointer;font-size:14px;color:#374151;">取消</button>
-          <button id="confirm-go" style="flex:2;padding:11px;border:none;background:#3b82f6;color:#fff;border-radius:5px;cursor:pointer;font-size:14px;font-weight:600;">⬇ 确认下载</button>
-        </div>
-
         <div style="margin-top:14px;padding:10px 12px;background:#f0f9ff;border-radius:5px;font-size:12px;color:#0c4a6e;line-height:1.5;">
           💡 点击"确认下载"后会弹出 Windows"选择文件夹"框，选好后由本地 Go 程序直接下载并保存到该文件夹。<br>
           <span style="color:#0369a1;">首次使用需先打开一次 <code style="background:#fff;padding:1px 4px;border-radius:2px;">go-catcher.exe</code>（GoCatcher 客户端，打开即自动启动下载服务）。</span>
         </div>
+      </div>`,
+      // 操作按钮走 footer（钉底），不跟内容一起滚：窗口变小时它是**唯一**的出口，被裁掉就没法继续也没法退出
+      `<div style="flex:none;padding:12px 24px;border-top:1px solid #e5e7eb;background:#fff;display:flex;gap:10px;">
+        <button id="confirm-cancel" style="flex:1;padding:11px;border:1px solid #d1d5db;background:#fff;border-radius:5px;cursor:pointer;font-size:14px;color:#374151;">取消</button>
+        <button id="confirm-go" style="flex:2;padding:11px;border:none;background:#3b82f6;color:#fff;border-radius:5px;cursor:pointer;font-size:14px;font-weight:600;">⬇ 确认下载</button>
       </div>`
     );
 
@@ -1587,6 +1602,9 @@
   // 测试钩子：node 环境下（有 module、无扩展 API）把纯函数挂出去，供
   // tests/livecontrols.test.js 与 tests/contentparse.test.js 直接调用。
   // content script 里没有 module，整段不执行 —— 对线上行为零影响。
+  // panelShell / renderConfirmPanel / showPanel：tests/panellayout.test.js 要**真跑**
+  // 一遍面板渲染（喂最小 DOM 桩），断言"按钮在滚动区之外"——它守的是布局契约，
+  // 扫字符串比不出来（同一个 id 留在 body 里也能让字符串断言全绿）。
   if (typeof module !== "undefined" && module.exports) {
     module.exports.__ui = {
       controlButtons,
@@ -1599,6 +1617,9 @@
       // P3-3：hideButton 真跑断言用（token 必须前移，否则晚到的检查会把按钮画回）
       hideButton,
       gateTokenNow: () => gateToken,
+      panelShell,
+      renderConfirmPanel,
+      showPanel,
     };
   }
 
