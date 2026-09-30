@@ -63,6 +63,13 @@
   let gateToken = 0; // 悬停检查令牌：仅最新一次悬停的结果生效
   let gatePending = null; // 正在检查链接的目标元素
   let lastPointer = { x: -1, y: -1 }; // 最近一次指针位置（复查用）
+  // lastRect 目标的**最后已知矩形**。站点把播放器收走时（悬停预览小窗被销毁、MSE 重挂载、
+  // 元素被置为 display:none），实时矩形会塌成 0×0 或直接断连；按钮区若还去读实时矩形，
+  // 就会退化到 (0,0) 上的一个点，指针从视频移向按钮的那条缝里下一次 mouseover 就把按钮
+  // 判死 —— 学徒实测的「小窗视频，移过去就消失」正是这么来的：真机上按钮在 y=52 那一步
+  // 消失，而视频顶边在 56、按钮底边在 48，那就是中间那条 8px 的缝（复现探针
+  // `.workbuddy/tmp/mini_btn.mjs`）。有它撑着，用户走到一半站点把窗收了也还点得到。
+  let lastRect = null;
   let recheckTimer = null;
   let panel = null;
   let activeTaskId = null; // 多任务并发：本次下载的 server 任务 id，轮询用
@@ -168,9 +175,11 @@
 
   function onHover(e) {
     if (currentBtn && (e.target === currentBtn || currentBtn.contains(e.target))) return;
-    // 按钮位于目标外部上方：光标在「目标矩形向上扩展的条带」内时保持按钮，
-    // 否则鼠标一离开目标边界按钮就会消失，根本来不及点
-    if (inButtonZone(e.clientX, e.clientY)) return;
+    // 按钮位于目标外部上方：光标在「目标矩形 + 向上扩展的条带」内时保持按钮，
+    // 否则鼠标一离开目标边界按钮就会消失，根本来不及点。
+    // ⚠️ 判据里包含按钮自身的矩形（见 pointerInButtonZone）—— 站点在指针离开小窗时
+    // 把它收掉，光标此刻可能正好落在已经"没主"的按钮上，只看目标矩形就会把按钮判死。
+    if (pointerInButtonZone(e.clientX, e.clientY)) return;
     const target = findMediaTargetAtPoint(e.clientX, e.clientY);
     if (target) showButtonIfSniffed(target);
     else hideButton();
@@ -374,46 +383,81 @@
       currentBtn = null;
     }
     currentTarget = null;
+    lastRect = null; // 换了目标就从零开始，别拿上一个视频的矩形撑按钮区
   }
 
   function repositionButton() {
     if (!currentBtn || !currentTarget) return;
-    // 目标被页面重建（播放器重挂载）后引用会变成游离节点，矩形全为 0：
-    // 先收起，交给 mediaRecheck 按坐标重新定位、重新显示
-    if (!currentTarget.el.isConnected) {
-      hideButton();
+    // 目标被站点收走（悬停小窗关闭 / 播放器重挂载 / 元素被藏）⇒ 实时矩形不可用。
+    // **指针已经在按钮上、或正冲着按钮来时钉住不动**（位置停在上一次算好的地方）：
+    // 站点收小窗多半正是被"指针离开它"触发的，而用户此刻正是在往按钮上伸手；
+    // 链接早就嗅探到了（下载读的是嗅探记录，不依赖这个元素还在），按钮留着才点得到。
+    // 指针不在按钮区里时照旧收起 —— 别把这条读成"目标没了也不收"。
+    const live = liveTargetRect();
+    if (!live) {
+      if (!pointerInButtonZone()) hideButton();
       return;
     }
-    const rect = currentTarget.el.getBoundingClientRect();
-    if (rect.width === 0 || rect.height === 0) {
-      hideButton();
-      return;
-    }
+    lastRect = live;
     // 首选：视频左上角正上方（视频外部），不遮挡画面
     const btnH = currentBtn.offsetHeight || 0;
-    const outsideTop = Math.max(rect.top, 0) - btnH - BTN_GAP;
+    const outsideTop = Math.max(live.top, 0) - btnH - BTN_GAP;
     if (outsideTop >= 0) {
       currentBtn.style.top = `${outsideTop}px`;
-      currentBtn.style.left = `${Math.max(rect.left, 0)}px`;
+      currentBtn.style.left = `${Math.max(live.left, 0)}px`;
       return;
     }
     // 上方空间不足（视频贴近视口顶端）：回退到视频内部左上角
-    currentBtn.style.top = `${Math.max(rect.top, 0) + BTN_GAP}px`;
-    currentBtn.style.left = `${Math.max(rect.left, 0) + BTN_GAP}px`;
+    currentBtn.style.top = `${Math.max(live.top, 0) + BTN_GAP}px`;
+    currentBtn.style.left = `${Math.max(live.left, 0) + BTN_GAP}px`;
   }
 
-  // inButtonZone 光标是否处于「目标矩形向上扩展一个按钮高度的条带」内。
-  // 按钮放在目标外部上方后，这是鼠标从目标移到按钮的必经之路。
-  function inButtonZone(x, y) {
-    if (!currentBtn || !currentTarget) return false;
-    const rect = currentTarget.el.getBoundingClientRect();
-    const btnH = currentBtn.offsetHeight || 0;
+  // ---- 按钮定位与「指针正朝按钮去」的判定 ----
+  // pinHold 纯函数：指针在按钮上、或在「目标矩形向上扩展一个按钮高度的条带」内。
+  // 输入全是普通数值/矩形对象，不碰 DOM，好逐例说清（tests/buttonpin.test.js）。
+  function pinHold(px, py, btnBox, targetBox, btnH) {
+    if (!btnBox) return false;
+    if (px >= btnBox.left && px <= btnBox.right && py >= btnBox.top && py <= btnBox.bottom) {
+      return true;
+    }
+    if (!targetBox) return false;
     return (
-      x >= rect.left - BTN_GAP &&
-      x <= rect.right + BTN_GAP &&
-      y >= rect.top - btnH - BTN_GAP * 2 &&
-      y <= rect.bottom + BTN_GAP
+      px >= targetBox.left - BTN_GAP &&
+      px <= targetBox.right + BTN_GAP &&
+      py >= targetBox.top - btnH - BTN_GAP * 2 &&
+      py <= targetBox.bottom + BTN_GAP
     );
+  }
+
+  function boxOf(el) {
+    const r = el.getBoundingClientRect();
+    return { left: r.left, right: r.right, top: r.top, bottom: r.bottom, width: r.width, height: r.height };
+  }
+
+  // liveTargetRect 目标的实时矩形；元素断连、或已被站点收成 0×0 时返回 null
+  // （＝"实时矩形不可用"，而不是"目标在原点"）。
+  function liveTargetRect() {
+    if (!currentTarget || !currentTarget.el || !currentTarget.el.isConnected) return null;
+    const r = currentTarget.el.getBoundingClientRect();
+    if (r.width <= 0 || r.height <= 0) return null;
+    return { left: r.left, right: r.right, top: r.top, bottom: r.bottom, width: r.width, height: r.height };
+  }
+
+  // targetRect 按钮定位与按钮区共用的矩形：实时优先，实时不可用就退回最后已知。
+  // ⚠️ 这处**必须**保留 lastRect 兜底，别再改回只看实时矩形（成因见 lastRect 的注释）。
+  function targetRect() {
+    return liveTargetRect() || lastRect;
+  }
+
+  // pointerInButtonZone 指针是否"正冲着按钮"：在按钮上，或在从目标到按钮的必经条带里
+  // （条带同时覆盖目标矩形本身）。判据用坐标而不是 hover 状态：站点把小窗收掉之后
+  // 不会再有点向我们的 mouseover，那时候只有坐标还靠得住。
+  function pointerInButtonZone(px, py) {
+    if (!currentBtn) return false;
+    const x = typeof px === "number" ? px : lastPointer.x;
+    const y = typeof py === "number" ? py : lastPointer.y;
+    if (x < 0 || y < 0) return false;
+    return pinHold(x, y, boxOf(currentBtn), targetRect(), currentBtn.offsetHeight || 0);
   }
 
   window.addEventListener("scroll", repositionButton, true);
@@ -1617,6 +1661,15 @@
       // P3-3：hideButton 真跑断言用（token 必须前移，否则晚到的检查会把按钮画回）
       hideButton,
       gateTokenNow: () => gateToken,
+      // 悬停按钮的保命逻辑：真跑断言用（tests/buttonpin.test.js 施加"站点收走小窗"）
+      pinHold,
+      targetRect,
+      showButtonIfSniffed,
+      repositionButton,
+      setPointer: (x, y) => {
+        lastPointer.x = x;
+        lastPointer.y = y;
+      },
       panelShell,
       renderConfirmPanel,
       showPanel,
