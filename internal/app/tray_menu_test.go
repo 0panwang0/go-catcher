@@ -1,4 +1,4 @@
-// 托盘菜单只留「显示主窗口」「退出客户端」两项（需求单 v0.6.0 特性 1）。
+// 托盘菜单只留「显示主窗口」「退出客户端」两项（需求单 v0.5.1 特性 1）。
 //
 // 守的是"入口消失"这件事，不是"少了两行"：服务启停与"在浏览器打开监控"两个入口去掉后，
 // 菜单里复活、或换个地方长出来，都要红。
@@ -74,7 +74,7 @@ func TestTrayMenuHasExactlyTwoItems(t *testing.T) {
 	sort.Strings(got)
 	sort.Strings(want)
 	if strings.Join(got, "|") != strings.Join(want, "|") {
-		t.Fatalf("托盘菜单项 %q want %q —— 增删菜单项要同步需求单（v0.6.0 特性 1）", got, want)
+		t.Fatalf("托盘菜单项 %q want %q —— 增删菜单项要同步需求单（v0.5.1 特性 1）", got, want)
 	}
 }
 
@@ -89,7 +89,7 @@ func TestServiceToggleEntryAbolishedInAppPackage(t *testing.T) {
 		src := stripLineComments(string(b))
 		for _, w := range bannedEntries {
 			if strings.Contains(src, w) {
-				t.Errorf("%s 里出现了已废弃的入口文案 %q —— 该入口已删除（v0.6.0 特性 1）", f, w)
+				t.Errorf("%s 里出现了已废弃的入口文案 %q —— 该入口已删除（v0.5.1 特性 1）", f, w)
 			}
 		}
 	}

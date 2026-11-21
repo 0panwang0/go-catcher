@@ -1,4 +1,4 @@
-// 设置页「改端口生效方式」的定点回归（需求单 v0.6.0 特性 1）。
+// 设置页「改端口生效方式」的定点回归（需求单 v0.5.1 特性 1）。
 //
 // 背景：托盘菜单里的「启动 / 停止服务」被去掉后，端口改动的生效方式只剩"重启客户端"。
 // 设置页原来两处文案都写着"托盘右键切换一次"——指向一个不再存在的操作，用户照做只会扑空。
@@ -45,7 +45,7 @@ func TestNoServiceToggleEntryInWebPages(t *testing.T) {
 	} {
 		for _, w := range abolishedTrayEntries {
 			if strings.Contains(c.page, w) {
-				t.Errorf("%s 出现已删除的入口文案 %q（v0.6.0 特性 1）", c.name, w)
+				t.Errorf("%s 出现已删除的入口文案 %q（v0.5.1 特性 1）", c.name, w)
 			}
 		}
 	}
