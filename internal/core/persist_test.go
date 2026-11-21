@@ -16,6 +16,12 @@ import (
 // （拿着已恢复的全局 statePath/tasks 继续写，构成数据竞争）。
 func saveRestoreState(t *testing.T) string {
 	t.Helper()
+	// 先等上一轮的去抖 goroutine 结束：它在 time.Sleep(r.stateSaveDelay) 求值时会读
+	// testStd.stateSaveDelay，而下面两行要写同一个字段。cleanup 注册到测试结束时才跑，
+	// 同一测试内多次调用本函数（如 TestTwoLiveEndsHaveDistinctStageText 连跑两条出口）
+	// 就存在窗口期 ⇒ -race 偶发红（2026-11-21 CI run #39 抓到；同一 sha 的 #40 是绿的，
+	// 本地 -count=40 可稳定复现）。
+	waitStateIdle(t)
 	oldPath, oldTasks, oldSeq, oldDelay := testStd.statePath, testStd.tasks, testStd.seqID, testStd.stateSaveDelay
 	testStd.stateSaveDelay = 5 * time.Millisecond
 	testStd.getStatePath() // 触发 once，之后直接覆盖 testStd.statePath
