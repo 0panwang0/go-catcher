@@ -1,10 +1,9 @@
 // 客户端外壳 HTML：iframe 内嵌监控页铺满窗口，不放任何控制工具条——
 // 服务随程序启动自动运行、退出自动停止，窗口内的状态/启停/浏览器按钮都是冗余信息。
-// 服务被手动停止（托盘菜单 / /svc/stop）时，外壳轮询 vc_running 切换为居中的降级提示。
+// 服务没起来时（启动失败），外壳轮询 vc_running 切换为居中的降级提示。
 // 点窗口右上角 ✕ 由 Go 侧 WM_CLOSE 子类化拦截，自动缩到托盘（见 tray.go），无需页面按钮。
 //
-// 端口不硬编码：iframe 地址由 JS 轮询 vc_port 拼出——设置里改端口并重启服务后，
-// 外壳下一次轮询就能把 iframe 切到新端口，无需重开客户端。
+// 端口不硬编码：iframe 地址由 JS 轮询 vc_port 拼出，端口一变下一轮就切到新地址。
 // 外壳自身的 JS 不发起任何 HTTP，状态判断走 Go 绑定（window.vc_running / vc_port）。
 package app
 
@@ -74,7 +73,7 @@ iframe::-webkit-scrollbar{display:none;width:0;height:0}
   <div class="placeholder" id="ph" style="display:none">
     <div class="ico">⬇</div>
     <h2>下载服务未运行</h2>
-    <p>可从托盘图标右键菜单重新启动；若启动失败，请检查端口 <span id="pport">…</span> 是否被占用。</p>
+    <p>请退出并重新打开客户端；若仍失败，请检查端口 <span id="pport">…</span> 是否被占用。</p>
   </div>
 </div>
 
@@ -97,7 +96,7 @@ async function refresh(){
   q('pport').textContent=port;
   q('ph').style.display=running?'none':'flex';
   if(running && iframeSrc!==url){
-    q('frm').src=url;   // 端口变化（设置改端口+托盘重启）时自动切到新地址
+    q('frm').src=url;   // 端口变化（设置改端口并重启客户端）时自动切到新地址
     iframeSrc=url;
   }else if(!running && iframeSrc!==''){
     q('frm').src='';

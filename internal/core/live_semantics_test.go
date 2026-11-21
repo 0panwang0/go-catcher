@@ -169,8 +169,12 @@ func TestStopRejectsNonLive(t *testing.T) {
 	}
 }
 
-// TestPauseAndResumeRejectLive 直播任务不得被暂停/恢复：这两条就是"续录"入口。
-func TestPauseAndResumeRejectLive(t *testing.T) {
+// TestPauseRejectsLiveAndResumeFinalizesIt 直播任务的这两条控制入口语义不同：
+//
+//   - 「暂停」仍然是续录入口，必须拒绝（空档期的流已经从列表滚走）；
+//   - 「继续」不再是拒绝，而是**收尾保存**（学徒 2026-09-20 定：直播点继续 =
+//     直接完成任务）。分流放在后端，任何入口（GUI / CLI / 扩展）调 resume 都走它。
+func TestPauseRejectsLiveAndResumeFinalizesIt(t *testing.T) {
 	saveRestoreState(t)
 	te := &taskEntry{rt: testStd, st: taskState{id: "liveblock", live: true, stage: "录制中", running: true}}
 	testStd.tasks[te.st.id] = te
@@ -184,21 +188,27 @@ func TestPauseAndResumeRejectLive(t *testing.T) {
 	if msg := rec.Body.String(); !strings.Contains(msg, "停止") {
 		t.Fatalf("pause 错误文案应引导到「停止」: %s", msg)
 	}
-
-	rec = httptest.NewRecorder()
-	e.handleResume(rec, httptest.NewRequest(http.MethodGet, "/resume?id=liveblock", nil))
-	if rec.Code != http.StatusBadRequest {
-		t.Fatalf("直播 /resume 返回 %d want 400", rec.Code)
-	}
-	if msg := rec.Body.String(); !strings.Contains(msg, "恢复") {
-		t.Fatalf("resume 错误文案没说清为什么不支持: %s", msg)
-	}
-
 	te.mu.Lock()
 	paused, intent := te.st.paused, te.intent
 	te.mu.Unlock()
 	if paused || intent != intentNone {
-		t.Fatalf("被拒的控制请求改动了任务状态: paused=%v intent=%d", paused, intent)
+		t.Fatalf("被拒的 pause 改动了任务状态: paused=%v intent=%d", paused, intent)
+	}
+
+	rec = httptest.NewRecorder()
+	e.handleResume(rec, httptest.NewRequest(http.MethodGet, "/resume?id=liveblock", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("直播 /resume 应分流到收尾（200），实际 %d: %s", rec.Code, rec.Body.String())
+	}
+	waitTaskState(t, te, func(s taskState) bool { return s.done }, "直播 resume 收尾")
+	te.mu.Lock()
+	stage, errMsg := te.st.stage, te.st.errorMsg
+	te.mu.Unlock()
+	if errMsg != "" {
+		t.Fatalf("没有内容可保存不是错误，errorMsg=%q", errMsg)
+	}
+	if !strings.Contains(stage, "无内容") {
+		t.Fatalf("stage=%q 应为「无内容」终态（本用例里 .part 不存在）", stage)
 	}
 }
 
@@ -253,7 +263,9 @@ func TestStopIdleLiveFinalizesExistingPart(t *testing.T) {
 	}
 
 	job := &dlJob{rt: testStd, live: true}
-	atomic.StoreInt64(&job.segFlushed, 2)
+	// 账本成对给：2 片、12 字节（= 下面 want 的长度）。收尾判据要用字节数
+	// 区分"只落了 init 段的空壳"与"真录到分片"，两个字段都必须设。
+	job.setFlushed(2, int64(len(want)))
 	te := &taskEntry{rt: testStd, job: job, st: taskState{
 		id: "idlelive", live: true, stage: "失败", errorMsg: "下载分片失败: boom",
 		filename: "idle.ts", saveDir: dir, finalPath: final, segDone: 2,
@@ -279,48 +291,144 @@ func TestStopIdleLiveFinalizesExistingPart(t *testing.T) {
 	}
 }
 
-// TestLiveResumeWithBreakpointRejected 带断点的直播任务不得继续录：
-// 空档期的流已经滚走，接着录只会产出时间轴带空洞的文件。
-// 「探测完成前被暂停」的任务与旧状态文件遗留的直播断点都落到这里，
-// 必须显式失败并让用户重新开始，而不是硬跑出个坏产物。
-func TestLiveResumeWithBreakpointRejected(t *testing.T) {
+// TestLiveRestartWithPartFinalizesInsteadOfResuming 直播任务重启恢复时，只要盘上已
+// 有内容就必须**收尾保存**，绝不进入 liveDownload 续录。
+//
+// 学徒 2026-09-20 定的语义：直播点「继续」= 直接完成任务。为什么不能接着录——
+// 断点/程序退出期间的分片已经从滑动窗口滚走，接着录只能在产物时间轴上留一段空洞。
+//
+// 判据为什么不能只看 from>0（旧实现）：运行中不落盘时 from 恒为 0（P0-1），
+// 守卫于是根本不触发，writeInitSegment 见 .part 非空就跳过写 init、
+// streamDownload 用 O_APPEND 从**已有内容的末尾**续写 —— 产物变成两段录制拼接
+// （探针实测 SEG0|SEG1|SEG2|SEG0|SEG1|SEG2|），而直播录像不可重录。
+//
+// 三个断言各钉一件事：
+//   - 源站请求数 == 0：没有重新下载（不是"下完了才保存"）；
+//   - 成品内容 == 原 .part：已录内容一字不差地保住了；
+//   - 中断原因保留、interrupted 为真：不把中断改写成"已完成"（等于抹掉故障记录）。
+func TestLiveRestartWithPartFinalizesInsteadOfResuming(t *testing.T) {
 	saveRestoreState(t)
 	oldLimiter := testStd.limiter
 	testStd.limiter = newResizableSem(1)
 	t.Cleanup(func() { testStd.limiter = oldLimiter })
 
+	// 分片请求数必须为 0（核心：没有续录）；列表请求最多 1 次 ——
+	// 判定 isLive 必须先拉一次播放列表（pl.hasEndList），那是识别直播所需的，
+	// 不是"又去轮询录制"。两次以上说明真的进了 liveDownload 的轮询循环。
+	var playlistHits, segHits int64
 	mux := http.NewServeMux()
 	mux.HandleFunc("/live.m3u8", func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt64(&playlistHits, 1)
 		w.Header().Set("Content-Type", "application/vnd.apple.mpegurl")
-		fmt.Fprint(w, "#EXTM3U\n#EXT-X-VERSION:3\n#EXTINF:6.0,\nseg/0.ts\n#EXTINF:6.0,\nseg/1.ts\n")
+		fmt.Fprint(w, "#EXTM3U\n#EXT-X-VERSION:3\n#EXTINF:6.0,\nseg/0.ts\n")
 	})
-	mux.HandleFunc("/seg/", func(w http.ResponseWriter, r *http.Request) { fmt.Fprint(w, "SEG") })
+	mux.HandleFunc("/seg/", func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt64(&segHits, 1)
+		fmt.Fprint(w, "SEG")
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	const want = "SEG-A|SEG-B|"
+	dir := t.TempDir()
+	final := filepath.Join(dir, "livebp.ts")
+	if err := os.WriteFile(final+".part", []byte(want), 0644); err != nil {
+		t.Fatal(err)
+	}
+	// 模拟"程序退出后重启恢复出来的直播任务"：live 已持久化、账本与 .part 一致。
+	te := &taskEntry{rt: testStd, st: taskState{
+		id: "livebp", queued: true, stage: "录制中断（程序异常退出）", started: time.Now(),
+		m3u8URL: srv.URL + "/live.m3u8", filename: "livebp.ts", saveDir: dir,
+		finalPath: final, live: true,
+		segDone: 2, flushedBytes: int64(len(want)),
+	}}
+	testStd.tasks[te.st.id] = te
+	go runDiskPipeline(te)
+	waitTaskState(t, te, func(s taskState) bool { return s.done }, "直播重启收尾")
+	waitLimiterDrained(t)
+
+	data, err := os.ReadFile(final)
+	if err != nil {
+		t.Fatalf("成品文件不存在（已录的直播内容被丢弃）: %v", err)
+	}
+	if string(data) != want {
+		t.Fatalf("成品内容=%q want %q", data, want)
+	}
+	if n := atomic.LoadInt64(&segHits); n != 0 {
+		t.Fatalf("直播重启恢复不应下载任何分片（实际 %d 次）：说明又去续录了，产物会变成两段录制拼接", n)
+	}
+	if n := atomic.LoadInt64(&playlistHits); n > 1 {
+		t.Fatalf("播放列表被请求 %d 次（>1 说明进了 liveDownload 的轮询循环）", n)
+	}
+	te.mu.Lock()
+	msg, stage, interrupted := te.st.errorMsg, te.st.stage, te.st.interrupted
+	te.mu.Unlock()
+	if msg == "" {
+		t.Fatal("中断原因必须保留：把它改写成'已完成'等于抹掉故障记录")
+	}
+	if !interrupted {
+		t.Fatalf("中断收尾必须标 interrupted（stage=%q），否则界面会把这次录制显示成完整录完", stage)
+	}
+	if _, err := os.Stat(final + ".part"); !os.IsNotExist(err) {
+		t.Fatal("收尾后残留 .part")
+	}
+}
+
+// TestLiveRestartWithBreakpointButNoPartStopsCleanly 带断点（from>0）但盘上没有
+// .part：同样不能续录 —— 硬跑会从 from 开始往空文件里写，产物前 from 片直接缺失。
+// 该形态走"无内容"终态：任务结束、不产出成品、不留错误提示（用户没做错什么）。
+func TestLiveRestartWithBreakpointButNoPartStopsCleanly(t *testing.T) {
+	saveRestoreState(t)
+	oldLimiter := testStd.limiter
+	testStd.limiter = newResizableSem(1)
+	t.Cleanup(func() { testStd.limiter = oldLimiter })
+
+	// 分片请求必须为 0；列表请求最多 1 次（判定 isLive 所需，见上一个用例）。
+	var playlistHits, segHits int64
+	mux := http.NewServeMux()
+	mux.HandleFunc("/live.m3u8", func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt64(&playlistHits, 1)
+		w.Header().Set("Content-Type", "application/vnd.apple.mpegurl")
+		fmt.Fprint(w, "#EXTM3U\n#EXT-X-VERSION:3\n#EXTINF:6.0,\nseg/0.ts\n")
+	})
+	mux.HandleFunc("/seg/", func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt64(&segHits, 1)
+		fmt.Fprint(w, "SEG")
+	})
 	srv := httptest.NewServer(mux)
 	defer srv.Close()
 
 	dir := t.TempDir()
 	te := &taskEntry{rt: testStd, st: taskState{
-		id: "livebp", queued: true, stage: "已暂停", started: time.Now(),
-		m3u8URL: srv.URL + "/live.m3u8", filename: "livebp.ts", saveDir: dir,
-		finalPath: filepath.Join(dir, "livebp.ts"),
-		live:      true, // 直播标记已被持久化（探测期暂停或旧状态文件）
-		segDone:   2,    // 已有断点
+		id: "livebp2", queued: true, stage: "已暂停", started: time.Now(),
+		m3u8URL: srv.URL + "/live.m3u8", filename: "livebp2.ts", saveDir: dir,
+		finalPath: filepath.Join(dir, "livebp2.ts"),
+		live:      true,
+		segDone:   2, // 有断点，但磁盘上什么都没有
 	}}
 	testStd.tasks[te.st.id] = te
 	go runDiskPipeline(te)
-	waitTaskState(t, te, func(s taskState) bool { return s.done }, "失败收尾")
+	waitTaskState(t, te, func(s taskState) bool { return s.done }, "无内容收尾")
 	waitLimiterDrained(t)
 
+	if n := atomic.LoadInt64(&segHits); n != 0 {
+		t.Fatalf("不应下载任何分片（实际 %d 次）", n)
+	}
+	if n := atomic.LoadInt64(&playlistHits); n > 1 {
+		t.Fatalf("播放列表被请求 %d 次（>1 说明进了轮询循环）", n)
+	}
 	te.mu.Lock()
-	msg, finalPath := te.st.errorMsg, te.st.finalPath
+	msg, stage, finalPath := te.st.errorMsg, te.st.stage, te.st.finalPath
 	te.mu.Unlock()
-	if msg == "" {
-		t.Fatal("带断点的直播任务没有失败：会产出时间轴带空洞的文件")
+	if msg != "" {
+		t.Fatalf("没有内容可保存不是错误，errorMsg=%q", msg)
 	}
-	if !strings.Contains(msg, "断点") && !strings.Contains(msg, "重新") {
-		t.Fatalf("errorMsg=%q 未提示用户重新开始录制", msg)
+	if !strings.Contains(stage, "无内容") {
+		t.Fatalf("stage=%q 应说明没有内容可保存（用户才知道为什么没有文件）", stage)
 	}
-	if _, err := os.Stat(finalPath); !os.IsNotExist(err) {
-		t.Fatal("失败路径不该产出成品文件")
+	if finalPath != "" {
+		if _, err := os.Stat(finalPath); !os.IsNotExist(err) {
+			t.Fatal("无内容路径不该产出成品文件")
+		}
 	}
 }

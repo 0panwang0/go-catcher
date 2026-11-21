@@ -6,10 +6,12 @@ package core
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/0panwang0/go-catcher/internal/platform"
 )
@@ -63,7 +65,15 @@ func (l *resizableSem) acquire(ctx context.Context) bool {
 		go func() {
 			select {
 			case <-ctx.Done():
-				l.cond.Broadcast() // 唤醒等待者自查 ctx
+				// ⚠️ 必须**持 l.mu** 广播（新-2）。不持锁时存在丢失唤醒：
+				// 取消恰好落在主协程"检查 ctx.Err()（还是 nil）"与"cond.Wait()"之间，
+				// 广播发生在 Wait 之前、当时无人可唤醒，随后 Wait 永久睡下去 ——
+				// 任务卡在「排队中」，而 resume 又因为它还占着队位不放行。
+				// 持锁后 watcher 会阻塞在 Lock 上直到 Wait 释放锁，广播不可能早于 Wait。
+				// （「不留锁 Broadcast 也合法」是 sync.Cond 的文档事实，但合法 ≠ 安全。）
+				l.mu.Lock()
+				l.cond.Broadcast()
+				l.mu.Unlock()
 			case <-stop:
 			}
 		}()
@@ -143,7 +153,26 @@ func defaultConfig() appConfig {
 
 // concurrencyNow / maxRetriesNow 是下载热路径的读取入口（无锁）。
 func (r *Runtime) concurrencyNow() int { return int(r.segConcurrency.Load()) }
-func (r *Runtime) maxRetriesNow() int  { return int(r.retryLimit.Load()) }
+
+// maxRetriesNow 读取重试次数，并把下限夹取到 1。
+//
+// 为什么下限是 1 而不是 0：设置页把「分片失败重试」的合法区间写作 0–10
+// （settings.html），所以 0 是用户能选的值，语义是"不重试"。但重试循环都写成
+// `for attempt := 1; attempt <= n; attempt++`，n=0 时一次都不进 ⇒ 函数直接走到
+// 末尾那句 `return …, lastErr`，而 lastErr 从未被赋值 ⇒ 返回 **nil error + 空产物**。
+// 调用方把它当成功，拿着空体往下走，产物坏了而日志全绿。
+// ⚠️ net.go 的两处已收进 retryGet，它对 <1 显式报错（见 retry_skeleton_test.go）；
+// download.go 的两处循环仍只靠这里的夹取兜着。
+//
+// 夹取放在读取入口而不是写入点：存储值保留用户的字面选择（0 就是 0，
+// 设置页回显一致），只在这里保证"至少尝试一次"这条不变量，四处调用点
+// （net.go ×2、download.go ×2）一次全覆盖。
+func (r *Runtime) maxRetriesNow() int {
+	if n := int(r.retryLimit.Load()); n > 0 {
+		return n
+	}
+	return 1
+}
 
 // chunkSizeNow 本次直链分片使用的片长（0 视为默认，测试可调小）。
 func (r *Runtime) chunkSizeNow() int64 {
@@ -151,6 +180,14 @@ func (r *Runtime) chunkSizeNow() int64 {
 		return r.chunkSizeBytes
 	}
 	return chunkSizeFixed
+}
+
+// segBodyLimitNow 单个媒体分片的读体上限（0 视为默认，测试可调小）。
+func (r *Runtime) segBodyLimitNow() int64 {
+	if r.segBodyBytes > 0 {
+		return r.segBodyBytes
+	}
+	return maxSegmentBytes
 }
 
 // setDownloadTuning 写入运行时下载调参。CLI 初始化与 /config 热更新都走这里。
@@ -180,15 +217,33 @@ func (r *Runtime) getConfigPath() string {
 // loadConfig 启动时读取配置并应用（校验范围，越界/损坏回退默认）。
 func (r *Runtime) loadConfig() {
 	c := defaultConfig()
-	data, err := os.ReadFile(r.getConfigPath())
+	p := r.getConfigPath()
+	data, err := os.ReadFile(p)
+	// 读不出来（被占用 / 权限不足 / 盘拔了）：**不能当成"没有配置"** —— 随后
+	// saveConfigLocked（ensureAPIToken 触发）会把默认值写回、**覆盖用户原文件**
+	// （含代理设置）。先留档（R7），留档成败都会经 persistHealth 上报 /status。
+	if err != nil && !os.IsNotExist(err) {
+		r.quarantineUnreadableConfig(p, fmt.Sprintf("读取失败: %v", err))
+	}
 	if err == nil {
 		var fileC appConfig
-		if json.Unmarshal(data, &fileC) == nil {
-			// 返回值表示"发生过夹取"。这里按设计忽略：读盘路径对越界值做夹取
-			// （而非回退默认），与 /config 端点用 clamped 提示用户的处理不同。
-			_ = clamp(&fileC.MaxConcurrent, 1, 16)
-			_ = clamp(&fileC.SegConcurrency, 1, 32)
-			_ = clamp(&fileC.MaxRetries, 0, 10)
+		if uerr := json.Unmarshal(data, &fileC); uerr != nil {
+			// 内容确实坏了（截断 / 非法 JSON）：留档后从默认值开始 —— 留档那份
+			// 还能人工抢救，"被默认值覆盖掉"就没有任何余地了（R7）。
+			// ⚠️ 留档必须发生在"回退默认"之前，晚了原文件已被盖掉。
+			r.quarantineUnreadableConfig(p, fmt.Sprintf("解析失败: %v", uerr))
+		} else {
+			// 键缺失 ≠ 用户填了 0（A-7）。用一份原始键表把两种情况分开：
+			//   · 键不在（旧配置 / 手改删掉了这一项）⇒ 回退默认，与下面
+			//     Port / uiView / proxy 的处置一致；
+			//   · 键在但越界 ⇒ 夹到边界（值是人填的，夹住比悄悄换成默认更贴他的意图）。
+			// 一律按"越界就夹取"处理时，缺字段会被夹到**下限**（并发变 1、重试变 0），
+			// 观感是"下载突然变得极慢 / 一失败就放弃"，而且没有任何提示。
+			var keys map[string]json.RawMessage
+			_ = json.Unmarshal(data, &keys)
+			configInt(keys, "maxConcurrent", &fileC.MaxConcurrent, c.MaxConcurrent, 1, 16)
+			configInt(keys, "segConcurrency", &fileC.SegConcurrency, c.SegConcurrency, 1, 32)
+			configInt(keys, "maxRetries", &fileC.MaxRetries, c.MaxRetries, 0, 10)
 			// 旧配置文件没有 port 字段（反序列化为 0）：回退默认而不是夹取到 1
 			if fileC.Port <= 0 || fileC.Port > 65535 {
 				fileC.Port = c.Port
@@ -212,6 +267,29 @@ func (r *Runtime) loadConfig() {
 	r.applyConfigLocked() // 无论默认还是读盘，都写入限制器与运行时变量
 }
 
+// quarantineUnreadableConfig 把读不出 / 坏掉的配置文件改名留档（R7），并把原因
+// 记进 persistHealth 让 /status 可见（GUI 是 windowsgui 子系统，Printf 等于没写）。
+//
+// 为什么要留档而不是只"回退默认"：回退默认本身是既有行为（TestLoadConfigFallsBack
+// 钉着），但随后 saveConfigLocked 会把默认值写回同一个路径 —— 那是**静默销毁**
+// 用户改过的设置。留一份带时间戳的 .bak，至少还能人工恢复。
+//
+// ⚠️ 提醒走 recordPersistNotice（**不是** recordPersistResult）：本函数之后程序照常
+// 运行、照常落盘，若把提醒写进 lastErr 槽位，它会被紧接着的第一次成功 saveState 秒清，
+// 用户看不到"你的设置被重置了"（S1）。
+//
+// 留档失败不影响继续运行（最坏：这次用默认值且原文件仍在，下次启动会再报一次）。
+func (r *Runtime) quarantineUnreadableConfig(p, why string) {
+	bak := fmt.Sprintf("%s.%s.bak", p, time.Now().Format("20060102-150405"))
+	if err := os.Rename(p, bak); err != nil {
+		r.recordPersistNotice(fmt.Sprintf("配置%s，且留档失败: %v（本次用默认配置，原文件未动）", why, err))
+		fmt.Printf("[config] 配置%s，且留档失败: %v（本次用默认配置）\n", why, err)
+		return
+	}
+	r.recordPersistNotice(fmt.Sprintf("配置文件%s，已留档为 %s（本次用默认配置）", why, filepath.Base(bak)))
+	fmt.Printf("[config] 配置文件%s，已留档为 %s（本次从默认配置开始）\n", why, filepath.Base(bak))
+}
+
 // clamp 把 v 夹取到 [lo,hi]，并报告原值是否本来就合法：
 // 返回 true = 原值落在区间内（v 未被改动）；false = 越界、已夹到边界。
 //
@@ -231,6 +309,19 @@ func clamp(v *int, lo, hi int) bool {
 	return ok
 }
 
+// configInt 处理一个整型配置项（A-7）：**键缺失回退默认，键在才夹取**。
+//
+// 两种处置刻意不同 —— "文件里根本没有这一项"是未知（旧版本写的 / 被人手改删了），
+// 该给默认值；"写了个越界值"是已知，该尽量贴近用户意图（夹到边界）而不是换掉他填的数。
+// 把两者混成一条"越界就夹取"，缺字段就会静默落到下限。
+func configInt(keys map[string]json.RawMessage, key string, v *int, def, lo, hi int) {
+	if _, ok := keys[key]; !ok {
+		*v = def
+		return
+	}
+	_ = clamp(v, lo, hi)
+}
+
 // applyConfigLocked 把 cfg 写入运行时变量（调用方须持 cfgMu）。
 func (r *Runtime) applyConfigLocked() {
 	r.limiter.setLimit(r.cfg.MaxConcurrent)
@@ -247,15 +338,9 @@ func (r *Runtime) saveConfigLocked() error {
 	if err != nil {
 		return err
 	}
-	p := r.getConfigPath()
-	tmp := p + ".tmp"
-	if err := os.WriteFile(tmp, data, 0644); err != nil {
-		return err
-	}
-	if err := os.Rename(tmp, p); err != nil {
-		return err
-	}
-	return nil
+	// 原子写：临时文件 + Sync + rename（见 writeFileAtomic）—— 就地写会在断电时
+	// 留下半份 JSON，下次启动解析失败直接回落默认配置，用户改过的设置静默丢失。
+	return writeFileAtomic(r.getConfigPath(), data, 0644)
 }
 
 // initRuntimeConfig 服务启动时调用：建限制器并装载持久化配置。

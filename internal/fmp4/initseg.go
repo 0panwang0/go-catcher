@@ -189,7 +189,11 @@ func parseMoovTimescales(moov []byte, moovAbs int, info *fmp4InitInfo) {
 		}
 		switch typ {
 		case "mvhd":
-			if ts, ok := mvhdTimescale(moov[payload:]); ok {
+			// 切片必须限定到**该盒声明的末端**（pos+sz）。只给 moov[payload:] 时，
+			// 一个"声明长度远小于实际数据"的畸形 mvhd 会让下面的 p[12:] 读到下一个
+			// 盒（甚至盒外）的字节 —— timescale 解析成垃圾，时长元数据全错、日志全绿
+			// （B-4；与 2026-09-22 修过的 hdlrMediaType 同一类漏网）。
+			if ts, ok := mvhdTimescale(moov[payload : pos+sz]); ok {
 				info.movieTS = ts
 				info.mvhdOff = moovAbs + pos
 				info.mvhdWide = moov[payload] == 1
@@ -215,7 +219,8 @@ func parseTrakTimescales(trak []byte, info *fmp4InitInfo) {
 		}
 		switch typ {
 		case "tkhd":
-			trackID = tkhdTrackID(trak[payload:])
+			// 同 mvhd：限定到该盒声明的末端，否则会读到下一个盒的字节（B-4）。
+			trackID = tkhdTrackID(trak[payload : pos+sz])
 		case "mdia":
 			if ts, ok := mdhdTimescale(trak[pos : pos+sz]); ok {
 				trackTS = ts
@@ -253,7 +258,15 @@ func hdlrMediaType(mdia []byte) string {
 		}
 		if typ == "hdlr" {
 			// hdlr: verflags(4) + pre_defined(4) + handler_type(4) + reserved(12) + name*
-			if len(mdia)-payload < 16 {
+			//
+			// 边界必须按该盒**自己声明的长度**（pos+sz）算，不能用父盒 mdia 的总长：
+			// 一个 sz 越过 mdia 末端的畸形 hdlr 会在这里被判成"长度足够"，随后读到的
+			// 是下一个盒（或盒外）的字节，handler_type 解析出垃圾 —— 音轨被判成视频轨
+			// 之类，产物"能播但轨道标记错"，日志全绿。
+			// ⚠️ 2026-09-28：这句注释原先还宣称"同文件另四个盒遍历都按各自的 box 末端
+			// 判断"，那是**错的** —— mvhdTimescale / tkhdTrackID 当时收的是 moov[payload:]，
+			// 根本不限盒长（已按本条修好，B-4）。说的和做的对不上，比不说更糟。
+			if payload+16 > pos+sz {
 				return ""
 			}
 			switch string(mdia[payload+8 : payload+12]) {
@@ -361,7 +374,11 @@ func mdhdTimescale(mdia []byte) (uint32, bool) {
 			break
 		}
 		if typ == "mdhd" {
-			p := mdia[payload:]
+			// 同 mvhd/tkhd：切片限定到 mdhd **自己声明的末端**（B-4）。用
+			// mdia[payload:] 时，一个声明长度只到 version_flags 的畸形 mdhd 会让
+			// p[12:16] 读到紧随其后的盒（或盒外），timescale 解析成垃圾 ⇒
+			// mehd/mvhd 回填的总时长按错比例换算、静默写错，日志全绿。
+			p := mdia[payload : pos+sz]
 			if len(p) < 16 {
 				return 0, false
 			}

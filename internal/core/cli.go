@@ -5,6 +5,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -38,14 +39,22 @@ type CLIOptions struct {
 // 运行时参数，为 Runtime 上的原子字段（concurrencyNow / maxRetriesNow /
 // setDownloadTuning）。
 
-// ParseCLI 解析命令行（未识别参数由 flag 包报错退出）。
-func ParseCLI(args []string) CLIOptions {
+// ParseCLI 解析命令行，返回解析结果与错误。
+//
+// 为什么用 ContinueOnError 而不是 ExitOnError（R10）：本程序是 windowsgui 子系统，
+// 解析发生在 AttachParentConsole **之前**（原生消息宿主绝不能挂控制台——AttachParentConsole
+// 会把 os.Stdout 换成 CONOUT$，一挂就毁掉那条 stdin/stdout 帧协议）。而 flag 的
+// ExitOnError 会**当场** os.Exit(2)，它自己那句报错就落进了尚不存在的控制台 ——
+// 用 `start` / 快捷方式起进程（句柄未继承）时用户只看到窗口"闪一下"，错误与用法全丢。
+// 这里把 flag 的输出丢进 io.Discard，改由 main 在挂好控制台之后自行报错。
+func ParseCLI(args []string) (CLIOptions, error) {
 	o := CLIOptions{
 		Proxy:       "system",
 		Output:      "output.ts",
 		Concurrency: defaultConfig().SegConcurrency,
 	}
-	fs := flag.NewFlagSet("go-catcher", flag.ExitOnError)
+	fs := flag.NewFlagSet("go-catcher", flag.ContinueOnError)
+	fs.SetOutput(io.Discard) // 报错时机交给调用方（见上）
 	fs.StringVar(&o.URL, "url", o.URL, "m3u8 URL (必填)")
 	fs.StringVar(&o.Referer, "referer", "", "Referer（来源页 URL，部分站点必填）")
 	fs.StringVar(&o.Proxy, "proxy", o.Proxy, "Proxy address（默认 system=跟随系统代理；direct/none = 直连；或 http://host:port）")
@@ -59,7 +68,9 @@ func ParseCLI(args []string) CLIOptions {
 	fs.BoolVar(&o.InstallNativeHost, "install-native-host", false, "登记本程序为浏览器原生消息宿主（写入当前用户注册表）")
 	fs.BoolVar(&o.UninstallNativeHost, "uninstall-native-host", false, "注销浏览器原生消息宿主登记")
 	fs.BoolVar(&o.NativeHostStatus, "native-host-status", false, "打印原生消息宿主登记状态")
-	_ = fs.Parse(args)
+	if err := fs.Parse(args); err != nil {
+		return o, err
+	}
 	// 浏览器按宿主清单拉起本程序时，命令行长这样：
 	//     go-catcher.exe chrome-extension://<扩展ID>/
 	// 清单的 path 只能写可执行文件本身——Chrome/Edge 用 CreateProcess 起进程，
@@ -76,7 +87,7 @@ func ParseCLI(args []string) CLIOptions {
 			}
 		}
 	}
-	return o
+	return o, nil
 }
 
 // isBrowserExtensionOrigin 判断某个参数是否为浏览器传入的扩展来源。
@@ -114,11 +125,31 @@ func (r *Runtime) describeProxy() string {
 func RunCLI(o CLIOptions) int {
 	// CLI 拥有独立的一次性运行时：不与任何 Engine 共享状态
 	rt := newRuntime()
+	// 但"独立"不等于"可以写状态文件"：本 Runtime 从不 loadState，若放任 markDirty
+	// 落盘，写下去的是一份**空表**，会把 exe 同目录里 GUI 的历史整个覆盖掉（R1）。
+	// CLI 本就不做断点续传（见 PrintUsage），"永不落盘"与它的契约一致。
+	rt.persistDisabled = true
 	rt.setProxyAddr(o.Proxy)
 	rt.setDownloadTuning(o.Concurrency, -1) // CLI 只暴露分片并发，不动重试次数
 	rt.outputFile = o.Output
 	rt.outputFile = rt.normalizeOutput()
 	outAbs, _ := filepath.Abs(rt.outputFile)
+	// -o 可能带子目录（如 out/video.ts）：CLI 的 writeInitSegmentFor 用 O_CREATE 打开
+	// .part，**不会建父目录**；建目录原先只发生在最后一步 emitOutput，为时已晚
+	// （HLS 路径在第 3 步就写 init 段了）。这里算出绝对路径后立刻建目录（R5）。
+	// filepath.Dir 在无目录时返回 "."，MkdirAll(".") 是无害的 no-op。
+	if mkErr := ensureOutputDir(outAbs); mkErr != nil {
+		fmt.Printf("创建输出目录失败: %v\n", mkErr)
+		return 1
+	}
+
+	// Ctrl+C 必须对 CLI 的**每一条**下载路径生效 —— 直链、点播一次性、直播跟随。
+	// 原先只有 isLive 分支注册 signal.NotifyContext，点播与直链收到的 SIGINT 无人
+	// 接管，走 Go 默认处置把进程直接杀掉，RunCLI 里的 defer 一个都不跑（R9）。
+	// 统一在下载开始前注册一次，三条路径共用这个可取消 ctx（fetchPlaylist 也一并接上，
+	// 让拉索引阶段的 Ctrl+C 同样能干净收场）。
+	dlCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+	defer stop()
 
 	job := &dlJob{
 		rt:      rt,
@@ -142,15 +173,36 @@ func RunCLI(o CLIOptions) int {
 
 	// 1. 获取 m3u8 / 直链识别
 	fmt.Println("\n[1/4] 获取 m3u8 索引...")
-	m3u8Content, baseURL, isDirect, err := job.fetchPlaylist(context.Background())
+	m3u8Content, baseURL, isDirect, err := job.fetchPlaylist(dlCtx)
 	if err != nil {
 		fmt.Printf("获取 m3u8 失败: %v\n", err)
 		return 1
 	}
 	if isDirect {
 		fmt.Println("识别为直链媒体文件（MP4 等），整体下载…")
-		if err := job.downloadDirect(context.Background(), partPath); err != nil {
+		// 输出扩展名跟随 URL（如 .mp4）：与 GUI 直链（runDirectDownload）共用同一条
+		// 规则（correctedDirectName），否则 MP4 内容会存成默认的 output.ts，与
+		// container.go「fMP4 内容绝不能存成 .ts」的既定约束相悖（R6）。
+		if nf := correctedDirectName(rt.outputFile, job.m3u8URL); nf != rt.outputFile {
+			rt.outputFile = nf
+			outAbs, _ = filepath.Abs(rt.outputFile)
+			partPath = outAbs + ".part"
+			fmt.Printf("直链媒体，输出扩展名修正为 %s\n", rt.outputFile)
+		}
+		if err := job.downloadDirect(dlCtx, partPath); err != nil {
+			if dlCtx.Err() != nil {
+				fmt.Println("\n已中断（Ctrl+C），未完成下载")
+				return 1
+			}
 			fmt.Printf("下载直链文件失败: %v\n", err)
+			return 1
+		}
+		// 直链没有 HLS 那套容器探测，成品可能是一张错误页（CDN 的 403/502 HTML 被
+		// Content-Type 撒谎掩盖）。落盘前做一次拒绝式校验，明显不是媒体就失败（R8）。
+		if verr := validateDirectMedia(partPath); verr != nil {
+			os.Remove(partPath)
+			removeChunkMeta(partPath)
+			fmt.Printf("产物校验失败: %v\n", verr)
 			return 1
 		}
 		if err := emitOutput(partPath, rt.outputFile); err != nil {
@@ -175,7 +227,6 @@ func RunCLI(o CLIOptions) int {
 	}
 	segURLs := pl.segments
 	// 加密流装配解密器（拉取 key 并按 METHOD 建解密器），失败即退出
-	dlCtx := context.Background()
 	if kerr := job.ensureDecryptor(dlCtx, pl.key); kerr != nil {
 		fmt.Printf("装配解密器失败: %v\n", kerr)
 		return 1
@@ -220,15 +271,18 @@ func RunCLI(o CLIOptions) int {
 	fmt.Println("\n[3/4] 下载并写入文件…")
 	written := 0
 	if isLive {
-		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
-		defer stop()
-		dlCtx = ctx
 		job.live = true
-		written, err = job.liveDownload(dlCtx, partPath, 0)
+		// CLI 不区分结束种类（那是给 GUI 收尾文案用的）：这里只关心录到几片。
+		written, _, err = job.liveDownload(dlCtx, partPath, 0)
 	} else {
 		written, err = streamDownload(dlCtx, job, segURLs, 0, pl.mediaSeq, partPath)
 	}
 	if err != nil {
+		// Ctrl+C 会让 ctx 取消、下载提前返回 —— 那是用户主动中断，不是"失败"（R9）。
+		if dlCtx.Err() != nil {
+			fmt.Printf("\n已中断（Ctrl+C），已写入 %d 个分片\n", written)
+			return 1
+		}
 		fmt.Printf("\n下载失败（已写入 %d 个分片）: %v\n", written, err)
 		return 1
 	}
@@ -248,7 +302,10 @@ func RunCLI(o CLIOptions) int {
 		return 1
 	}
 	if jerr := job.backfill(partPath); jerr != nil {
-		fmt.Printf("[warn] 容器收尾处理失败（不影响文件可播性）: %v\n", jerr)
+		// 失败不改成功语义（文件已合法可播），但要如实说明后果。原文案"不影响文件
+		// 可播性"是**错的**（与 internal/fmp4/initseg.go 文件头"无 mehd ⇒ 播放器
+		// 预知不了时长、不能拖动"自述矛盾）—— R4。
+		fmt.Printf("[warn] 容器收尾处理失败（时长信息缺失，播放器可能无法拖动进度条）: %v\n", jerr)
 	}
 	if err := emitOutput(partPath, finalOut); err != nil {
 		fmt.Printf("输出失败: %v\n", err)
@@ -257,6 +314,21 @@ func RunCLI(o CLIOptions) int {
 
 	fmt.Printf("\n全部完成，耗时 %s\n", time.Since(start).Round(time.Second))
 	return 0
+}
+
+// ensureOutputDir 保证 `-o` 的父目录存在（R5）。
+//
+// 为什么必须在下载**之前**建：CLI 的写入路径（writeInitSegmentFor / streamWriter）
+// 用 O_CREATE 打开 .part，**不会建父目录**；而建目录原先只发生在最后一步
+// emitOutput（output.go）—— HLS 路径在第 3 步就要写 init 段，那时已经失败了
+// （报 `open D:\...\out\video.ts.part: 系统找不到指定的路径`）。
+// 纯文件名（无目录）时 filepath.Dir 返回 "."，跳过即可。
+func ensureOutputDir(outAbs string) error {
+	dir := filepath.Dir(outAbs)
+	if dir == "" || dir == "." {
+		return nil
+	}
+	return os.MkdirAll(dir, 0755)
 }
 
 // resetPartForRerun CLI 的 HLS 路径不做断点续传：`<输出>.part` 一旦存在，
@@ -292,7 +364,7 @@ func resetPartForRerun(partPath string) error {
 		return fmt.Errorf("丢弃临时文件失败（请手动删除后重试）: %s: %w", partPath, rmErr)
 	}
 	// 分片位图是直链分片续传的元数据，与本次全新下载无关，一并清掉避免误用
-	if rmErr := os.Remove(chunkMetaPath(partPath)); rmErr != nil && !os.IsNotExist(rmErr) {
+	if rmErr := removeChunkMeta(partPath); rmErr != nil {
 		fmt.Printf("[warn] 清理分片位图失败 %s: %v\n", chunkMetaPath(partPath), rmErr)
 	}
 	return nil

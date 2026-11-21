@@ -3,8 +3,9 @@
 // 单进程架构：下载服务不再是独立进程，由本进程内的 core.Engine 承载。
 //   - 主窗 = iframe 内嵌本地监控页（任务列表/暂停/继续/设置）铺满窗口，无工具条——
 //     服务随程序启动自动运行、退出自动停止，窗口内不放冗余控件；
-//     服务被手动停止时外壳自动切换为居中降级提示。
-//   - 系统托盘：左键点图标直接显示主窗口，右键弹菜单（启停服务/浏览器打开/退出）。
+//     服务没起来时外壳自动切换为居中降级提示。
+//   - 系统托盘：左键点图标显示主窗口，右键弹菜单，只有「显示主窗口」与「退出客户端」
+//     两项——服务启停与"在浏览器打开监控"两个入口已去掉（后者与主窗口功能重复）。
 //     点窗口 X 缩到托盘（WM_CLOSE 子类化拦）。
 //   - 退出客户端（托盘菜单）= 优雅停服务（进行中任务转暂停、断点落盘）后进程结束；
 //     点 X 只是缩到托盘，下载继续。
@@ -13,7 +14,6 @@ package app
 import (
 	"fmt"
 	"os"
-	"os/exec"
 
 	"github.com/jchv/go-webview2"
 	"golang.org/x/sys/windows"
@@ -21,17 +21,6 @@ import (
 	"github.com/0panwang0/go-catcher/internal/core"
 	"github.com/0panwang0/go-catcher/internal/platform"
 )
-
-// monitorBase 监控页地址前缀（端口跟随引擎/配置，运行时动态取）。
-func monitorURL(eng *core.Engine) string {
-	return fmt.Sprintf("http://127.0.0.1:%d", eng.Port())
-}
-
-func openBrowser(url string) error {
-	cmd := exec.Command("rundll32", "url.dll,FileProtocolHandler", url)
-	cmd.SysProcAttr = hiddenProcAttr()
-	return cmd.Start()
-}
 
 // Run 启动 GUI 客户端（trayOnly=true 时为"托盘常驻"形态），阻塞直到用户真正退出。
 //
@@ -56,11 +45,11 @@ func Run(trayOnly bool) {
 	}
 
 	// 打开客户端即自动拉起下载服务（沿用旧双进程版行为，浏览器扩展依赖本地服务常驻）。
-	// 失败不阻断 GUI：外壳轮询显示"未运行"，用户从托盘重启能看到具体错误。
+	// 失败不阻断 GUI：外壳轮询切到"未运行"降级面板，面板里给出原因与处理方式。
 	// 端口不再固定 7891：跟随 gocatcher_config.json（可在监控页设置里改）。
 	eng := core.NewEngine(0)
 	if err := eng.Start(); err != nil {
-		// 启动失败不阻断 GUI（外壳会切到"服务未运行"降级面板，用户可从托盘重启），
+		// 启动失败不阻断 GUI（外壳会切到"服务未运行"降级面板，提示重启客户端），
 		// 但必须留下原因：GUI 是 windowsgui 子系统、没有控制台，端口被占用这类
 		// 错误如果不落到文件日志，用户只会看到"服务未运行"而完全无从下手。
 		fmt.Printf("[app] 下载服务启动失败: %v\n", err)
@@ -96,8 +85,8 @@ func Run(trayOnly bool) {
 	}
 
 	// 外壳需要的两个绑定：服务是否在运行（iframe vs 降级提示）、当前端口
-	// （设置里改端口 + 托盘重启服务后，外壳据此把 iframe 切到新地址）。
-	// 启停控制都在托盘菜单；服务随程序启动自动运行、退出自动停止。
+	// （设置里改端口并重启客户端后，外壳据此把 iframe 切到新地址）。
+	// 服务随程序启动自动运行、退出自动停止，没有单独的启停入口。
 	w.Bind("vc_running", func() bool { return eng.Running() })
 	w.Bind("vc_port", func() int { return eng.Port() })
 
@@ -108,7 +97,7 @@ func Run(trayOnly bool) {
 	w.SetHtml(shellHTML(eng.EmbedKey()))
 
 	// 注册托盘 + 子类化主窗(拦 WM_CLOSE 缩托盘)
-	initTray(w, eng)
+	initTray(w)
 
 	w.Run()
 

@@ -114,6 +114,20 @@ type playlistInfo struct {
 	// N 行会解析出同一个 URL 并各下一遍再顺序 append —— 体积放大 N 倍、时间轴
 	// 完全错位，而且不会有任何报错。用这个标记让调用方显式失败。
 	hasByteRange bool
+	// mapByteRange #EXT-X-MAP 行带了 BYTERANGE 属性：init 段是某个文件的**字节片段**。
+	// 当前实现只按 URI 把整个文件拉回来当 init 段 —— 偏移非 0 时那根本不是 init 段，
+	// fMP4 的容器识别与轨道信息都跟着错，产物"能播但时间轴/轨道错"而日志全绿。
+	// 与 hasByteRange 同源（同一个特性，落在 MAP 行上），并进同一条校验。
+	// 只在 MAP 行同时给出 URI 时置位：没有 URI 就没有要取的 init 段，
+	// 不该因为一行畸形声明拒掉一个本来正常的流。
+	mapByteRange bool
+	// hasDiscontinuity 播放列表用了 #EXT-X-DISCONTINUITY（或声明断点总数的
+	// #EXT-X-DISCONTINUITY-SEQUENCE）：声明「接下来的分片与前面的不在同一条
+	// 时间轴上」。编码参数变化、广告插入、直播中编码器重启都会产生它。当前管线
+	// 把分片一律当一条连续时间轴顺序拼接，既不重置时间基准也不重编号 —— 断点
+	// 之后的分片落在错误的时间位置，产物"能播但时间轴错"，且不会有任何报错。
+	// 用这个标记让 validatePlaylist 显式失败，而不是静默拼出一条时间轴错位的文件。
+	hasDiscontinuity bool
 }
 
 // sameKey 判定两条 #EXT-X-KEY 是否等价（METHOD/URI/IV/KEYFORMAT 全同）。
@@ -139,6 +153,9 @@ func validatePlaylist(pl playlistInfo) error {
 		return err
 	}
 	if err := ensureNoByteRange(pl); err != nil {
+		return err
+	}
+	if err := ensureNoDiscontinuity(pl); err != nil {
 		return err
 	}
 	return ensureIdentityKeyFormat(pl)
@@ -181,17 +198,132 @@ func ensureSingleKey(pl playlistInfo) error {
 	return nil
 }
 
-// ensureNoByteRange 校验播放列表没有使用字节范围分片。
+// ensureNoByteRange 校验播放列表没有使用字节范围取流。
 //
 // #EXT-X-BYTERANGE 让多个分片行指向同一个 URL 的不同字节区间。当前管线把每行
 // 当成独立文件整份下载，结果是同一个文件被下 N 遍再顺序拼接：体积放大 N 倍、
 // 时间轴错位，且 validateOutput 的同步字节判据发现不了（每一份都是合法 TS）。
 // 完整支持需要给分片附上 Range 语义，属于较大的改动；定版前先显式拒绝。
+//
+// 同一个特性落在 #EXT-X-MAP 行上（init 段是字节片段）危害更大：管线会把整个
+// 文件当成 init 段，容器识别与轨道信息全错，而"产物能播"会让人以为没问题。
+// 所以这**不是**只查分片行——两条来源并进同一个判据，新增来源时也往这里加。
 func ensureNoByteRange(pl playlistInfo) error {
-	if pl.hasByteRange {
+	if pl.hasByteRange || pl.mapByteRange {
 		return fmt.Errorf("播放列表使用了 #EXT-X-BYTERANGE（单文件按字节区间切片），当前版本不支持字节范围分片，无法正确下载该流")
 	}
 	return nil
+}
+
+// ensureNoDiscontinuity 校验播放列表没有时间轴断点。
+//
+// #EXT-X-DISCONTINUITY 声明「接下来的分片与前面的不在同一条时间轴上」：编码
+// 参数切换、广告插入、直播中编码器重启都会产生它。当前管线把分片一律当一条
+// 连续时间轴顺序拼接，既不重置时间基准也不重编号 —— 断点之后的分片会落在
+// 错误的时间位置，产物"能播但时间轴错"，而且不会有任何报错。完整支持需要处理
+// 时间基准重置（并可能涉及编码参数切换后的重新封装），属于较大的改动；
+// 与 #EXT-X-BYTERANGE 同类，定版前先显式拒绝。
+func ensureNoDiscontinuity(pl playlistInfo) error {
+	if pl.hasDiscontinuity {
+		return fmt.Errorf("播放列表包含 #EXT-X-DISCONTINUITY（时间轴断点），当前版本不支持在断点处重置时间轴，无法保证产物的时间轴正确")
+	}
+	return nil
+}
+
+// ensureNotNestedMaster 校验取出的一跳子播放列表不是又一个 master。
+//
+// master 里 #EXT-X-STREAM-INF 之后的行是下一级播放列表的地址。当前实现只做
+// 一跳（master → 媒体播放列表）：第二跳拿到的东西只验了「首行是 #EXTM3U」，
+// 若它又是 master，就意味着里面那一串地址是**下一级播放列表**，而 parsePlaylist
+// 会跳过所有以 # 开头的行、把这些地址当成分片逐个下载 —— 拼出来的成品是若干份
+// m3u8 文本，日志却一切正常（本项目头号缺陷形态）。
+//
+// 归在「不支持特性显式拒绝」这一族，但没并进 validatePlaylist：master 的内容在
+// 取出子播放列表那一刻就被替换掉了，出了 fetchPlaylist 再没有地方能看到它。
+func ensureNotNestedMaster(subBody []byte, subURL string) error {
+	if hasPlaylistTag(subBody, "#EXT-X-STREAM-INF") {
+		return fmt.Errorf("master playlist 指向的子播放列表又是一个 master（多级嵌套），"+
+			"当前版本只支持一跳，无法正确下载该流: %s", sanitizeURLForError(subURL))
+	}
+	return nil
+}
+
+// ensureNoSeparateAudio 校验选中的变体没有把音频放在独立的 #EXT-X-MEDIA 轨道上。
+//
+// master 可以用 #EXT-X-MEDIA:TYPE=AUDIO 把音频单独切成一条播放列表，再让变体通过
+// AUDIO="<组名>" 引用它（demuxed 音频）。当前实现只下载单一播放列表、完全不认识
+// #EXT-X-MEDIA，于是下回来的成品**没有声音**，而日志一切正常 —— 与 validatePlaylist
+// 里那几条同源，只是这条的线索只在 master 里（同样出不了 fetchPlaylist）。
+func ensureNoSeparateAudio(content, variantLine string) error {
+	if masterHasSeparateAudioTrack(content, variantLine) {
+		return fmt.Errorf("master playlist 把音频放在独立的 #EXT-X-MEDIA 轨道上" +
+			"（选中的变体用 AUDIO 属性引用了带 URI 的音频组），当前版本只下载单一播放列表、" +
+			"无法把独立音轨合并进来，会产出没有声音的成品")
+	}
+	return nil
+}
+
+// masterHasSeparateAudioTrack 判断选中的变体是否真的依赖一条独立音频轨道。
+//
+// 判据刻意收窄，否则会误伤一大片本来正常的流：
+//   - 变体没写 AUDIO 属性 ⇒ 音频与视频在同一条播放列表里（muxed），正常，不拒；
+//   - #EXT-X-MEDIA 的 URI 缺省 ⇒ 规范规定这就是「音频与该组视频同容器」的写法
+//     （URI 是可选属性），正常，不拒；
+//   - TYPE=SUBTITLES / CLOSED-CAPTIONS ⇒ 只是字幕轨，缺了不影响正片可播，不拒。
+//
+// 三者叠加（被引用 + 是音频 + 带 URI）才说明「关键内容确实在别的播放列表里」。
+func masterHasSeparateAudioTrack(content, variantLine string) bool {
+	group := firstGroup(streamAudioRe, variantLine)
+	if group == "" {
+		return false
+	}
+	for _, line := range strings.Split(strings.TrimPrefix(content, "\ufeff"), "\n") {
+		line = strings.TrimSpace(line)
+		// 必须带冒号：#EXT-X-MEDIA-SEQUENCE 是另一个标签，前缀相同但语义无关。
+		if !strings.HasPrefix(line, "#EXT-X-MEDIA:") {
+			continue
+		}
+		if !strings.EqualFold(firstGroup(mediaTypeRe, line), "AUDIO") {
+			continue
+		}
+		if firstGroup(mediaGroupRe, line) != group {
+			continue
+		}
+		if firstGroup(mediaURIRe, line) != "" {
+			return true
+		}
+	}
+	return false
+}
+
+var (
+	// EXT-X-MEDIA 行的属性：TYPE / GROUP-ID / URI。
+	mediaTypeRe  = regexp.MustCompile(`(?i)\bTYPE\s*=\s*"?([^",]+)"?`)
+	mediaGroupRe = regexp.MustCompile(`(?i)\bGROUP-ID\s*=\s*"?([^",]+)"?`)
+	mediaURIRe   = regexp.MustCompile(`(?i)\bURI\s*=\s*"?([^",]+)"?`)
+	// EXT-X-STREAM-INF 行的 AUDIO 属性：引用音频组的组名。
+	streamAudioRe = regexp.MustCompile(`(?i)\bAUDIO\s*=\s*"?([^",]+)"?`)
+)
+
+// hasPlaylistTag 按行判断播放列表正文里是否出现某个标签（忽略行首尾空白与 BOM）。
+// 用整行前缀而不是 strings.Contains：标签名是别的词的前缀时（如 #EXT-X-MEDIA
+// 与 #EXT-X-MEDIA-SEQUENCE）才不会被误判。
+func hasPlaylistTag(body []byte, tag string) bool {
+	s := strings.TrimPrefix(string(body), "\ufeff")
+	for _, line := range strings.Split(s, "\n") {
+		if strings.HasPrefix(strings.TrimSpace(line), tag) {
+			return true
+		}
+	}
+	return false
+}
+
+// firstGroup 取正则第一个捕获组（无匹配返回空串）。
+func firstGroup(re *regexp.Regexp, s string) string {
+	if m := re.FindStringSubmatch(s); len(m) == 2 {
+		return m[1]
+	}
+	return ""
 }
 
 // KeyInfo 一条 #EXT-X-KEY 声明（URI 已按播放列表 base 解析为绝对地址）。
@@ -244,6 +376,9 @@ func (j *dlJob) fetchPlaylist(ctx context.Context) (content, base string, isDire
 			return "", "", false, fmt.Errorf(
 				"子播放列表响应不是 m3u8 内容（可能是网页/解析页）: %s", sanitizeURLForError(subURL))
 		}
+		if err := ensureNotNestedMaster(subBody, subURL); err != nil {
+			return "", "", false, err
+		}
 		return string(subBody), subURL, false, nil
 	}
 	return content, base, false, nil
@@ -268,6 +403,10 @@ func parsePlaylist(m3u8Text, base string) playlistInfo {
 		switch {
 		case strings.HasPrefix(line, "#EXT-X-ENDLIST"):
 			pl.hasEndList = true
+		case strings.HasPrefix(line, "#EXT-X-DISCONTINUITY"):
+			// 两种标签都计入：#EXT-X-DISCONTINUITY（断点本身）与
+			// #EXT-X-DISCONTINUITY-SEQUENCE（断点序列号，出现即说明有断点）。
+			pl.hasDiscontinuity = true
 		case strings.HasPrefix(line, "#EXT-X-MEDIA-SEQUENCE:"):
 			if v, err := strconv.ParseUint(strings.TrimSpace(strings.TrimPrefix(line, "#EXT-X-MEDIA-SEQUENCE:")), 10, 64); err == nil {
 				pl.mediaSeq = v
@@ -293,6 +432,9 @@ func parsePlaylist(m3u8Text, base string) playlistInfo {
 			if u := mapURIAttr(line); u != "" {
 				pl.hasMap = true
 				pl.mapURI = resolveURL(base, u)
+				// init 段的 BYTERANGE 与分片行的 BYTERANGE 是同一特性，
+				// 但管线对 init 段只做"按 URI 整份下载"，同样按错误语义硬跑。
+				pl.mapByteRange = pl.mapByteRange || mapHasByteRangeAttr(line)
 			}
 		case strings.HasPrefix(line, "#EXTINF:"):
 			// EXTINF 行在它对应的分片 URL 行之前出现，先记下等 URL 行配对
@@ -316,9 +458,18 @@ func parsePlaylist(m3u8Text, base string) playlistInfo {
 	return pl
 }
 
-// parseEXTINFDuration 解析 "#EXTINF:10.0," 中的秒数；解析失败或产生非有限值
+// maxExtinfSeconds 单条 #EXTINF 的合理上限（秒）。HLS 规范建议分片 1–10 秒，长分片
+// 也不过几十秒 —— 取 1 小时，留了三个数量级余量。理由见 parseEXTINFDuration。
+const maxExtinfSeconds = 3600
+
+// parseEXTINFDuration 解析 "#EXTINF:10.0," 中的秒数；解析失败、产生非有限值
 // （如 "#EXTINF:NaN," / "#EXTINF:+Inf,"：strconv.ParseFloat 会成功返回但结果是
-// NaN/+Inf，污染 totalDur 与 durs 令下游净时长比较失效）返回 0。
+// NaN/+Inf，污染 totalDur 与 durs 令下游净时长比较失效）或**荒谬的大值**返回 0。
+//
+// 大值这一道是 A-6：`1e300` 是**有限**值，能穿透 NaN/Inf 检查。它一路累加进
+// job.gapMillis（`int64(sec*1000)` 溢出 int64、回绕成负数）⇒ gapSecondsNow()
+// 此后恒为负 ⇒ 缺口提示对**该任务永久关闭**（产物中间有洞却一声不响）。
+// 远端字节是不可信输入，这里必须限量级。
 func parseEXTINFDuration(line string) float64 {
 	rest := strings.TrimPrefix(line, "#EXTINF:")
 	rest = strings.TrimSpace(rest)
@@ -329,13 +480,28 @@ func parseEXTINFDuration(line string) float64 {
 	if err != nil || math.IsNaN(d) || math.IsInf(d, 0) {
 		return 0
 	}
+	if d > maxExtinfSeconds {
+		return 0
+	}
 	return d
 }
 
 // #EXT-X-KEY 行属性的正则（模块级编译，parseKeyLine 每行解析复用；
 // 属性名按大小写不敏感匹配，容忍非规范播放列表）。
 var (
-	keyMethodRe = regexp.MustCompile(`(?i)METHOD=([A-Za-z0-9-]+)`)
+	// keyMethodRe METHOD 属性值。规范要求裸枚举值，但非规范播放列表会写成
+	// METHOD="AES-128"（带引号）或 METHOD = AES-128（等号两侧有空白）。
+	//
+	// 旧实现只认裸值，且**把"正则匹配不上"直接当成"没有 METHOD 属性"** ⇒ 带引号
+	// 的 METHOD 会让整条加密声明蒸发：key=nil、keyMalformed 不置位、validatePlaylist
+	// 放行 ⇒ 密文被当明文拼进成品、日志全绿（P1-7）。宽容度现与 keyURIRe /
+	// keyFormatRe / mapURIRe 对齐 —— 那三个一直容忍带引号与裸值两种写法。
+	keyMethodRe = regexp.MustCompile(`(?i)METHOD\s*=\s*"?([A-Za-z0-9-]+)"?`)
+	// keyMethodAttrRe 宽松探测「这一行到底有没有声明 METHOD 属性」：只看属性名，
+	// 不看值。**畸形判据必须建立在比解析器更宽的判据上** —— 拿同一个窄正则既当
+	// 解析器又当判据，等于让"解析失败"与"根本没有这个属性"永远不可区分，而这两者
+	// 的处置完全相反（前者必须显式失败，后者才是明文）。见 parseKeyLine。
+	keyMethodAttrRe = regexp.MustCompile(`(?i)[:,\s]METHOD\s*=`)
 	// keyURIRe URI 属性：规范要求 quoted-string，但非规范播放列表会写成裸值
 	// （URI=k.ts,IV=…），两种都认——与下面 keyFormatRe 的宽容度对齐。旧实现只认
 	// 带引号形态，裸值时 URI 取不到、整条声明被当成明文流（见 ensureKeyDeclared）。
@@ -367,6 +533,42 @@ func mapURIAttr(line string) string {
 	return strings.TrimSpace(m[2])
 }
 
+// mapHasByteRangeAttr 判定 #EXT-X-MAP 行是否带 BYTERANGE 属性。
+//
+// 不在整行上正则匹配 `BYTERANGE=`：URI 属性是 quoted-string，查询串里完全可能
+// 出现这个词（`URI="https://x/i.mp4?BYTERANGE=0"`），整行匹配会把合法流误判成
+// 不支持。规范里属性用逗号分隔、quoted-string 内部的逗号不算分隔符，所以按引号
+// 状态切段、再逐段比对**属性名**，就只认真正的属性位置。
+func mapHasByteRangeAttr(line string) bool {
+	i := strings.IndexByte(line, ':')
+	if i < 0 {
+		return false
+	}
+	attrs := line[i+1:]
+	inQuote := false
+	start := 0
+	for j := 0; j < len(attrs); j++ {
+		c := attrs[j]
+		if c == '"' {
+			inQuote = !inQuote
+			continue
+		}
+		if c != ',' || inQuote {
+			continue
+		}
+		if isByteRangeToken(attrs[start:j]) {
+			return true
+		}
+		start = j + 1
+	}
+	return isByteRangeToken(attrs[start:])
+}
+
+// isByteRangeToken 判定一个属性片段是否为 BYTERANGE=…（属性名大小写不敏感）。
+func isByteRangeToken(seg string) bool {
+	return strings.HasPrefix(strings.ToUpper(strings.TrimSpace(seg)), "BYTERANGE=")
+}
+
 // parseKeyLine 解析 #EXT-X-KEY 行：METHOD、URI（相对路径按 base 解析）、
 // 十六进制 IV 与 KEYFORMAT。
 //
@@ -375,10 +577,19 @@ func mapURIAttr(line string) string {
 //   - (nil, false)：行里没有 METHOD 属性（不是有效 KEY 声明），或 METHOD=NONE
 //     （显式明文）——两者都该按明文处理；
 //   - (key, false)：解析成功；
-//   - (nil, true)：声明了加密 METHOD，但 URI 缺失/为空 —— 畸形，必须显式失败。
+//   - (nil, true)：声明了加密但读不懂 —— METHOD 值缺失/为空、或 URI 缺失/为空。
+//
+// ⚠️ 第三态的判据取 **keyMethodAttrRe（宽）** 而不是 keyMethodRe（窄）：只要行里
+// 出现了 METHOD 属性名，而我们没能解析出一个可用的方法值，就必须报畸形。
+// 反过来用窄正则当判据时，"METHOD 的写法没被认出来"会退化成第一态（明文），
+// 与它本该走的第三态（显式失败）正好相反 —— 这个漏洞 2026-09-24 用探针复现过
+// （METHOD="AES-128" 与 METHOD = AES-128 两种写法 ⇒ key=nil + 校验放行）。
 func parseKeyLine(line, base string) (*KeyInfo, bool) {
 	m := keyMethodRe.FindStringSubmatch(line)
 	if len(m) != 2 {
+		if keyMethodAttrRe.MatchString(line) {
+			return nil, true
+		}
 		return nil, false
 	}
 	method := strings.ToUpper(m[1])
@@ -421,6 +632,9 @@ func keyURIAttr(line string) string {
 func (j *dlJob) pickHighestBitrateM3U8(content string) (string, error) {
 	lines := strings.Split(content, "\n")
 	var bestURL string
+	// bestLine 记住选中变体的 #EXT-X-STREAM-INF 行：它的属性（如 AUDIO）决定
+	// 这条流的关键内容是否被拆到了别的播放列表里。
+	var bestLine string
 	var bestBw int64 = -1
 	base := urlBase(j.m3u8URL)
 	for i := 0; i < len(lines); i++ {
@@ -433,6 +647,7 @@ func (j *dlJob) pickHighestBitrateM3U8(content string) (string, error) {
 					if bw > bestBw {
 						bestBw = bw
 						bestURL = resolveURL(base, next)
+						bestLine = line
 					}
 				}
 			}
@@ -440,6 +655,9 @@ func (j *dlJob) pickHighestBitrateM3U8(content string) (string, error) {
 	}
 	if bestURL == "" {
 		return "", fmt.Errorf("master playlist 中未找到子 m3u8")
+	}
+	if err := ensureNoSeparateAudio(content, bestLine); err != nil {
+		return "", err
 	}
 	return bestURL, nil
 }

@@ -143,7 +143,7 @@
 
   <div class="note">
     <span>⚠</span>
-    <span><b>改动端口需重启服务生效</b>：托盘右键「启动 / 停止服务」切换一次，或重启客户端；浏览器扩展需同步改为新端口。</span>
+    <span><b>改动端口需重启客户端生效</b>：退出并重新打开客户端；浏览器扩展需同步改为新端口。</span>
   </div>
 </div>
 <div id="toast"></div>
@@ -260,7 +260,7 @@ async function save(){
     if (!r.ok){ const t = await r.json().catch(()=>({})); throw new Error(t.error || ('HTTP '+r.status)); }
     const d = await r.json();
     if (d.restartRequired){
-      toast('已保存。新端口 '+d.port+' 需重启服务生效：托盘右键「启动 / 停止服务」切换一次');
+      toast('已保存。新端口 '+d.port+' 需重启客户端生效：请退出并重新打开客户端');
     }else{
       toast('设置已保存并生效');
     }

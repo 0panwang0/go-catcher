@@ -130,11 +130,11 @@ func ensureLocalService(exePath string, port int) nativeHostResponse {
 	if waitForLocalService(port, nativeHostWaitTotal) {
 		return nativeHostResponse{OK: true, Port: port, Started: true}
 	}
-	// 拉起来了但服务没通，常见原因是客户端已在运行、而它内部的服务被手动停掉了
+	// 拉起来了但服务没通，常见原因是客户端已在运行、而它内部的服务启动失败
 	// （单实例逻辑会让新进程直接退出并把已有窗口拉到前台）。给出可操作的提示，
 	// 别让用户对着"唤起失败"猜。
 	return nativeHostResponse{
-		Error: "客户端已启动，但本地服务未在预期时间内就绪；若客户端已在运行，请从托盘菜单启动服务",
+		Error: "客户端已启动，但本地服务未在预期时间内就绪；若客户端已在运行，请退出并重新打开客户端",
 	}
 }
 

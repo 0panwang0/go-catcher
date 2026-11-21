@@ -69,10 +69,34 @@ type Runtime struct {
 	statePathOnce  sync.Once
 	statePath      string
 	stateSaveDelay time.Duration
-	persistHealth  struct {
+	// stateSaveMu 串行化 saveState 本身。debounce goroutine 与 Engine.Stop 是两条
+	// 独立调用路径，而 writeFileAtomic 的临时名是**固定的** `<path>.tmp` ⇒ 两个写者
+	// 会互踩：A 截断临时文件、B 也截断、A 写完 rename 走、B 接着往同一个 inode 写、
+	// B 的 rename 失败 —— 落成一份**非法 JSON**，下次启动解析失败 ⇒ 历史被空表覆盖
+	// （见 stateOverwriteBlocked）。
+	stateSaveMu sync.Mutex
+	// stateOverwriteBlocked 置位后本次进程不再写状态文件。
+	// 载入时"文件读不出 / 解析不了 / 版本不认识"会置它：那些情况下 r.tasks 是
+	// "一个都没恢复"的空表，照常落盘就等于**把用户仅有的那份历史覆盖成空**（A-1）。
+	stateOverwriteBlocked bool
+	// persistDisabled 置位后本 Runtime **从不**写状态文件。CLI 的 RunCLI 用它
+	// （见 cli.go 的 RunCLI）：CLI 的一次性 Runtime 从不 loadState，而它仍会经
+	// markDirty → saveState 落盘 —— 落下去的就是一份**空表**，会把 exe 同目录里
+	// GUI 的历史整个覆盖掉（R1）。与 stateOverwriteBlocked 的区别：那条是"这次
+	// 载入失败，本轮别写"，这条是"本 Runtime 根本没有持久化语义，永远别写"。
+	persistDisabled bool
+	persistHealth   struct {
 		mu      sync.Mutex
 		lastErr string
 		lastOK  time.Time
+		// notice 是"需要用户知晓、且**不该**被后续落盘抹掉"的一次性事件：配置 /
+		// 状态文件损坏后已留档、或"本次不覆盖原状态文件"。
+		//
+		// 与 lastErr 的分工（S1）：lastErr 表达"最近一次落盘健不健康"，成功落盘时
+		// **应当**清空；notice 表达"发生过一件用户该知道的事"，成功落盘**不该**清。
+		// 先前两者共用一个槽位 ⇒ 留档消息被随后任一次成功 saveState 冲掉（GUI 有
+		// 任务时秒级发生），用户一个字都看不到。写入见 recordPersistNotice。
+		notice string
 	}
 
 	// ---- 网络（原 net.go 包级变量）----
@@ -105,6 +129,12 @@ type Runtime struct {
 	// chunkSizeBytes 目标片长；0 = 用 chunkSizeFixed（生产值）。
 	// 仅供测试调小以覆盖多片/续传路径，未暴露到 /config。
 	chunkSizeBytes int64
+
+	// ---- 媒体分片读体参数 ----
+	// segBodyBytes 单个分片读体上限；0 = 用 maxSegmentBytes（生产值，256 MiB）。
+	// 仅供测试调小以覆盖超限路径 —— 生产值下要造 256 MiB 响应才能触发，
+	// 那条路没法在单测里真跑。未暴露到 /config。
+	segBodyBytes int64
 }
 
 // newRuntime 创建一份带默认值的运行时。Engine 与 CLI 各持一份，互不共享。
@@ -126,6 +156,7 @@ func newRuntimeWithEntropy(rnd io.Reader) *Runtime {
 		livePollInterval:  3 * time.Second,
 		liveMaxEmptyPolls: 25,
 		chunkSizeBytes:    chunkSizeFixed,
+		segBodyBytes:      maxSegmentBytes,
 	}
 	// 内嵌豁免键：每次运行新键，GUI 外壳的 iframe 豁免凭据。熵源故障时留空
 	// 并记下原因——空键下 embedAccepted 一律拒绝（fail-closed），不静默放行。

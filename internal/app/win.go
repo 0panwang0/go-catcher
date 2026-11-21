@@ -1,6 +1,6 @@
 //go:build windows
 
-// Windows 进程/窗口辅助：Per-Monitor DPI、隐藏子进程、单实例互斥。
+// Windows 进程/窗口辅助：Per-Monitor DPI、单实例互斥。
 package app
 
 import (
@@ -12,12 +12,6 @@ import (
 
 // 主窗口标题（webview2 创建窗口与 FindWindow 唤起共用）
 const mainWindowTitle = "GoCatcher 下载客户端"
-
-func hiddenProcAttr() *syscall.SysProcAttr {
-	return &syscall.SysProcAttr{
-		CreationFlags: 0x08000000, // CREATE_NO_WINDOW：不弹子进程控制台
-	}
-}
 
 // enablePerMonitorDPI 在创建任何窗口前声明 Per-Monitor V2 DPI 感知。
 // go-webview2 自己不做 DPI 声明，进程默认 DPI-unaware 时整窗被系统

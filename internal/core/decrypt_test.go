@@ -540,3 +540,76 @@ func TestEnsureSingleKey(t *testing.T) {
 		t.Fatalf("未有分片使用旧 key 时的切换不应报错: %v", err)
 	}
 }
+
+// TestKeyMethodQuotingVariantsStillEncrypted METHOD 的写法变体不得让加密声明蒸发。
+//
+// 回归（P1-7，2026-09-24 探针复现）：keyMethodRe 原先写成 `METHOD=([A-Za-z0-9-]+)`，
+// 紧跟等号的必须是字母数字或连字符 ⇒ `METHOD="AES-128"`（带引号）与
+// `METHOD = AES-128`（等号两侧空白）都匹配失败，而 parseKeyLine 把「匹配失败」
+// 直接当成「没有 METHOD 属性」⇒ key=nil、keyMalformed 不置位、validatePlaylist
+// 放行 ⇒ 密文被当明文拼进成品、日志全绿。讽刺的是 keyMalformed 的注释逐字预言了
+// 这个后果 —— 规矩写下来了，守卫只堵了两条路里的一条。
+//
+// 两半都要钉：
+//   - 带引号 / 带空白两种写法必须**识别为加密**（钉住放宽后的值正则）；
+//   - 明确声明了 METHOD 却读不出方法值时必须**显式拒绝**（钉住"畸形判据取宽探测"
+//     这一层）—— 后者才是根治，因为正则永远堵不完写法变体。
+//
+// 注意：本用例**不**主张把 `#EXT-X-KEY:URI=k.bin`（有 URI 无 METHOD）改成畸形 ——
+// 那是 m3u8_duration_test.go 里明确登记过的合法明文，属有意的取舍，不在本次范围。
+func TestKeyMethodQuotingVariantsStillEncrypted(t *testing.T) {
+	base := "https://cdn.example.com/hls/"
+	encrypted := []struct {
+		name string
+		line string
+	}{
+		{"规范裸值", `#EXT-X-KEY:METHOD=AES-128,URI="k.bin"`},
+		{"带引号", `#EXT-X-KEY:METHOD="AES-128",URI="k.bin"`},
+		{"等号两侧空白", `#EXT-X-KEY:METHOD = AES-128,URI="k.bin"`},
+		{"带引号且小写", `#EXT-X-KEY:method="aes-128",URI="k.bin"`},
+	}
+	for _, c := range encrypted {
+		t.Run(c.name, func(t *testing.T) {
+			body := "#EXTM3U\n" + c.line + "\n#EXTINF:6.0,\ns0.ts\n#EXT-X-ENDLIST\n"
+			pl := parsePlaylist(body, base)
+			if pl.key == nil {
+				t.Fatalf("加密声明蒸发（key=nil）⇒ 密文会被当明文拼进成品: %q", c.line)
+			}
+			if pl.key.Method != "AES-128" {
+				t.Fatalf("Method=%q want AES-128", pl.key.Method)
+			}
+			if err := validatePlaylist(pl); err != nil {
+				t.Fatalf("合法加密流不该被拒: %v", err)
+			}
+		})
+	}
+
+	// 配对断言：明文流仍须放行。把判据写成"见到 KEY 字样就拒绝"更省事但是错的。
+	plain := parsePlaylist("#EXTM3U\n#EXTINF:6.0,\ns0.ts\n#EXT-X-ENDLIST\n", base)
+	if plain.key != nil || plain.keyMalformed {
+		t.Fatalf("无 KEY 声明的流应判明文: key=%+v malformed=%v", plain.key, plain.keyMalformed)
+	}
+	if err := validatePlaylist(plain); err != nil {
+		t.Fatalf("明文流不该被拒: %v", err)
+	}
+	none := parsePlaylist("#EXTM3U\n#EXT-X-KEY:METHOD=NONE\n#EXTINF:6.0,\ns0.ts\n#EXT-X-ENDLIST\n", base)
+	if none.key != nil || none.keyMalformed {
+		t.Fatalf("METHOD=NONE 应判明文: key=%+v malformed=%v", none.key, none.keyMalformed)
+	}
+
+	// 声明了 METHOD 却读不出方法值 ⇒ 必须显式拒绝，不得退化成明文
+	for _, line := range []string{
+		`#EXT-X-KEY:METHOD=,URI="k.bin"`,   // 方法值为空
+		`#EXT-X-KEY:METHOD="",URI="k.bin"`, // 空引号
+		`#EXT-X-KEY:METHOD="AES-128"`,      // 带引号但缺 URI
+		`#EXT-X-KEY:METHOD = ,URI="k.bin"`, // 空白 + 空值
+	} {
+		pl := parsePlaylist("#EXTM3U\n"+line+"\n#EXTINF:6.0,\ns0.ts\n#EXT-X-ENDLIST\n", base)
+		if !pl.keyMalformed {
+			t.Fatalf("声明了 METHOD 却读不出方法值必须判畸形（否则密文当明文）: %q", line)
+		}
+		if err := validatePlaylist(pl); err == nil {
+			t.Fatalf("畸形加密声明必须显式拒绝: %q", line)
+		}
+	}
+}

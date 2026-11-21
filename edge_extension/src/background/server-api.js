@@ -201,6 +201,26 @@ export async function queryDownload(msg) {
     if (!t) return { exists: false };
     // 归一化字段，供 content.js 统一处理
     if (t.done) {
+      // 中断收尾（直播故障 / 程序异常退出）：成品**已保存但没录完**，后端用
+      // interrupted=true + 有效 finalPath 表达。必须排在"有 finalPath 即完成"
+      // 之前 —— 否则它被归一化成 state:"complete"，扩展面板弹 🎉「下载完成」，
+      // 把"产物不完整"藏起来（R2，本项目头号缺陷形态）。
+      // gapSeconds/fileMissing 一并带出：中断的具体后果（缺口时长 / 文件已失效）
+      // 只有消费侧拿到才有意义。
+      if (t.interrupted) {
+        return {
+          exists: true,
+          id: t.id,
+          state: "interrupted",
+          finalPath: t.finalPath || "",
+          filename: t.finalPath ? t.finalPath.split(/[\\/]/).pop() : "",
+          pct: 100,
+          stage: t.stage || "录制中断 · 已保存",
+          error: t.error || "",
+          gapSeconds: typeof t.gapSeconds === "number" ? t.gapSeconds : 0,
+          fileMissing: !!t.fileMissing,
+        };
+      }
       if (t.finalPath) {
         return {
           exists: true,
@@ -218,6 +238,17 @@ export async function queryDownload(msg) {
           id: t.id,
           state: "canceled",
           stage: t.stage || "已取消",
+        };
+      }
+      // 用户主动停止但没录到内容：done + 无 finalPath + 非 canceled/interrupted，
+      // 且**没有错误**。这既不是「完成」（没有成品）也不是「失败」（用户自己叫停的）。
+      // 旧代码把它归成 error，扩展显示成「下载失败：下载失败」（R3）。
+      if (!t.error) {
+        return {
+          exists: true,
+          id: t.id,
+          state: "stoppedEmpty",
+          stage: t.stage || "已停止（无内容）",
         };
       }
       return {

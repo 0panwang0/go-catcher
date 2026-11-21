@@ -20,6 +20,7 @@
     parseVariants: () => parseVariants,
     qualityFromURL: () => qualityFromURL,
     resolveURL: () => resolveURL,
+    sanitizeQuality: () => sanitizeQuality,
     shortQuality: () => shortQuality,
     sleep: () => sleep,
     variantLabel: () => variantLabel,
@@ -121,6 +122,10 @@
   function shortQuality(variant) {
     return String(variant.label || "").split(" \xB7 ")[0] || "";
   }
+  function sanitizeQuality(v) {
+    const s = String(v ?? "");
+    return /^[A-Za-z0-9._+\- ]{1,24}$/.test(s) ? s : "";
+  }
   function qualityFromURL(u) {
     if (!u) return "";
     try {
@@ -129,7 +134,7 @@
         /(2160p|1440p|1080p|720p|480p|360p|240p)/i
       );
       if (m) return m[1].toUpperCase();
-      const q = p.searchParams.get("quality");
+      const q = sanitizeQuality(p.searchParams.get("quality"));
       if (q) return q;
     } catch {
     }
@@ -169,15 +174,16 @@
   function sanitizeFileName(name) {
     return String(name == null ? "" : name).replace(CONTROL_CHARS, "").replace(/[\\/:*?"<>|]/g, "_").replace(/_{2,}/g, "_").replace(/\s*_\s*/g, "_").replace(/\s+/g, " ").replace(/^[_\s]+|[_\s]+$/g, "").trim();
   }
+  var SHELL_METACHARS = /["`$!]/g;
   function quoteArg(v) {
-    return String(v == null ? "" : v).replace(CONTROL_CHARS, "").replace(/"/g, "").trim();
+    return String(v == null ? "" : v).replace(CONTROL_CHARS, "").replace(SHELL_METACHARS, "").trim();
   }
   function assembleGoCommand(m3u8URL, pageURL, outName, exePath) {
     const exe = quoteArg(exePath) || "go-catcher.exe";
     const args = [`"${exe}"`];
     if (m3u8URL) args.push(`--url="${quoteArg(m3u8URL)}"`);
     if (pageURL) args.push(`--referer="${quoteArg(pageURL)}"`);
-    if (outName) args.push(`-o "${outName}"`);
+    if (outName) args.push(`-o "${quoteArg(outName)}"`);
     return ["chcp 65001", args.join(" ")].join(" ; ");
   }
 
@@ -218,6 +224,17 @@
     })[c]);
   }
 
+  // src/background/constants.js
+  var constants_exports = {};
+  __export(constants_exports, {
+    MAX_SNIFFED: () => MAX_SNIFFED,
+    MAX_SNIFF_AGE_MS: () => MAX_SNIFF_AGE_MS,
+    POLL_MAX_MISSES: () => POLL_MAX_MISSES
+  });
+  var MAX_SNIFFED = 30;
+  var MAX_SNIFF_AGE_MS = 7 * 24 * 60 * 60 * 1e3;
+  var POLL_MAX_MISSES = 15;
+
   // src/content-shared-entry.js
-  globalThis.__m3u8Shared = { ...m3u8_parse_exports, ...cli_args_exports, ...media_url_exports, ...html_escape_exports };
+  globalThis.__m3u8Shared = { ...m3u8_parse_exports, ...cli_args_exports, ...media_url_exports, ...html_escape_exports, ...constants_exports };
 })();

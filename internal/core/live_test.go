@@ -227,9 +227,12 @@ func TestLiveFollow(t *testing.T) {
 	out := filepath.Join(t.TempDir(), "live.ts")
 	j := &dlJob{rt: testStd, m3u8URL: srv.URL + "/live.m3u8", live: true}
 
-	next, err := j.liveDownload(context.Background(), out, 0)
+	next, endKind, err := j.liveDownload(context.Background(), out, 0)
 	if err != nil {
 		t.Fatalf("liveDownload: %v", err)
+	}
+	if endKind != liveEndEndList {
+		t.Fatalf("endKind=%v want liveEndEndList（第二轮列表带 ENDLIST，属源站声明结束）", endKind)
 	}
 	if next != 4 {
 		t.Fatalf("next=%d want 4", next)
@@ -269,9 +272,12 @@ func TestLiveFollowStop(t *testing.T) {
 		time.Sleep(80 * time.Millisecond) // 等第一轮分片写盘后再停
 		cancel()
 	}()
-	next, err := j.liveDownload(ctx, out, 0)
+	next, endKind, err := j.liveDownload(ctx, out, 0)
 	if err != nil {
 		t.Fatalf("liveDownload 应为干净停止: %v", err)
+	}
+	if endKind != liveEndUserStop {
+		t.Fatalf("endKind=%v want liveEndUserStop（ctx 取消，不是任何一种自然结束）", endKind)
 	}
 	if next != 2 {
 		t.Fatalf("next=%d want 2（第一轮已录 2 片后停止）", next)
@@ -460,9 +466,12 @@ func TestLiveEventStreamNoDuplicate(t *testing.T) {
 	out := filepath.Join(t.TempDir(), "event.ts")
 	j := &dlJob{rt: testStd, m3u8URL: srv.URL + "/event.m3u8", live: true}
 
-	next, err := j.liveDownload(context.Background(), out, 0)
+	next, endKind, err := j.liveDownload(context.Background(), out, 0)
 	if err != nil {
 		t.Fatalf("liveDownload: %v", err)
+	}
+	if endKind != liveEndEndList {
+		t.Fatalf("endKind=%v want liveEndEndList（第 3 轮起列表带 ENDLIST）", endKind)
 	}
 	if next != 6 {
 		t.Fatalf("next=%d want 6（每片恰好录一次）", next)
@@ -526,8 +535,10 @@ func TestLiveFailureDoesNotAdvanceWaterline(t *testing.T) {
 
 	job := &dlJob{rt: testStd, id: "twater", live: true, m3u8URL: srv.URL + "/live.m3u8"}
 	out := filepath.Join(t.TempDir(), "live.ts")
-	if _, err := job.liveDownload(context.Background(), out, 0); err == nil {
+	if _, endKind, err := job.liveDownload(context.Background(), out, 0); err == nil {
 		t.Fatal("分片全 500 应返回错误")
+	} else if endKind != liveEndNone {
+		t.Fatalf("endKind=%v want liveEndNone（报错路径不该被记成任何一种正常结束）", endKind)
 	}
 	if wm, ok := job.seenWatermark(); ok {
 		t.Fatalf("3 片全部下载失败，水位线却推进到 %d：下一轮会把它们当已录制跳过", wm)
@@ -550,8 +561,10 @@ func TestLivePartialBatchCommitsOnlyFlushed(t *testing.T) {
 
 	job := &dlJob{rt: testStd, id: "tpartial", live: true, m3u8URL: srv.URL + "/live.m3u8"}
 	out := filepath.Join(t.TempDir(), "live.ts")
-	if _, err := job.liveDownload(context.Background(), out, 0); err == nil {
+	if _, endKind, err := job.liveDownload(context.Background(), out, 0); err == nil {
 		t.Fatal("分片失败应返回错误")
+	} else if endKind != liveEndNone {
+		t.Fatalf("endKind=%v want liveEndNone（报错路径不该被记成任何一种正常结束）", endKind)
 	}
 	wm, ok := job.seenWatermark()
 	if !ok || wm != 0 {

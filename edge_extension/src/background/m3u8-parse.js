@@ -127,6 +127,23 @@ export function shortQuality(variant) {
   return String(variant.label || "").split(" · ")[0] || "";
 }
 
+// sanitizeQuality 画质 token 的白名单（P0-2）。
+//
+// 画质是**页面可控**的输入（`?quality=`），两条入口都必须走这里：
+//   ① qualityFromURL 解析 URL 时；
+//   ② downloader 页从自己的 location.search 读 autoQuality 时 ——
+//      openDownloader 会把 item.quality 拼进 downloader.html 的 URL，
+//      读回时若不过白名单，"下载器页 → 再开一个下载器页"就绕过了收窄。
+// 出口另有一道 escapeHtml（渲染前最后一道），这里是纵深防御。
+// 它同时进文件名后缀（makeFilename）与档位排序（qualityRank），所以按白名单收窄。
+// 合法形态只有短 token（1080P / HD / 5.0 Mbps / 1080p 60fps）—— 允许空格是因为
+// variantQuality 会产出带空格的 Mbps 形态；非法值一律当「没有画质」，
+// 代价只是文件名少一个后缀，比把脏值带下去好。
+export function sanitizeQuality(v) {
+  const s = String(v ?? "");
+  return /^[A-Za-z0-9._+\- ]{1,24}$/.test(s) ? s : "";
+}
+
 // qualityFromURL 从 URL 推断画质：优先路径里的分辨率字样（/1080p/v.m3u8、
 // xxx_720p.m3u8 都命中），其次 ?quality= 参数。
 // 与 buildOutputName / makeFilename 共用——文件名后缀必须由这一处决定，
@@ -139,7 +156,7 @@ export function qualityFromURL(u) {
       /(2160p|1440p|1080p|720p|480p|360p|240p)/i
     );
     if (m) return m[1].toUpperCase();
-    const q = p.searchParams.get("quality");
+    const q = sanitizeQuality(p.searchParams.get("quality"));
     if (q) return q;
   } catch { }
   return "";

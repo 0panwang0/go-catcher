@@ -268,72 +268,146 @@ func cleanURLParseErr(err error, target string) error {
 	return fmt.Errorf("%s（链接: %s）", msg, sanitizeURLForError(target))
 }
 
-// 带重试的 HTTP GET
+// ============================================================
+// 带重试的 HTTP GET（播放列表读的两条路径共用同一副骨架）
+// ============================================================
 
-func (r *Runtime) httpGetWithRetry(ctx context.Context, target, ref string) ([]byte, int, error) {
+// getFate 一次尝试之后的走向，由单次尝试函数自报。
+//
+// ⚠️ 零值刻意是 getRetry（保守侧），不是 getDone：单次尝试里任何一支忘了写
+// fate，后果必须是"再试一轮、最后失败"，绝不能是"把失败当成功返回" ——
+// 后者正是本项目头号缺陷形态（产物坏了而日志正常）：一个漏写的字段就能把
+// HTTP 500 变成 200 成功。要 getDone 必须显式声明，它是一次尝试里唯一
+// "结果可用、可以停止重试"的走向。
+//
+// 这条不是纸面约定：TestRetryGetZeroFateStaysConservative 把 getDone 挪回
+// 零值位置就会翻红。
+type getFate int
+
+const (
+	getRetry getFate = iota // 失败，按退避策略再试（**零值**：漏写即落这里）
+	getDone                 // 取得成功，结果可用
+	getFatal                // 失败，且重试没有意义
+)
+
+// getOutcome 单次尝试的走向与失败原因。
+//
+// fate 省略即 getRetry —— 失败分支只填 err 时读作"可重试"（见 getFate 注释）。
+type getOutcome struct {
+	fate      getFate
+	noBackoff bool  // 仅 getRetry 生效：立刻重试，不做退避
+	err       error // 仅非 getDone 时有值，已带 attempt 前缀
+}
+
+// retryGet 是播放列表读两条路径共用的重试骨架。
+//
+// 为什么收敛：httpGetWithRetry 与 httpGetPlaylist 原先各写了一份逐行相同的
+// attempt 循环 + sleepCtx 退避 + lastErr 记账。第七轮给两侧各加体积上限后，
+// 重复从"重试骨架"升级成"骨架 + 上限判定" —— 同一个判据要在两处保持一致，
+// 而"改一处漏一处"正是本项目头号缺陷形态（产物坏了而日志正常）的温床。
+//
+// 骨架只管控制流：ctx 中断立即退出（退避途中也一样）、失败按 attempt*2 秒退避、
+// 记账最后一次错误、守住尝试次数。单次尝试仍各自独立 —— 两者对响应的处理本来就
+// 不同（peek 判直链 + 流式解压 vs 整体读后解压），合并没有意义。
+//
+// ⚠️ 零次尝试的后果是"成功 + 空内容"（返回零值 + nil error），正是 P0-3 那条
+// 缺陷的形态。这里**不**夹取下限，而是显式拒绝：下限由 maxRetriesNow() 在读取
+// 入口保证（见 config.go），本函数只负责让"万一漏了"变成一条看得见的错误。
+func retryGet[T any](ctx context.Context, maxAttempts int, attempt func(n int) (T, getOutcome)) (T, error) {
+	var zero T
+	if maxAttempts < 1 {
+		return zero, fmt.Errorf("重试次数 %d 无效：至少要尝试一次，0 次尝试会被当成「成功 + 空内容」", maxAttempts)
+	}
 	var lastErr error
-	var lastStatus int
-	for attempt := 1; attempt <= r.maxRetriesNow(); attempt++ {
+	for n := 1; n <= maxAttempts; n++ {
 		if err := ctx.Err(); err != nil {
-			return nil, lastStatus, err
+			return zero, err
 		}
-		req, err := r.newRequest(target, ref)
-		if err != nil {
-			return nil, 0, cleanURLParseErr(err, target)
+		res, out := attempt(n)
+		if out.fate == getDone {
+			return res, nil
+		}
+		lastErr = out.err
+		if out.fate == getFatal {
+			return zero, lastErr
+		}
+		if !out.noBackoff && !sleepCtx(ctx, time.Duration(n*2)*time.Second) {
+			return zero, ctx.Err()
+		}
+	}
+	return zero, lastErr
+}
+
+// httpGetWithRetry 取一份文本资源（当前唯一调用点是 master 指向的子播放列表）。
+// 返回的 status 在成功时恒为 200；失败时给出最后一次见到的响应状态码
+// （一次响应都没收到则为 0），供调用方与测试定位。
+func (r *Runtime) httpGetWithRetry(ctx context.Context, target, ref string) ([]byte, int, error) {
+	var lastStatus int
+	body, err := retryGet(ctx, r.maxRetriesNow(), func(n int) ([]byte, getOutcome) {
+		req, rerr := r.newRequest(target, ref)
+		if rerr != nil {
+			// URL 非法：重试还是同一个 URL，直接失败
+			return nil, getOutcome{fate: getFatal, err: cleanURLParseErr(rerr, target)}
 		}
 		req = req.WithContext(ctx)
-		resp, err := r.getClient().Do(req)
-		if err != nil {
+		resp, rerr := r.getClient().Do(req)
+		if rerr != nil {
 			if ctx.Err() != nil {
-				return nil, lastStatus, ctx.Err()
+				return nil, getOutcome{fate: getFatal, err: ctx.Err()}
 			}
-			lastErr = fmt.Errorf("attempt %d: %w", attempt, err)
-			if !sleepCtx(ctx, time.Duration(attempt*2)*time.Second) {
-				return nil, lastStatus, ctx.Err()
-			}
-			continue
+			return nil, getOutcome{err: fmt.Errorf("attempt %d: %w", n, rerr)}
 		}
 		if resp.StatusCode != http.StatusOK {
 			lastStatus = resp.StatusCode
-			// 打印响应头帮助调试
-			if attempt == 1 {
+			// 打印响应头帮助调试（只看第一次：重试之间的响应头基本相同）
+			if n == 1 {
 				fmt.Printf("\n  HTTP %d, 响应头:\n", resp.StatusCode)
 				for k, v := range resp.Header {
 					fmt.Printf("    %s: %s\n", k, v)
 				}
 			}
 			resp.Body.Close()
-			lastErr = fmt.Errorf("attempt %d: HTTP %d", attempt, resp.StatusCode)
-			if !sleepCtx(ctx, time.Duration(attempt*2)*time.Second) {
-				return nil, lastStatus, ctx.Err()
-			}
-			continue
+			return nil, getOutcome{err: fmt.Errorf("attempt %d: HTTP %d", n, resp.StatusCode)}
 		}
 		// 读体带空闲超时（与分片下载同一套）：只设 ResponseHeaderTimeout 时，
-		// 服务端把响应头发完就停住会让读取永久挂住。
-		body, err := readAllWithIdleTimeout(resp.Body, transferIdleTimeout)
+		// 服务端把响应头发完就停住会让读取永久挂住。上限见 maxPlaylistBytes。
+		raw, rerr := readCappedWithIdleTimeout(resp.Body, resp.Body, maxPlaylistBytes, transferIdleTimeout)
 		resp.Body.Close()
-		if err != nil {
-			lastErr = fmt.Errorf("attempt %d: read body: %w", attempt, err)
+		if rerr != nil {
 			if ctx.Err() != nil {
-				return nil, lastStatus, ctx.Err()
+				return nil, getOutcome{fate: getFatal, err: ctx.Err()}
 			}
-			continue
+			out := getOutcome{noBackoff: true, err: fmt.Errorf("attempt %d: read body: %w", n, rerr)}
+			if errors.Is(rerr, errBodyTooLarge) {
+				// 超限是"远端返回的东西不是播放列表"，重试只会再来一遍同样的内容。
+				out.fate = getFatal
+			}
+			return nil, out
 		}
 		// 显式解压：Go 在请求未显式声明 Accept-Encoding 时会自动解压 gzip，
 		// 但自定义 Transport + 指纹伪装握手下个别 CDN 仍可能把压缩流原样返回。
 		// 此处按 Content-Encoding 兜底（若 Go 已解压，该头会被移除，不会二次解压）。
 		if enc := resp.Header.Get("Content-Encoding"); strings.Contains(enc, "gzip") {
-			if gz, gerr := gzip.NewReader(bytes.NewReader(body)); gerr == nil {
-				if ub, uerr := io.ReadAll(gz); uerr == nil {
-					body = ub
-				}
+			if gz, gerr := gzip.NewReader(bytes.NewReader(raw)); gerr == nil {
+				// 解压同样有上限：压缩率由对方决定，压缩前那道限挡不住解压炸弹。
+				ub, uerr := readCappedBytes(gz, maxPlaylistBytes)
 				gz.Close()
+				if errors.Is(uerr, errBodyTooLarge) {
+					return nil, getOutcome{fate: getFatal, err: fmt.Errorf("attempt %d: %w", n, uerr)}
+				}
+				if uerr == nil {
+					raw = ub
+				}
+				// 其它解压错误（损坏的 gzip，极少见）：沿用原行为按未解压正文处理，
+				// 后面 isM3U8Playlist 会判定它不是播放列表。
 			}
 		}
-		return body, http.StatusOK, nil
+		return raw, getOutcome{fate: getDone}
+	})
+	if err != nil {
+		return nil, lastStatus, err
 	}
-	return nil, lastStatus, lastErr
+	return body, http.StatusOK, nil
 }
 
 // isM3U8Playlist 校验响应体是否为 m3u8 播放列表文本：首个非空行以 #EXTM3U
@@ -353,39 +427,36 @@ func isM3U8Playlist(body []byte) bool {
 	return false
 }
 
+// fetchedPlaylist 一次成功尝试的产物：正文 + 是否直链媒体文件。
+type fetchedPlaylist struct {
+	body     []byte
+	isDirect bool
+}
+
 // httpGetPlaylist 获取 m3u8 播放列表；若响应是直链媒体文件（MP4 等），
 // 只读取开头一小段识别后即返回（isDirect=true），由上层改为流式整体下载，
 // 避免把整个大文件读进内存。文本播放列表则读完剩余部分一并返回。
-func (r *Runtime) httpGetPlaylist(ctx context.Context, target, ref string) (body []byte, isDirect bool, status int, err error) {
+//
+// 与 httpGetWithRetry 共用 retryGet 的控制流，但响应处理各自独立：这里多一道
+// "peek 判直链"，gzip 也走流式（peek 阶段就开始解压，不必先把整份压包读进内存）。
+func (r *Runtime) httpGetPlaylist(ctx context.Context, target, ref string) ([]byte, bool, int, error) {
 	const peekLen = 32 << 10 // 32KB：足够判断文本播放列表与二进制媒体头
-	var lastErr error
-	for attempt := 1; attempt <= r.maxRetriesNow(); attempt++ {
-		if err := ctx.Err(); err != nil {
-			return nil, false, 0, err
-		}
+	got, err := retryGet(ctx, r.maxRetriesNow(), func(n int) (fetchedPlaylist, getOutcome) {
 		req, rerr := r.newRequest(target, ref)
 		if rerr != nil {
-			return nil, false, 0, cleanURLParseErr(rerr, target)
+			return fetchedPlaylist{}, getOutcome{fate: getFatal, err: cleanURLParseErr(rerr, target)}
 		}
 		req = req.WithContext(ctx)
 		resp, rerr := r.getClient().Do(req)
 		if rerr != nil {
 			if ctx.Err() != nil {
-				return nil, false, 0, ctx.Err()
+				return fetchedPlaylist{}, getOutcome{fate: getFatal, err: ctx.Err()}
 			}
-			lastErr = fmt.Errorf("attempt %d: %w", attempt, rerr)
-			if !sleepCtx(ctx, time.Duration(attempt*2)*time.Second) {
-				return nil, false, 0, ctx.Err()
-			}
-			continue
+			return fetchedPlaylist{}, getOutcome{err: fmt.Errorf("attempt %d: %w", n, rerr)}
 		}
 		if resp.StatusCode != http.StatusOK {
 			resp.Body.Close()
-			lastErr = fmt.Errorf("attempt %d: HTTP %d", attempt, resp.StatusCode)
-			if !sleepCtx(ctx, time.Duration(attempt*2)*time.Second) {
-				return nil, false, 0, ctx.Err()
-			}
-			continue
+			return fetchedPlaylist{}, getOutcome{err: fmt.Errorf("attempt %d: HTTP %d", n, resp.StatusCode)}
 		}
 
 		rd := io.Reader(resp.Body)
@@ -397,44 +468,50 @@ func (r *Runtime) httpGetPlaylist(ctx context.Context, target, ref string) (body
 				gz = nil // 解压失败就按原样读（极少见）
 			}
 		}
+		// 收尾统一走这里：响应体每次尝试都必须关，漏一处就是连接泄漏。
+		closeBody := func() {
+			if gz != nil {
+				gz.Close()
+			}
+			resp.Body.Close()
+		}
 		// peek/rest 都带空闲超时，closer 恒为 resp.Body：gzip.Reader.Close 不关
 		// 底层连接，而空闲超时靠 Close 从另一 goroutine 中断阻塞读。
 		var peekBuf bytes.Buffer
 		if _, rerr = copyWithIdleTimeout(&peekBuf, limitReadCloser(rd, peekLen, resp.Body), transferIdleTimeout); rerr != nil {
-			if gz != nil {
-				gz.Close()
-			}
-			resp.Body.Close()
-			lastErr = fmt.Errorf("attempt %d: read body: %w", attempt, rerr)
-			continue
+			closeBody()
+			return fetchedPlaylist{}, getOutcome{noBackoff: true, err: fmt.Errorf("attempt %d: read body: %w", n, rerr)}
 		}
 		peek := peekBuf.Bytes()
 		if isDirectMediaFile(peek, resp.Header.Get("Content-Type")) {
-			if gz != nil {
-				gz.Close()
-			}
-			resp.Body.Close()
-			return peek, true, http.StatusOK, nil
+			closeBody()
+			return fetchedPlaylist{body: peek, isDirect: true}, getOutcome{fate: getDone}
 		}
-		rest, rerr := readAllWithIdleTimeout(&limitedReadCloser{Reader: rd, Closer: resp.Body}, transferIdleTimeout)
-		if gz != nil {
-			gz.Close()
-		}
-		resp.Body.Close()
+		// 上限按"整份播放列表"算：peek 已占去一部分，剩下的额度在这里
+		// （httpGetWithRetry 与这里读的是同一类东西，两侧同一个 maxPlaylistBytes）。
+		rest, rerr := readCappedWithIdleTimeout(rd, resp.Body, maxPlaylistBytes-int64(len(peek)), transferIdleTimeout)
+		closeBody()
 		if rerr != nil {
-			lastErr = fmt.Errorf("attempt %d: read body: %w", attempt, rerr)
-			continue
+			out := getOutcome{noBackoff: true, err: fmt.Errorf("attempt %d: read body: %w", n, rerr)}
+			if errors.Is(rerr, errBodyTooLarge) {
+				// 超限的内容重试一遍还是同一份，没必要空耗 maxRetries 轮
+				out.fate = getFatal
+			}
+			return fetchedPlaylist{}, out
 		}
 		full := append(peek, rest...)
 		if !isM3U8Playlist(full) {
 			// 200 但内容不是播放列表（网页/解析页）：重试同样结果，直接失败并
 			// 给出可行动的错误，不再空耗 maxRetries 轮
-			return nil, false, 0, fmt.Errorf(
-				"URL 指向的不是 m3u8 播放列表（响应为网页内容，请确认选择 .m3u8 直链，而非播放页/解析页链接）")
+			return fetchedPlaylist{}, getOutcome{fate: getFatal, err: fmt.Errorf(
+				"URL 指向的不是 m3u8 播放列表（响应为网页内容，请确认选择 .m3u8 直链，而非播放页/解析页链接）")}
 		}
-		return full, false, http.StatusOK, nil
+		return fetchedPlaylist{body: full}, getOutcome{fate: getDone}
+	})
+	if err != nil {
+		return nil, false, 0, err
 	}
-	return nil, false, 0, lastErr
+	return got.body, got.isDirect, http.StatusOK, nil
 }
 
 // ============================================================
@@ -523,6 +600,37 @@ const transferIdleTimeout = 60 * time.Second
 var errTransferStalled = fmt.Errorf(
 	"传输中断：连续 %s 无数据到达（连接卡死或服务端已停止响应）", transferIdleTimeout)
 
+// errBodyTooLarge 响应体超过体积上限。独立哨兵：调用方要区分"超限"（远端恶意/异常，
+// 必须显式失败）与"其它读错误"（沿用原有重试语义）。
+var errBodyTooLarge = errors.New("响应体超过体积上限")
+
+// maxPlaylistBytes 单个播放列表响应的读取上限，**解压前后各自适用**。
+//
+// 真实播放列表是纯文本：一万条分片 × 每行约 100 字节 ≈ 1 MB，8 MiB 已是一个
+// 数量级的余量（大分片段走 fetchSegment，不经这里，故不受此值影响）。
+//
+// 设上限的理由不是"装不下"，而是**远端字节不可信**：无上限时，一个持续输出的
+// 源站就能把响应体无限灌进内存。解压后的读取必须用同一个上限——压缩率由对方
+// 决定（可到 1000:1），只在压缩前设限挡不住"小输入炸出大内存"。
+const maxPlaylistBytes int64 = 8 << 20
+
+// maxSegmentBytes 单个媒体分片读体上限（生产默认值）。
+//
+// 与 maxPlaylistBytes 的定值依据完全不同：播放列表是纯文本，大小可以估
+// （一万条分片约 1 MB）；分片是二进制媒体，合法大小跨三个数量级 —— 音频片
+// 几十 KB，4K 高码率片上百 MB —— 而且**没有可依据的声明长度**：播放列表不
+// 给单片大小，BANDWIDTH 只出现在 master 里、media playlist 拿不到。
+//
+// 所以这个值刻意取得很宽：它要挡的不是"偏大的分片"，而是**"无限灌"**。
+// 分片读路径原先只有空闲超时（连续 60s 无数据才中断），而空闲超时管的是
+// "对方卡住不动"——只要对方持续吐字节就永远不空闲，ReadAll 会一路读进内存
+// 直到进程 OOM，且日志上一个错字都没有。256 MiB 高于任何已知合法分片，
+// 又远低于"能把内存吃光"。
+//
+// ⚠ 这是**单片**上限，不是任务上限：并发 10 时理论峰值仍是 10 × 256 MiB。
+// 它给的是"有界"，不是"够用"——量级守卫，别当成容量规划。
+const maxSegmentBytes int64 = 256 << 20
+
 // copyWithIdleTimeout 把 body 拷到 dst，读空闲超过 idle 即关闭 body 中断传输。
 // 返回已写字节数与错误；正常情况下 io.EOF 归零为 nil。
 //
@@ -560,11 +668,33 @@ func copyWithIdleTimeout(dst io.Writer, body io.ReadCloser, idle time.Duration) 
 	}
 }
 
-// readAllWithIdleTimeout 读整个 body 到内存，带空闲超时（小分片用）。
-func readAllWithIdleTimeout(body io.ReadCloser, idle time.Duration) ([]byte, error) {
-	var buf bytes.Buffer
-	if _, err := copyWithIdleTimeout(&buf, body, idle); err != nil {
+// readCappedBytes 把 r 读进内存并硬性限制字节数（用于已在内存里的数据，如 gzip 解压流）。
+//
+// 超限**返回错误而不是截断**：截断会让"只读到一半的播放列表"被当成完整内容进管线，
+// 产物错了而日志正常——正是本项目反复出现的头号缺陷形态。多读 1 字节是为了把
+// "正好等于上限"与"超出上限"区分开。
+func readCappedBytes(r io.Reader, limit int64) ([]byte, error) {
+	b, err := io.ReadAll(io.LimitReader(r, limit+1))
+	if err != nil {
 		return nil, err
+	}
+	if int64(len(b)) > limit {
+		return nil, fmt.Errorf("%w（已超出 %d 字节上限）", errBodyTooLarge, limit)
+	}
+	return b, nil
+}
+
+// readCappedWithIdleTimeout 同 readCappedBytes，但带空闲超时。
+// r 与 closer 分开传：r 可能是套在 resp.Body 上的 gzip.Reader，
+// 而中断阻塞读必须作用于底层 resp.Body（见 limitedReadCloser 的注释）。
+func readCappedWithIdleTimeout(r io.Reader, closer io.Closer, limit int64, idle time.Duration) ([]byte, error) {
+	var buf bytes.Buffer
+	n, err := copyWithIdleTimeout(&buf, limitReadCloser(r, limit+1, closer), idle)
+	if err != nil {
+		return nil, err
+	}
+	if n > limit {
+		return nil, fmt.Errorf("%w（已超出 %d 字节上限）", errBodyTooLarge, limit)
 	}
 	return buf.Bytes(), nil
 }

@@ -5,9 +5,11 @@ package fmp4
 import (
 	"bytes"
 	"encoding/binary"
+	"fmt"
 	"math"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -603,6 +605,30 @@ func TestRebuildMdatBoundsErrors(t *testing.T) {
 	segVideoOOB, _ := buildTwoTrackSeg(100, 6, offV+8)
 	if out, err := NewState().Normalize(segVideoOOB); err != nil || len(out) != len(segVideoOOB) {
 		t.Fatalf("视频越界分片应原样放行: %v", err)
+	}
+}
+
+// TestRebuildMdatFailureIsLogged 上面那些"原样放行"的分支必须**留痕**。
+//
+// 它们产出的分片是"重建过的 moof + 原始 mdat"：轨道里声明的样本尺寸/偏移不再与
+// mdat 内容对齐，播放端可能花屏、音画错位甚至直接播不动 —— 而下载过程一路正常、
+// 日志一片安静，用户拿到坏产物却毫无线索。这正是本项目头号缺陷形态。
+//
+// 同一函数里 parseMoof 失败那条分支早有 logDiagnostic，rebuildMdat 这条原来漏了；
+// 上面的用例只断言了"不上抛错误、长度不变"，一个恒真方向，抓不到"没留痕"。
+func TestRebuildMdatFailureIsLogged(t *testing.T) {
+	_, offV := buildTwoTrackSeg(8, 6, 0)
+	segOverlap, _ := buildTwoTrackSeg(8, 6, offV) // 音频区间与视频重叠 ⇒ rebuildMdat 报错
+
+	var diags []string
+	st := NewStateWithLogger(func(format string, args ...any) {
+		diags = append(diags, fmt.Sprintf(format, args...))
+	})
+	if out, err := st.Normalize(segOverlap); err != nil || len(out) != len(segOverlap) {
+		t.Fatalf("重叠分片应原样放行: %v", err)
+	}
+	if !strings.Contains(strings.Join(diags, "\n"), "mdat 重建失败") {
+		t.Fatalf("rebuildMdat 失败没有留下诊断（诊断=%q）：产物坏了而日志正常", diags)
 	}
 }
 

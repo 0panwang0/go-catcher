@@ -80,6 +80,11 @@ func TestDownloadDirectResume(t *testing.T) {
 	os.WriteFile(part, []byte("01234"), 0644) // 已下 5 字节
 
 	job := &dlJob{rt: testStd, m3u8URL: srv.URL}
+	// 残留是**有效前缀**：必须声明"上次是单连接连续追加"，才允许按文件大小续传。
+	// 模式未知时守卫会清空重下（见 downloadDirect 的模式守卫）—— 真机上这个值由
+	// pipeline 从状态文件恢复（pipeline.go 的 st.partMode），而单测直连
+	// downloadDirect，所以得自己声明；漏了这一行就等于在断言"未知模式的安全"。
+	job.setPartMode(partModeStream)
 	if err := job.downloadDirect(context.Background(), part); err != nil {
 		t.Fatalf("downloadDirect: %v", err)
 	}
@@ -108,6 +113,7 @@ func TestDownloadDirectNoRangeFallback(t *testing.T) {
 	os.WriteFile(part, []byte("stale-old-data"), 0644)
 
 	job := &dlJob{rt: testStd, m3u8URL: srv.URL}
+	job.setPartMode(partModeStream) // 上次为单连接连续追加（见上一条用例的说明）
 	if err := job.downloadDirect(context.Background(), part); err != nil {
 		t.Fatalf("downloadDirect: %v", err)
 	}
@@ -140,6 +146,7 @@ func TestDownloadDirect416Retry(t *testing.T) {
 	os.WriteFile(part, []byte("very-long-stale-part"), 0644) // 20 字节 > 新文件长度
 
 	job := &dlJob{rt: testStd, m3u8URL: srv.URL}
+	job.setPartMode(partModeStream) // 上次为单连接连续追加（见 TestDownloadDirectResume 的说明）
 	if err := job.downloadDirect(context.Background(), part); err != nil {
 		t.Fatalf("downloadDirect: %v", err)
 	}
@@ -559,7 +566,7 @@ func TestStreamWriterFlushBreakpointNotAhead(t *testing.T) {
 		segSize  = 300 << 10 // 8 × 300KB = 2.4MB，足以跨过 1MB 刷新阈值
 	)
 	flushed := 0
-	sw, err := newStreamWriter(path, 0, func(int) {}, func(f int) {
+	sw, err := newStreamWriter(path, 0, 0, func(int) {}, func(f int, _ int64) {
 		if f > flushed {
 			flushed = f
 		}
@@ -604,7 +611,7 @@ func TestStreamWriterFlushBreakpointNotAhead(t *testing.T) {
 func TestStreamWriterFlushedLagsMemoryBreakpoint(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "lag.ts")
-	sw, err := newStreamWriter(path, 0, func(int) {}, func(int) {}, nil)
+	sw, err := newStreamWriter(path, 0, 0, func(int) {}, func(int, int64) {}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -641,7 +648,7 @@ func TestFinishStreamKeepsDiskBreakpointOnCloseFailure(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "fail.ts")
 	j := &dlJob{rt: testStd}
-	sw, err := newStreamWriter(path, 0, func(int) {}, func(int) {}, nil)
+	sw, err := newStreamWriter(path, 0, 0, func(int) {}, func(int, int64) {}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -748,4 +755,90 @@ func TestOffsetWriterTruncatesAtEnd(t *testing.T) {
 	if n2, err2 := w.Write([]byte("more")); err2 != nil || n2 != 0 {
 		t.Fatalf("写满后应安全丢弃：n=%d err=%v", n2, err2)
 	}
+}
+
+// TestChunkMetaMatchesPart 位图必须与 .part 的实际长度相容才敢采信（P0-5）。
+//
+// loadChunkMeta 只校验位图**自洽**（片数与 Total/Size 对得上），它看不见 .part；
+// 而「位图说第 i 片已完成」在盘上是个可观测事实：downloadRange 用 WriteAt 写
+// [i*Size, min((i+1)*Size, Total))，所以文件长度至少要到该区间末尾。
+func TestChunkMetaMatchesPart(t *testing.T) {
+	const chunk = 1 << 20
+	mk := func(done ...bool) *chunkMeta {
+		return &chunkMeta{Total: 3 * chunk, Size: chunk, Done: done}
+	}
+	cases := []struct {
+		name string
+		size int64
+		meta *chunkMeta
+		want bool
+	}{
+		{"空 .part 与「某片已完成」直接矛盾", 0, mk(true, false, false), false},
+		{"只写了半片却声称第 0 片完成", chunk - 1, mk(true, false, false), false},
+		{"正好够第 0 片", chunk, mk(true, false, false), true},
+		{"残留位图配 1 字节新 .part", 1, mk(true, false, false), false},
+		{"一片都没完成 ⇒ 不提供任何跳过指令", chunk, mk(false, false, false), true},
+		{"下界由最高那片已完成决定", 3 * chunk, mk(false, false, true), true},
+		{"最高那片不足 ⇒ 不相容", 3*chunk - 1, mk(false, false, true), false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			part := filepath.Join(t.TempDir(), "x.mp4.part")
+			f, err := os.OpenFile(part, os.O_CREATE|os.O_WRONLY, 0644)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := f.Truncate(c.size); err != nil {
+				f.Close()
+				t.Fatal(err)
+			}
+			f.Close()
+			if got := chunkMetaMatchesPart(part, c.meta); got != c.want {
+				t.Fatalf("chunkMetaMatchesPart=%v want %v", got, c.want)
+			}
+		})
+	}
+}
+
+// TestStaleBitmapWithEmptyPartIsDiscarded 残留位图 + 空 .part 必须清空重下。
+//
+// 探针复现的缺陷（P0-5，2026-09-24）：位图是独立文件，生命周期与 .part 不绑定 ——
+// 「失败任务转取消」原先只删 .part，位图留下。用户重新下载同一个视频时
+// downloadDirect 会**无条件**采信这个位图（只查"位图在不在"，不查 .part 有没有内容），
+// 于是被标记「已完成」的片永远不下载 ⇒ 2 MiB 成品前 1 MiB 全是 0x00，
+// 而 downloadDirect 返回 nil、界面显示「已保存」。
+//
+// 夹具就是那条真实触发链的末态：0 字节 .part + 内部自洽的残留位图。
+// 判据钉**产物逐字节等于源站**：跳片时前半段是 0x00，这条必红。
+func TestStaleBitmapWithEmptyPartIsDiscarded(t *testing.T) {
+	saveRestoreState(t)
+	const chunk = 512 << 10
+	saveRestoreSeg(t, 4)
+	saveRestoreChunkSize(t, chunk)
+
+	body := directMP4Stub(int(3 * chunk))
+	rr := &rangeRecorder{}
+	srv := newDirectRangeServer(rr, body)
+	t.Cleanup(srv.Close)
+
+	part := filepath.Join(t.TempDir(), "movie.mp4.part")
+	m := &chunkMeta{Total: int64(len(body)), Size: chunk}
+	m.Done = make([]bool, int(chunkCount(int64(len(body)), chunk)))
+	if len(m.Done) < 3 {
+		t.Fatalf("夹具前置不成立：片数=%d，至少要有 3 片才能造出「已完成但没下」的片", len(m.Done))
+	}
+	m.Done[0], m.Done[1] = true, true
+	if err := saveChunkMeta(part, m); err != nil {
+		t.Fatal(err)
+	}
+	// .part 是空的 —— 模拟「失败转取消」只删了 .part、位图留下
+	if err := os.WriteFile(part, nil, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	job := &dlJob{rt: testStd, m3u8URL: srv.URL + "/movie.mp4"}
+	if err := job.downloadDirect(context.Background(), part); err != nil {
+		t.Fatalf("下载失败: %v", err)
+	}
+	assertSameAsSource(t, part, body)
 }

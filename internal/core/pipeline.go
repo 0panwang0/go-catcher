@@ -95,6 +95,11 @@ func runDiskPipeline(te *taskEntry) {
 		saveDir: st.saveDir,
 		fname:   st.filename,
 	}
+	// 恢复上次的直链写入模式：位图丢失时它决定能不能按文件大小续传
+	// （分片模式是稀疏写，按大小续传会把空洞留在成品里，见 downloadDirect）。
+	if st.partMode != "" {
+		job.setPartMode(st.partMode)
+	}
 	te.mu.Lock()
 	te.job = job
 	te.mu.Unlock()
@@ -111,6 +116,17 @@ func runDiskPipeline(te *taskEntry) {
 			te.st.normState = job.norm.Snapshot()
 		}
 		te.mu.Unlock()
+		// 运行中必须落盘（P0-1）：状态文件以前只在创建/暂停/停止/收尾时写，
+		// 下载与录制的主循环里一次都没有 ⇒ 强杀（断电、任务管理器、崩溃）后
+		// 重启，磁盘上的 segDone/flushedBytes 停在开始下载之前的值，而 .part
+		// 里是整段已下/已录的内容。那条链路会引向两个后果：点「停止」按
+		// "没有内容"把文件删掉、点「继续」按陈旧断点重复追加。
+		//
+		// markDirty 自带 debounce + 合并（persist.go），高频调用不会写爆盘；
+		// 它只做"起 goroutine + 短暂持 stateMu"，而 progress 可能在
+		// streamWriter.mu 持有期间被调用（submit → onWrite → setSeg），
+		// 两者不构成锁环（不反向获取 writer 锁）。
+		te.rt.markDirty()
 	}
 
 	// 下载期间写 .part，写完后改名成正式文件（避免半成品被当成成品）
@@ -139,69 +155,10 @@ func runDiskPipeline(te *taskEntry) {
 		return
 	}
 
-	// 直链文件（MP4 等）：整体流式下载，跳过分片解析
+	// 直链文件（MP4 等）：整体流式下载，跳过分片解析。这条路径与分片路径不共享
+	// 任何状态（不解析列表、不探容器、不用断点账本），单独成函数 —— 见 runDirectDownload
 	if isDirect {
-		// 输出扩展名跟随 URL（如 .mp4），避免 MP4 内容存成 .ts
-		if ext := directExtFromURL(st.m3u8URL); ext != "" && !strings.HasSuffix(strings.ToLower(st.filename), ext) {
-			st.filename = strings.TrimSuffix(st.filename, filepath.Ext(st.filename)) + ext
-			nf, rerr := reclaimPath(st.saveDir, st.filename, st.finalPath)
-			if rerr != nil {
-				fail(rerr.Error())
-				return
-			}
-			st.finalPath = nf
-			st.filename = filepath.Base(st.finalPath)
-			partPath = st.finalPath + ".part"
-		}
-		te.mu.Lock()
-		// 重命名后的文件名/路径同步回任务状态：取消/暂停时按新路径清理 .part
-		te.st.filename = st.filename
-		te.st.finalPath = st.finalPath
-		te.st.stage = "下载直链文件中"
-		te.mu.Unlock()
-		te.rt.markDirty()
-		fmt.Printf("[disk] id=%s 直链文件下载 -> %s\n", st.id, st.finalPath)
-		if err := job.downloadDirect(ctx, partPath); err != nil {
-			if ctx.Err() != nil {
-				finishInterrupt(te)
-				return
-			}
-			fail("下载直链文件失败: " + err.Error())
-			return
-		}
-		if err := moveFile(partPath, st.finalPath); err != nil {
-			fail("保存文件失败: " + err.Error())
-			return
-		}
-		te.mu.Lock()
-		te.st.running = false
-		te.st.done = true
-		te.st.paused = false
-		te.st.stage = "已保存"
-		te.st.filename = st.filename
-		te.st.finalPath = st.finalPath
-		te.st.errorMsg = ""
-		te.st.finished = time.Now()
-		// 直链进度对齐：文件已经完整落盘，"下满了"是事实。
-		// 分母优先用下载时探到的总大小；服务器既不给 Content-Length 也不给
-		// Content-Range（chunked 响应）时，用刚写好的成品大小补上 ——
-		// 一条成功的记录绝不能停在 0%（学徒 2026-09-19 截图里就是这个毛病）。
-		//
-		// 必须写回 job 的原子计数，不能只改 te.st：snapshot() 对还挂着 job 的任务
-		// 一律以 job 的原子值为准（分片路径的 te.st.segDone 本就是滞后的），
-		// 只改 te.st 会被下一次快照立刻盖回 0 —— 第一版就是这么错的，
-		// 「无 Content-Length」那条用例当场把它抓了出来。
-		total := te.st.bytesTot
-		if total <= 0 {
-			if fi, serr := os.Stat(st.finalPath); serr == nil {
-				total = fi.Size()
-			}
-		}
-		job.setBytes(total, total)
-		te.st.bytesTot = total
-		te.st.bytesDone = total
-		te.mu.Unlock()
-		te.rt.markDirty()
+		runDirectDownload(ctx, te, job, &st)
 		return
 	}
 
@@ -227,18 +184,64 @@ func runDiskPipeline(te *taskEntry) {
 	job.encrypted = pl.key != nil
 	fmt.Printf("[disk] id=%s segments: %d live=%v\n", st.id, len(pl.segments), isLive)
 
-	// 断点：已写入的分片数（暂停/失败后恢复时从它继续）
+	// 断点：已写入的分片数（暂停/失败后恢复时从它继续）。
+	// 它来自状态文件的「落盘值」（flushedMark.segs），与下面的字节账同源落盘。
 	from := int(st.segDone)
 
-	// 直播 + 已有断点：显式拒绝，不硬跑。
-	// 直播流没有"接着上次录"这回事——断点期间的分片已经从滑动窗口滚走，
-	// 继续追加只会产出时间轴带空洞的产物（fMP4 的 tfdt 前跳、TS 的 PTS 前跳）。
-	// 落进这里的有两种任务：探测完成前就被暂停的（当时还不知道是直播），
-	// 以及旧状态文件遗留下来的直播断点任务。
-	if isLive && from > 0 {
-		fail(fmt.Sprintf("直播流不支持从断点继续（已有 %d 个分片）：中间的内容已从列表滚走，"+
-			"继续录制会在产物里留下时间轴空洞，请重新开始录制", from))
+	// 直播任务重启后的恢复一律走**收尾保存**，绝不进入 liveDownload（P0-5）。
+	//
+	// 为什么不是"接着录"：直播流是滑动的，断点/程序退出期间的分片已经从列表滚走，
+	// 接着录只能在产物时间轴上留一段空洞。学徒 2026-09-20 定的语义（直播点「继续」
+	// = 直接完成任务）与之完全一致：用户点「继续」的含义是"我接受这个结果"，
+	// 不是"从未中断过"。
+	//
+	// 判据为什么不能只看 from>0：运行中不落盘时 from 恒为 0（P0-1），于是原来的
+	// 守卫根本不触发，接着 writeInitSegment 见 .part 非空就跳过写 init、
+	// streamDownload 用 O_APPEND 从**已有内容的末尾**续写 —— 产物变成两段录制
+	// 拼接（探针实测 SEG0|SEG1|SEG2|SEG0|SEG1|SEG2|），而直播录像不可重录。
+	//
+	// 收敛到 finishStoppedTask 而不是就地收尾：它与用户点「停止」走的是同一条
+	// 路径（finishStop → finalizeRecording），两条入口的产物规则因此天然一致。
+	if isLive && (from > 0 || partFileOffset(partPath) > 0) {
+		fmt.Printf("[disk] id=%s 直播任务重启恢复（from=%d, 盘上 %d 字节）→ 收尾保存，不续录\n",
+			st.id, from, partFileOffset(partPath))
+		// 清掉 pipeline 刚建的空 job，让收尾经 reopenJobForFinalize 重建：
+		// 容器与跨分片规范化状态从 containerID / normState 恢复，否则 fMP4 的
+		// 总时长回填会整段跳过（产物拖不动、看不出录了多久）。
+		te.mu.Lock()
+		te.job = nil
+		te.mu.Unlock()
+		finishStoppedTask(te)
 		return
+	}
+
+	// 点播续传：把 .part 对齐到账本位置（P0-4）。
+	// 不做这一步，O_APPEND 会从文件当前末尾续写，而"末尾"可能领先账本一整段
+	// （运行中不落盘）或落后（外部改动）—— 前者产出重复内容，后者产出空洞。
+	if !isLive {
+		al, aerr := alignPartToLedger(partPath, from, st.flushedBytes)
+		if aerr != nil {
+			fail("对齐临时文件到断点失败: " + aerr.Error())
+			return
+		}
+		from = al.from
+		// 对齐结果必须写回任务状态并落盘：否则本轮清空重下后，状态文件里仍是
+		// 那份旧账（segs/bytes 都更大），下次重启又会按旧账把下到一半的文件
+		// 再清空一次 —— 永远下不完。
+		te.mu.Lock()
+		te.st.segDone = int64(al.from)
+		te.st.flushedBytes = al.bytes
+		if al.resumeNote != "" {
+			te.st.restartNote = al.resumeNote
+		}
+		te.mu.Unlock()
+		if al.resumeNote != "" {
+			fmt.Printf("[disk] id=%s %s\n", st.id, al.resumeNote)
+			te.rt.markDirty()
+		}
+		// 账本同时进 job：streamDownload 会把它当 baseBytes（writer 的初始字节数），
+		// 这样 flush 回调报出的绝对偏移才是对的。
+		job.setFlushed(int64(from), al.bytes)
 	}
 
 	// 3. 容器探测（仅全新下载时）：拉取首片 → 识别真实格式 → 修正扩展名 → 取 init 段。
@@ -274,6 +277,13 @@ func runDiskPipeline(te *taskEntry) {
 			fail(werr.Error())
 			return
 		}
+		// init 段纳入字节账本：账本说"文件里有 initLen 字节、但一个分片都没落盘"
+		// （segs 仍为 0），这样"刚写完 init 就崩"的形态也能被收尾判据正确识别成
+		// 空壳，而不是被当成"里面有东西"。非 fMP4（无 init 段）时 initLen 为 0，
+		// 账本保持全零 —— 那种容器从第一个分片开始才产生内容，语义正确。
+		if job.initLen > 0 {
+			job.setFlushed(0, int64(job.initLen))
+		}
 		te.mu.Lock()
 		te.st.filename = st.filename
 		te.st.finalPath = st.finalPath
@@ -308,15 +318,18 @@ func runDiskPipeline(te *taskEntry) {
 	te.mu.Unlock()
 
 	var next int
+	// 结束种类只有直播会填：同一个 nil error 底下藏着三个出口，必须分开。
+	var endKind liveEndKind
 	if isLive {
-		next, err = job.liveDownload(ctx, partPath, from)
+		next, endKind, err = job.liveDownload(ctx, partPath, from)
 	} else if from >= len(pl.segments) {
 		// 断点已达/超过列表总数（含旧版本重复续传遗留的脏断点）：分片已齐，直接收尾。
 		// streamDownload 未运行，job 计数需手动同步（snapshot 的进度读 job 原子值）
 		next = from
 		job.setSeg(int64(len(pl.segments)), int64(len(pl.segments)))
-		// 断点同样要落盘值语义：下面 306 行会持久化 segFlushedNow 作为下次的 from
-		job.setSegFlushed(int64(from))
+		// 断点同样要落盘值语义：下面会持久化 segFlushedNow 作为下次的 from。
+		// 字节数沿用对齐后的值（分片已齐，.part 长度即账本长度）。
+		job.setFlushed(int64(from), job.flushedBytesNow())
 	} else {
 		// 点播续传只下剩余分片：segURLs[0] 对应写入序号 from，重复传全量会把
 		// 整个列表重下一遍追加到断点后（内容重复 + segDone 超过 segTot）
@@ -328,7 +341,12 @@ func runDiskPipeline(te *taskEntry) {
 	// from。next 是内存进度，可能领先磁盘（streamDownload 关闭时最终 Flush 失败，
 	// 那条路径已经改用 Flushed 并回错误）。用 next 会让重启后从空洞之后继续
 	// append —— 缺口永久留在产物里，而状态与日志一切正常（R9）。
+	//
+	// 字节账必须一起写回 te.st：同一进程内的重试/继续走的是同一个 te（不重新读
+	// 状态文件），只写回序号会让对齐判据看到 flushedBytes=0 ⇒ 把已下的内容
+	// 清空重下。产物仍正确，但白下一遍，且用户看到的"续传"根本不是续传。
 	te.st.segDone = job.segFlushedNow()
+	te.st.flushedBytes = job.flushedBytesNow()
 	if isLive {
 		te.st.segTot = 0 // 直播列表无限增长，进度由前端按录制时长展示
 	} else {
@@ -362,9 +380,12 @@ func runDiskPipeline(te *taskEntry) {
 		//     ——不能因为是直播就把坏数据当成品（那又是"产物坏了但日志正常"）。
 		if job.live && job.segFlushedNow() > 0 {
 			fmt.Printf("[disk] LIVE-FAIL: %s\n", msg)
-			// reason 直接给 msg：stage 已经是「录制中断 · 已保存」，再加"录制中断:"
+			// failReason 直接给 msg：stage 已经是「录制中断 · 已保存」，再加"录制中断:"
 			// 前缀会让界面读成"录制中断 · 已保存（录制中断: xx）"。
-			if serr := finalizeRecording(te, job, partPath, finalizeInterrupted, msg); serr == nil {
+			if serr := finalizeRecording(te, job, partPath, finalizeCause{
+				outcome:    finalizeInterrupted,
+				failReason: msg,
+			}); serr == nil {
 				return
 			}
 		}
@@ -383,10 +404,133 @@ func runDiskPipeline(te *taskEntry) {
 	// 5-6. 抽样校验 → 容器收尾 → .part 改名为正式文件。
 	//      与「停止」「中断」路径共用同一个收尾函数：收尾代码一旦分叉，
 	//      两条路的产物规则就再也对不齐了。
-	if ferr := finalizeRecording(te, job, partPath, finalizeComplete, ""); ferr != nil {
+	//
+	// 直播走到这里有两条出口，**判据强度不同，文案必须分开**：
+	//   - ENDLIST：源站白纸黑字声明结束 —— 确证；
+	//   - 连续 liveMaxEmptyPolls 次无新分片：只是"列表不再增长"—— 推断，
+	//     产物末尾可能被截断（源站编码卡顿/CDN 慢一拍都会撞上）。
+	// 两者原来都落到 finalizeComplete 且不带说明，卡片上逐字相同，用户看不出
+	// 哪次是"录完的"、哪次是"猜完的"（本项目头号缺陷形态：产物可能不完整，
+	// 而状态与日志显示一切正常）。
+	// 文案不在这里拼：交给 endKind（枚举自带，见 liveEndKind.note），点播是
+	// liveEndNone ⇒ 说明为空，保持干脆的「已保存」。
+	if ferr := finalizeRecording(te, job, partPath, finalizeCause{
+		outcome: finalizeComplete,
+		endKind: endKind,
+	}); ferr != nil {
 		fail(ferr.Error())
 		return
 	}
+}
+
+// correctedDirectName 返回直链输出的修正文件名：扩展名跟随 URL（如 .mp4）。
+//
+// 与 HLS 那条 correctExtName（探容器后修正）不同：直链的媒体类型由 URL 后缀指示，
+// 不做容器探测。**GUI 直链（runDirectDownload）与 CLI 直链共用这一条规则** ——
+// 抽出来就是为了避免"一边修了另一边漏"（R6：CLI 曾经完全没调，MP4 存成 output.ts）。
+// 已是目标扩展名（大小写不敏感）或 URL 后缀认不出时，原样返回。
+func correctedDirectName(filename, rawURL string) string {
+	ext := directExtFromURL(rawURL)
+	if ext == "" || strings.HasSuffix(strings.ToLower(filename), ext) {
+		return filename
+	}
+	return strings.TrimSuffix(filename, filepath.Ext(filename)) + ext
+}
+
+// runDirectDownload 处理"URL 直接指向媒体文件"（MP4 等）的下载路径：
+// 扩展名跟随 URL → 整体流式下载 → 改名为成品 → 按磁盘事实对齐字节进度 → 置完成态。
+//
+// 为什么单独成函数：它与分片路径**不共享任何状态** —— 不解析播放列表、不探容器、
+// 不碰断点账本，跑完即结束（这段原先嵌在 runDiskPipeline 里占掉近 80 行，而它与
+// 上下文唯一的联系只有"失败要 failTask"）。主流程调完它就 return，所以本函数对 st 的
+// 修改不承担"回传给后续步骤"的义务，只负责同步回 te.st（取消/暂停路径按它算 .part 路径）。
+func runDirectDownload(ctx context.Context, te *taskEntry, job *dlJob, st *taskState) {
+	// 与主流程同款失败收尾（主流程那个 fail 闭包在本函数里够不着）
+	fail := func(msg string) {
+		fmt.Printf("[disk] FAIL: %s\n", msg)
+		failTask(te, msg)
+		te.rt.markDirty()
+	}
+	partPath := st.finalPath + ".part"
+
+	// 输出扩展名跟随 URL（如 .mp4），避免 MP4 内容存成 .ts。
+	// 规则抽成 correctedDirectName 与 CLI 直链共用 —— 两条路径各写一份
+	// "取扩展名 + TrimSuffix" 正是 R6 的成因（CLI 那份整个漏了）。
+	if nf0 := correctedDirectName(st.filename, st.m3u8URL); nf0 != st.filename {
+		st.filename = nf0
+		nf, rerr := reclaimPath(st.saveDir, st.filename, st.finalPath)
+		if rerr != nil {
+			fail(rerr.Error())
+			return
+		}
+		st.finalPath = nf
+		st.filename = filepath.Base(st.finalPath)
+		partPath = st.finalPath + ".part"
+	}
+	te.mu.Lock()
+	// 重命名后的文件名/路径同步回任务状态：取消/暂停时按新路径清理 .part
+	te.st.filename = st.filename
+	te.st.finalPath = st.finalPath
+	te.st.stage = "下载直链文件中"
+	te.mu.Unlock()
+	te.rt.markDirty()
+	fmt.Printf("[disk] id=%s 直链文件下载 -> %s\n", st.id, st.finalPath)
+	if err := job.downloadDirect(ctx, partPath); err != nil {
+		// 恢复路径上的一次性提示（如"续传位图丢失，已从头下载"）在失败时
+		// 同样要可见：它解释了这次进度为什么看起来是重头开始的。
+		publishRestartNote(te, job)
+		if ctx.Err() != nil {
+			finishInterrupt(te)
+			return
+		}
+		fail("下载直链文件失败: " + err.Error())
+		return
+	}
+	publishRestartNote(te, job)
+	// 直链没有 HLS 那套容器探测（probeContainer），成品可能只是一张错误页
+	// （CDN 的 403/502 HTML 被 Content-Type 撒谎掩盖）。改名前做一次拒绝式校验：
+	// 明显不是媒体就判失败，绝不把 HTML 当视频存成"已完成"（R8，头号缺陷形态）。
+	// 判失败前把这份垃圾 .part 清掉 —— 非空的 .part 会被下一次 downloadDirect 当成
+	// 可续传前缀（模式 3），留着它等于让错误页冒充"已下载的头部"，成品成了拼接体。
+	if verr := validateDirectMedia(partPath); verr != nil {
+		os.Remove(partPath)
+		removeChunkMeta(partPath)
+		fail("直链产物校验失败: " + verr.Error())
+		return
+	}
+	if err := moveFile(partPath, st.finalPath); err != nil {
+		fail("保存文件失败: " + err.Error())
+		return
+	}
+	te.mu.Lock()
+	te.st.running = false
+	te.st.done = true
+	te.st.paused = false
+	te.st.stage = "已保存"
+	te.st.filename = st.filename
+	te.st.finalPath = st.finalPath
+	te.st.errorMsg = ""
+	te.st.finished = time.Now()
+	// 直链进度对齐：文件已经完整落盘，"下满了"是事实。
+	// 分母优先用下载时探到的总大小；服务器既不给 Content-Length 也不给
+	// Content-Range（chunked 响应）时，用刚写好的成品大小补上 ——
+	// 一条成功的记录绝不能停在 0%（学徒 2026-09-19 截图里就是这个毛病）。
+	//
+	// 必须写回 job 的原子计数，不能只改 te.st：snapshot() 对还挂着 job 的任务
+	// 一律以 job 的原子值为准（分片路径的 te.st.segDone 本就是滞后的），
+	// 只改 te.st 会被下一次快照立刻盖回 0 —— 第一版就是这么错的，
+	// 「无 Content-Length」那条用例当场把它抓了出来。
+	total := te.st.bytesTot
+	if total <= 0 {
+		if fi, serr := os.Stat(st.finalPath); serr == nil {
+			total = fi.Size()
+		}
+	}
+	job.setBytes(total, total)
+	te.st.bytesTot = total
+	te.st.bytesDone = total
+	te.mu.Unlock()
+	te.rt.markDirty()
 }
 
 // finalizeOutcome 是收尾的起因，决定两件事：产物校验失败时是否保留 .part、
@@ -410,17 +554,57 @@ func (o finalizeOutcome) keepsPartOnInvalid() bool { return o != finalizeComplet
 // interrupted 报告这条收尾要不要对外标成「已中断」。
 func (o finalizeOutcome) interrupted() bool { return o == finalizeInterrupted }
 
+// finalizeCause 收尾的起因与说明。
+//
+// 为什么说明不单开一个 string 形参：那句用户看到的话，**含义完全由起因决定** ——
+// 中断时它是失败原因（进 errorMsg）、正常完成时它是直播的结束方式（拼进 stage 括号）、
+// 用户主动停止时它**根本没有位置**。三义共用一个形参时，读一个调用点无法判断那串
+// 东西会被摆到哪里，只能回溯到收尾内部；更糟的是"用户停止"那条路的调用方还得硬写
+// 一句没人会读的文案（`"用户停止录制"` 曾同时存在于形参与收尾内部两处）。
+//
+// 绑成结构体后，改动被三处掐住：
+//   - **生成点唯一**：文案只在 note() 里产生，调用方不再拼完成态文案；
+//   - **错配即空**：给中断塞结束方式、给完成塞失败原因都会得到空串（见 note），
+//     不会静默显示成另一层含义；
+//   - **加第 4 种起因时**，编译器会把所有构造点指出来。
+type finalizeCause struct {
+	outcome finalizeOutcome
+	// failReason 仅 finalizeInterrupted：失败原因，原样写进 errorMsg。
+	failReason string
+	// endKind 仅 finalizeComplete 且直播：结束方式；文案由枚举自带（liveEndKind.note）。
+	endKind liveEndKind
+}
+
+// note 返回本次收尾的用户可见说明 —— **全项目唯一的收尾文案生成点**。
+//
+// 三种起因各有归属，互不重叠：
+//   - 中断 → 失败原因写进 errorMsg。**必须保留**：本项目头号缺陷形态就是
+//     "产物不完整而记录显示一切正常"；
+//   - 正常完成 → 直播的结束方式拼进 stage 括号（让"源站声明结束"与"我们推断结束"
+//     在卡片上可区分）；点播没有这回事，留空；
+//   - 用户主动停止 → 无外部说明，stage 固定写「已保存（用户停止录制）」。
+func (c finalizeCause) note() string {
+	switch c.outcome {
+	case finalizeInterrupted:
+		return c.failReason
+	case finalizeComplete:
+		return c.endKind.note()
+	}
+	return ""
+}
+
 // finalizeRecording 把 .part 收尾成正式文件：抽样校验 → 容器收尾（fMP4 回填
 // 总时长 mehd/mvhd）→ 改名成成品 → 置任务终态。
 //
-// 三条路径共用（正常完成 / 用户停止 / 故障中断），差别只在 outcome。
+// 三条路径共用（正常完成 / 用户停止 / 故障中断），差别全在 cause（起因 + 说明，
+// 见 finalizeCause）。
 //
 // interrupted 那一条有两条硬约束，缺一条就是把缺陷藏起来：
 //   - stage 必须与"完整录制"可区分（"录制中断 · 已保存"）；
 //   - errorMsg 必须保留原因、不能清空——本项目头号缺陷形态就是
 //     "产物不完整但日志与状态显示一切正常"。
-func finalizeRecording(te *taskEntry, job *dlJob, partPath string, outcome finalizeOutcome, reason string) error {
-	interrupted := outcome.interrupted()
+func finalizeRecording(te *taskEntry, job *dlJob, partPath string, cause finalizeCause) error {
+	interrupted := cause.outcome.interrupted()
 	te.mu.Lock()
 	finalPath, id, segTot := te.st.finalPath, te.st.id, te.st.segTot
 	te.mu.Unlock()
@@ -436,26 +620,35 @@ func finalizeRecording(te *taskEntry, job *dlJob, partPath string, outcome final
 		Segments:  valSegs,
 		MinBytes:  int64(job.initLen),
 	}); verr != nil {
-		if outcome.keepsPartOnInvalid() {
+		if cause.outcome.keepsPartOnInvalid() {
 			// 用户停止 / 故障中断：保留 .part，那可能是用户仅有的半成品，交给他自己处理
 			return fmt.Errorf("%w（临时文件保留在 %s）", verr, partPath)
 		}
 		// 正常路径判定损坏就直接丢弃：重试只会重下出同样的坏数据，
 		// 留着它只会让"重试"反复失败并占着断点。
 		os.Remove(partPath)
-		os.Remove(partPath + ".meta")
+		removeChunkMeta(partPath)
 		return fmt.Errorf("%w（已丢弃损坏的临时文件）", verr)
 	}
 
+	// 容器收尾（fMP4 回填 mehd/mvhd 总时长）失败**不改成功语义**：文件已合法可播，
+	// 只是播放器预知不了时长、不能拖动进度条（见 internal/fmp4/initseg.go 文件头）。
+	// 判成失败会让用户去点「取消」把可播文件删掉（本项目红线）；静默吞掉则用户
+	// 永远不知道时长信息缺失。折中：文件保留、完成态照旧，只把这件事写进 stage（R4）。
+	// ⚠️ 不能写 errorMsg —— 前端 badge 先判 t.error（web/index.html 的 badge），
+	// 会把已完成的记录显示成「失败」，还会被算进"失败"统计。
+	backfillNote := ""
 	if jerr := job.backfill(partPath); jerr != nil {
 		fmt.Printf("[disk] WARN: 容器收尾处理失败: %v\n", jerr)
+		backfillNote = "时长信息缺失"
 	}
 	if err := moveFile(partPath, finalPath); err != nil {
 		return fmt.Errorf("保存文件失败: %w", err)
 	}
+	note := cause.note() // 唯一的收尾文案生成点（语义随起因，见 finalizeCause）
 	if interrupted {
-		fmt.Printf("[disk] id=%s 已保存（录制中断: %s）-> %s\n", id, reason, finalPath)
-	} else if outcome == finalizeStopped {
+		fmt.Printf("[disk] id=%s 已保存（录制中断: %s）-> %s\n", id, note, finalPath)
+	} else if cause.outcome == finalizeStopped {
 		fmt.Printf("[disk] id=%s 已保存（用户停止录制）-> %s\n", id, finalPath)
 	} else {
 		fmt.Printf("[disk] id=%s 已保存 -> %s\n", id, finalPath)
@@ -476,16 +669,28 @@ func finalizeRecording(te *taskEntry, job *dlJob, partPath string, outcome final
 	} else {
 		te.st.segDone = job.segFlushedNow()
 	}
+	// 容器收尾降级说明（R4）：拼进 stage，**不碰 errorMsg**（见 backfillNote 的说明）。
+	bfSuffix := ""
+	if backfillNote != "" {
+		bfSuffix = " · " + backfillNote
+	}
 	if interrupted {
-		te.st.stage = "录制中断 · 已保存"
-		te.st.errorMsg = reason
-	} else if outcome == finalizeStopped {
+		te.st.stage = "录制中断 · 已保存" + bfSuffix
+		te.st.errorMsg = note
+	} else if cause.outcome == finalizeStopped {
 		// 用户主动点「停止」：这是"录到这里收工"，不是故障。stage 写清是谁结束的，
 		// errorMsg 必须留空——否则前端的"失败"统计会把它算进去（学徒 2026-09-15 定）。
-		te.st.stage = "已保存（用户停止录制）"
+		te.st.stage = "已保存（用户停止录制）" + bfSuffix
 		te.st.errorMsg = ""
 	} else {
+		// 正常结束。note 在这里是"结束方式"的说明（见 finalizeCause.note）：直播会给
+		// 「播放列表已结束」或「播放列表停止更新 · 末尾可能不全」，点播留空。
+		// 不能用同一句「已保存」盖过去——那正是把两种判据强度混成一种的写法。
 		te.st.stage = "已保存"
+		if note != "" {
+			te.st.stage = "已保存（" + note + "）"
+		}
+		te.st.stage += bfSuffix
 		te.st.errorMsg = ""
 	}
 	// interrupted 标记决定前端把这条记录显示成「已中断」还是「已完成」
@@ -506,9 +711,16 @@ func finishInterrupt(te *taskEntry) {
 	intent := te.intent
 	part := te.st.finalPath + ".part"
 	id := te.st.id
-	segDone := te.st.segDone
 	te.st.running = false
 	te.st.queued = false
+	// 账本写回任务状态：暂停后 resume 复用同一个 te（不重新读状态文件），
+	// 不同步的话对齐判据看到 flushedBytes=0 ⇒ 把已下内容清空重下。
+	// 顺带让下面的日志/状态显示的是"确实落盘的断点"而不是内存进度。
+	if te.job != nil {
+		m := te.job.flushedMarkNow()
+		te.st.segDone, te.st.flushedBytes = m.segs, m.bytes
+	}
+	segDone := te.st.segDone
 	switch intent {
 	case intentCancel:
 		te.st.canceled = true
@@ -533,13 +745,15 @@ func finishInterrupt(te *taskEntry) {
 			if err := os.Remove(part); err != nil && !os.IsNotExist(err) {
 				fmt.Printf("[disk] WARN: 删除临时文件失败 %s: %v\n", part, err)
 			}
-			if err := os.Remove(part + ".meta"); err != nil && !os.IsNotExist(err) {
-				fmt.Printf("[disk] WARN: 删除分片位图失败 %s: %v\n", part+".meta", err)
+			if err := removeChunkMeta(part); err != nil {
+				fmt.Printf("[disk] WARN: 删除分片位图失败 %s: %v\n", chunkMetaPath(part), err)
 			}
 		}
 		fmt.Printf("[disk] id=%s 已取消\n", id)
 	case intentStop:
-		finishStop(te, id, part, segDone, finalizeStopped, "用户停止录制")
+		// 用户主动停止的文案由收尾内部固定（「已保存（用户停止录制）」），调用方不传说明
+		// —— 这句话曾经同时写在形参与收尾内部两处。
+		finishStop(te, id, part, segDone, finalizeCause{outcome: finalizeStopped})
 	default:
 		// 暂停时也做容器收尾处理（fMP4 回填已录部分的总时长，方便直接预览/拖动）；
 		// 续传完成后会以新总时长再次回填
@@ -569,10 +783,13 @@ func finishStoppedTask(te *taskEntry) {
 	reason := te.st.errorMsg
 	te.mu.Unlock()
 	if reason == "" {
-		// 状态文件里的直播任务不带 errorMsg（中断原因是"上次程序退出"这件事本身）
-		reason = "程序退出"
+		// 状态文件里的直播任务不带 errorMsg（中断原因是"上次程序被强杀"这件事本身）。
+		// 措辞必须说明"异常"：正常退出走的是 stopOrPauseAllTasks → intentStop →
+		// finishStop(finalizeCause{outcome: finalizeStopped})，那条路记「已完成」、
+		// 根本到不了这里。
+		reason = "程序异常退出导致中断"
 	}
-	finishStop(te, id, part, segDone, finalizeInterrupted, reason)
+	finishStop(te, id, part, segDone, finalizeCause{outcome: finalizeInterrupted, failReason: reason})
 }
 
 // reopenJobForFinalize 为「没有 job 的任务」重建收尾所需的 dlJob。
@@ -587,6 +804,7 @@ func reopenJobForFinalize(te *taskEntry) *dlJob {
 	te.mu.Lock()
 	id, finalPath := te.st.id, te.st.finalPath
 	segDone, segTot := te.st.segDone, te.st.segTot
+	flushedBytes := te.st.flushedBytes
 	live, containerID := te.st.live, te.st.containerID
 	filename, saveDir := te.st.filename, te.st.saveDir
 	normState := te.st.normState
@@ -617,7 +835,10 @@ func reopenJobForFinalize(te *taskEntry) *dlJob {
 	// 进度计数一并对齐已录片数：snapshot 优先读 job 的原子值，
 	// 不设就会把已录片数显示成 0。
 	job.setSeg(segDone, segTot)
-	job.setSegFlushed(segDone)
+	// 账本成对恢复（序号 + 字节数）。收尾路径不续传，但下面的"有没有内容"
+	// 判据要用字节数区分"只落了 init 段的空壳"与"真录到分片"，所以必须带上；
+	// 旧状态文件没有该字段 ⇒ 读到 0 ⇒ 判据自动退回磁盘事实（见 finishStop）。
+	job.setFlushed(segDone, flushedBytes)
 	// 收尾路径**有意忽略** restoreContainer 的错误：用户要的是把已录内容保住，
 	// 状态不可用只影响时间轴刻度（mehd 回填），不该让他丢掉整份录像。
 	// 续传路径（runDownload）才是必须拒绝的地方。
@@ -630,9 +851,9 @@ func reopenJobForFinalize(te *taskEntry) *dlJob {
 // 有已落盘分片就保存成正式文件；一片都没录到则按无内容处理（清掉临时文件），
 // 否则用户会拿到一个只有 init 段、播不出画面的空壳。
 //
-// outcome 由调用方给：还在录时停止 = finalizeStopped（用户主动收工），
+// cause 由调用方给：还在录时停止 = finalizeStopped（用户主动收工），
 // 已经静止时停止 = finalizeInterrupted（沿用原中断原因），见 finishStoppedTask。
-func finishStop(te *taskEntry, id, part string, segDone int64, outcome finalizeOutcome, reason string) {
+func finishStop(te *taskEntry, id, part string, segDone int64, cause finalizeCause) {
 	// 启动补偿收尾可能正在收尾同一个（重启后恢复出来的）任务，见 finalizeMu。
 	te.finalizeMu.Lock()
 	defer te.finalizeMu.Unlock()
@@ -661,13 +882,29 @@ func finishStop(te *taskEntry, id, part string, segDone int64, outcome finalizeO
 		part = fp + ".part"
 	}
 	te.mu.Unlock()
-	if job == nil || job.segFlushedNow() == 0 {
+
+	// "有没有可保存的内容"必须落在**磁盘事实**上（P0-1）。强杀后重启时 job 是
+	// 上面重建的、segFlushedNow 来自状态文件 —— 而下载/录制全程不落盘时它恒为 0，
+	// 此时 .part 里可能正是用户录了几小时的内容。同一函数上面（reopenJobForFinalize
+	// 之前）已经用 nonEmptyFile 确认过文件非空，两处判据必须对齐：否则就是
+	// "上面说有内容、下面说没有"，然后按下面把文件删掉——销毁用户录到的东西。
+	//
+	// 账本可用（flushedBytes > 0）时用账本区分"只落了 init 段的空壳"与"真录到
+	// 分片"：空壳播不出画面，保存成成品只会误导用户。账本不可用（旧状态文件、
+	// 或运行中从未落盘 ⇒ flushedBytes == 0 而 .part 非空）时**退回磁盘事实**，
+	// 方向 fail-safe：分片模式用 WriteAt 稀疏写，文件大小只会偏大，最坏结果是
+	// 多留一个残缺文件（用户能自己删），绝不会误删。
+	hasContent := nonEmptyFile(part)
+	if job != nil && job.flushedBytesNow() > 0 {
+		hasContent = job.segFlushedNow() > 0 || partFileOffset(part) > job.flushedBytesNow()
+	}
+	if job == nil || !hasContent {
 		if part != "" {
 			if err := os.Remove(part); err != nil && !os.IsNotExist(err) {
 				fmt.Printf("[disk] WARN: 删除临时文件失败 %s: %v\n", part, err)
 			}
-			if err := os.Remove(part + ".meta"); err != nil && !os.IsNotExist(err) {
-				fmt.Printf("[disk] WARN: 删除分片位图失败 %s: %v\n", part+".meta", err)
+			if err := removeChunkMeta(part); err != nil {
+				fmt.Printf("[disk] WARN: 删除分片位图失败 %s: %v\n", chunkMetaPath(part), err)
 			}
 		}
 		te.mu.Lock()
@@ -682,7 +919,7 @@ func finishStop(te *taskEntry, id, part string, segDone int64, outcome finalizeO
 		fmt.Printf("[disk] id=%s 已停止（无内容可保存）\n", id)
 		return
 	}
-	if err := finalizeRecording(te, job, part, outcome, reason); err != nil {
+	if err := finalizeRecording(te, job, part, cause); err != nil {
 		fmt.Printf("[disk] FAIL: 停止收尾失败: %v\n", err)
 		failTask(te, err.Error())
 		return
@@ -753,6 +990,83 @@ func writeInitSegmentFor(ctx context.Context, job *dlJob, pl *playlistInfo, part
 	}
 	job.initLen = len(nd)
 	return nil
+}
+
+// ============================================================
+// 恢复时的账本对齐（P0-4）
+// ------------------------------------------------------------
+// streamWriter 用 O_APPEND 打开输出文件，内核把新数据接到**文件当前末尾** ——
+// 它不看 startIdx。所以"从断点继续写"只在下面这个等式成立时是对的：
+//
+//	文件长度 == 前 segs 片的字节和
+//
+// 崩溃/强杀会打破它，而磁盘上没有任何一处记着每片多少字节（HLS 分片长度由源站
+// 决定、每片不同），断点无法自证。所以写入层在每次 flush 成功时记下绝对字节数
+// （flushedMark），恢复时按它对 .part 做对齐。
+// ============================================================
+
+// alignResult 是 .part 与持久化账本的对齐结果。
+type alignResult struct {
+	from  int   // 对齐后的续传起点（分片序号）
+	bytes int64 // 对齐后的账本字节数（= streamWriter 的 baseBytes）
+	// resumeNote 非空 = 账本不可用、已从头下载；必须让用户看见，不能悄悄重来。
+	// ⚠️ 名字必须带 resume 前缀：项目里"一次性提示"不止这一种（还有直播的结束方式说明、
+	// 收尾的中断原因），三样都叫 note 时 grep 任何一个名字都搜不全另外两个（见 finalizeCause）。
+	resumeNote string
+}
+
+// alignPartToLedger 把 .part 对齐到持久化账本 (from, ledgerBytes) 描述的位置。
+//
+// 方向一律 fail-safe：
+//   - 唯一的"破坏性"动作是 os.Truncate，且只朝**缩短到账本位置**或**清空**两个
+//     方向做，绝不朝"延长"或"按文件大小猜"的方向做；
+//   - 账本不可用时**清空重下**而不是继续追加：清空后 from=0 且文件为空，整条流程
+//     与全新任务完全同构 ⇒ 产物与"从头下完"逐字节相同（验收 A2）。代价是已下的
+//     字节要重取一遍，所以返回 note 让调用方报给用户 —— 不能悄悄重来。
+func alignPartToLedger(partPath string, from int, ledgerBytes int64) (alignResult, error) {
+	size := partFileOffset(partPath)
+
+	// 盘上什么都没有：等价于全新任务（账本若还在也一并归零 —— 文件都没了，
+	// 账本描述的位置已不存在）。不报 note：用户看到的就是"从头下"，无歧义。
+	if size == 0 {
+		return alignResult{}, nil
+	}
+
+	// 账本可用 = 有字节账，且没有超出文件实际长度。
+	// 超出（ledgerBytes > size）说明文件被外部截断/换过，账面不可信；
+	// 为 0 说明这是旧状态文件（v0.5.0 没有该字段）或运行中从未落盘。
+	if ledgerBytes <= 0 || ledgerBytes > size {
+		if err := os.Truncate(partPath, 0); err != nil {
+			return alignResult{}, err
+		}
+		return alignResult{resumeNote: "续传信息不完整，已从头下载（原有临时文件已清空）"}, nil
+	}
+
+	// 账本可用。文件比账本长 = 崩溃落在两次 flush 之间：截断到最后一个已记账
+	// 位置。少截会重复写入（P0-4），多截会删掉已下的内容 —— 基准只能是账本，
+	// 不能是文件大小本身。
+	if size > ledgerBytes {
+		if err := os.Truncate(partPath, ledgerBytes); err != nil {
+			return alignResult{}, err
+		}
+	}
+	return alignResult{from: from, bytes: ledgerBytes}, nil
+}
+
+// publishRestartNote 把 job 上的一次性恢复提示转写进任务状态并落盘。
+//
+// 需要这一跳是因为提示产生在 downloadDirect 内部（那儿只有 job、没有任务），
+// 而它对用户的意义是"这次进度为什么是重头开始的"—— 不写进状态就等于没有：
+// GUI 是 windowsgui 子系统、没有控制台，fmt.Printf 没人看得到。
+func publishRestartNote(te *taskEntry, job *dlJob) {
+	note := job.takeRestartNote()
+	if note == "" {
+		return
+	}
+	te.mu.Lock()
+	te.st.restartNote = note
+	te.mu.Unlock()
+	te.rt.markDirty()
 }
 
 // restoreContainer 断点续传（from>0）时恢复格式相关行为：

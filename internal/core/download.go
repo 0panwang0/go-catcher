@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"net/url"
 	"os"
@@ -35,11 +36,19 @@ type dlJob struct {
 	limit   int    // 分片上限（0 = 全部）
 	// 分片进度（每任务独立原子计数）。
 	// segDone 是"已写进缓冲区"的序号（给界面看，反映真实进度）；
-	// segFlushed 是"已确认落盘"的序号（给断点持久化用，见 swFlushBytes 注释）。
+	// flushed 是"已确认落盘"的断点（给断点持久化与恢复对齐用，见 swFlushBytes）。
 	// 两者分开：进度要即时，断点必须保守。
-	segDone    int64
-	segFlushed int64
-	segTot     int64
+	segDone int64
+	// flushed 把"已落盘分片序号"与"已落盘绝对字节数"打包成一个不可变值，
+	// 用 atomic.Pointer 一次性发布。
+	//
+	// 为什么必须是**一对**而不是两个独立原子值：HLS 的分片长度由源站决定、
+	// 每片不同，序号推不出字节、字节也推不出序号，而恢复时两个都要用
+	// （序号当续传起点、字节数当 .part 的对齐目标）。分开存会让读端拿到
+	// 「新序号 + 旧字节数」这类错配组合：截断少了是重复写入（P0-4），
+	// 截断多了是把用户已下的内容删掉。见 flushedMark。
+	flushed atomic.Pointer[flushedMark]
+	segTot  int64
 	// 直链字节进度（直链任务专用；分片任务这两个字段恒 0，两者互斥）。
 	// 直链没有"分片总数"这个分母，它的百分比只能按字节算 —— 见 setBytes。
 	bytesDone int64
@@ -82,6 +91,17 @@ type dlJob struct {
 	// initLen 本次实际写入 .part 头的 init 段长度（0 = 无 init 段或续传）。
 	// 落盘校验用它兜住"只落了 init 段、分片一个没写"的假成功。
 	initLen int
+	// partMode 直链 .part 的写入模式（partModeChunked / partModeStream），
+	// 空 = 未知（升级前的旧任务）。它决定"文件大小能不能当续传起点"：
+	// 分片模式用 WriteAt 稀疏写，文件中间可能有洞 ⇒ 大小 ≠ 有效字节数；
+	// 单连接模式是连续前缀 ⇒ 可以。两种模式在磁盘上无法区分，必须记下来。
+	partMode atomic.Value // string
+
+	// restartMu / restartNote 恢复路径上的一次性提示（如"位图丢失，已从头下载"）。
+	// 由 pipeline 在收尾前转写到任务状态 —— GUI 是 windowsgui 子系统、没有控制台，
+	// 只打日志等于没提示，而"白下了一遍"必须让用户知道。
+	restartMu   sync.Mutex
+	restartNote string
 }
 
 // seenCovers 报告序号为 seq 的分片是否已录制（按 media sequence 水位线判定）。
@@ -139,12 +159,45 @@ func (j *dlJob) seenWatermark() (uint64, bool) {
 	return j.seenSeq, j.seenAny
 }
 
+// gapMillis 的封顶（A-6）。缺口提示是说给用户听的："产物中间少了约 N 分钟"。
+// 累加器一旦溢出成负数，此后 gapSecondsNow() 恒为负 ⇒ gapText 恒返回空 ⇒ **该任务
+// 的缺口提示永久关闭**（产物有洞却一声不响 —— 头号形态）。而污染源是远端字节：
+// 一条 `#EXTINF:1e300,` 就能让 sec*1000 溢出 int64。
+const (
+	gapMillisPerCallMax = int64(24 * 3600 * 1000)     // 单次上限：一天
+	gapMillisTotalMax   = int64(7 * 24 * 3600 * 1000) // 累计上限：七天
+)
+
 // addGapSeconds 累加产物时间轴上的缺口时长（秒）。
+//
+// 三条防线，缺一条都会被一条畸形的 EXTINF 打穿（A-6）：
+//   - 非有限值直接丢（NaN 会污染后续所有比较）；
+//   - 单次封顶到一天（不是"丢弃"——真少了一天的内容也要如实报）；
+//   - 累计封顶到七天，且用 CAS 而不是 AddInt64：AddInt64 无界，加过头就回绕成负数。
 func (j *dlJob) addGapSeconds(sec float64) {
-	if sec <= 0 {
+	if sec <= 0 || math.IsNaN(sec) || math.IsInf(sec, 0) {
 		return
 	}
-	atomic.AddInt64(&j.gapMillis, int64(sec*1000))
+	ms := int64(sec * 1000)
+	if ms <= 0 {
+		return // 溢出成非正数：输入大到离谱，当脏数据丢掉
+	}
+	if ms > gapMillisPerCallMax {
+		ms = gapMillisPerCallMax
+	}
+	for {
+		cur := atomic.LoadInt64(&j.gapMillis)
+		if cur >= gapMillisTotalMax {
+			return
+		}
+		next := cur + ms
+		if next > gapMillisTotalMax || next < cur {
+			next = gapMillisTotalMax
+		}
+		if atomic.CompareAndSwapInt64(&j.gapMillis, cur, next) {
+			return
+		}
+	}
 }
 
 // gapSecondsNow 返回累计缺口时长（秒）。
@@ -172,13 +225,36 @@ func (j *dlJob) setSeg(done, tot int64) {
 
 func (j *dlJob) segNow() int64 { return atomic.LoadInt64(&j.segDone) }
 
-// segFlushedNow 返回"已确认落盘"的断点。持久化必须用它而不是 segNow()：
-// segNow() 可能领先磁盘若干 MB，拿它当断点续传会在文件中间留下空洞。
-func (j *dlJob) segFlushedNow() int64 { return atomic.LoadInt64(&j.segFlushed) }
+// flushedMark 是"已确认落盘"的断点：分片序号 + 绝对字节数（一次性发布，见 dlJob.flushed）。
+//
+// 两个字段必须同一次读写（同源）：HLS 分片长度不一，序号与字节互不推导；
+// 而恢复既要序号（续传起点）又要字节数（把 .part 对齐到账本位置）。
+// 拆成两个原子值就会读到「新序号 + 旧字节数」这种自相矛盾的组合。
+type flushedMark struct {
+	segs  int64
+	bytes int64
+}
 
-// setSegFlushed 推进已落盘断点（streamWriter 每次 flush 后回调）。
-func (j *dlJob) setSegFlushed(n int64) {
-	atomic.StoreInt64(&j.segFlushed, n)
+// segFlushedNow 返回"已确认落盘"的分片序号。持久化必须用它而不是 segNow()：
+// segNow() 可能领先磁盘若干 MB，拿它当断点续传会在文件中间留下空洞。
+func (j *dlJob) segFlushedNow() int64 { return j.flushedMarkNow().segs }
+
+// flushedBytesNow 返回"已确认落盘"的绝对字节数（含 init 段与恢复时的 baseBytes）。
+// 与 segFlushedNow 同源（同一次 Load）—— 两者永远描述同一个时刻。
+func (j *dlJob) flushedBytesNow() int64 { return j.flushedMarkNow().bytes }
+
+// flushedMarkNow 一次读出整对账本值；从未落盘过（nil）返回零值。
+func (j *dlJob) flushedMarkNow() flushedMark {
+	if m := j.flushed.Load(); m != nil {
+		return *m
+	}
+	return flushedMark{}
+}
+
+// setFlushed 推进已落盘断点（streamWriter 每次 flush 成功后回调）。
+// segs 与 bytes 必须在同一次调用里给出：它们描述的是同一个时刻的事实。
+func (j *dlJob) setFlushed(segs, bytes int64) {
+	j.flushed.Store(&flushedMark{segs: segs, bytes: bytes})
 }
 
 func (j *dlJob) segTotal() int64 { return atomic.LoadInt64(&j.segTot) }
@@ -197,6 +273,50 @@ func (j *dlJob) setBytes(done, tot int64) {
 func (j *dlJob) bytesNow() int64 { return atomic.LoadInt64(&j.bytesDone) }
 
 func (j *dlJob) bytesTotal() int64 { return atomic.LoadInt64(&j.bytesTot) }
+
+// 直链 .part 的两种写入模式（见 dlJob.partMode）。
+const (
+	partModeChunked = "chunked" // 分片并发 + WriteAt 定位写（文件中间可能有洞）
+	partModeStream  = "stream"  // 单连接连续追加（文件大小即有效字节数）
+)
+
+// setPartMode 记录 .part 的写入模式，并触发一次状态落盘。
+//
+// 为什么必须立刻落盘：这个值决定下次启动时"文件大小能不能当续传起点"，
+// 而进程随时可能被杀 —— 只在收尾时写就来不及了（那正是 P0-4 直链版本的成因）。
+func (j *dlJob) setPartMode(m string) {
+	if j.partModeNow() == m {
+		return
+	}
+	j.partMode.Store(m)
+	if j.rt != nil {
+		j.rt.markDirty()
+	}
+}
+
+// partModeNow 返回当前记录的写入模式（空 = 未知，升级前的旧任务）。
+func (j *dlJob) partModeNow() string {
+	if v, ok := j.partMode.Load().(string); ok {
+		return v
+	}
+	return ""
+}
+
+// setRestartNote 记下恢复路径上的一次性提示（见 dlJob.restartNote）。
+func (j *dlJob) setRestartNote(note string) {
+	j.restartMu.Lock()
+	j.restartNote = note
+	j.restartMu.Unlock()
+}
+
+// takeRestartNote 取走提示（pipeline 转写进任务状态后即清空）。
+func (j *dlJob) takeRestartNote() string {
+	j.restartMu.Lock()
+	defer j.restartMu.Unlock()
+	n := j.restartNote
+	j.restartNote = ""
+	return n
+}
 
 // ============================================================
 // 流式下载：边下边写
@@ -232,28 +352,44 @@ type streamWriter struct {
 	buf     map[int][]byte // 乱序到达、暂时还不能写的数据
 	w       *bufio.Writer
 	f       *os.File
-	onWrite func(next int)      // 每次推进后回调（刷新界面进度）
-	onFlush func(flushed int)   // 每次落盘后回调（推进可持久化断点）
-	norm    func([]byte) []byte // 写入前的规范化（nil = 原样写）
+	onWrite func(next int)                 // 每次推进后回调（刷新界面进度）
+	onFlush func(flushed int, bytes int64) // 每次落盘后回调（推进可持久化断点，序号与字节同源）
+	norm    func([]byte) []byte            // 写入前的规范化（nil = 原样写）
+
+	// baseBytes 打开文件时文件里**已被记账**的字节数：续传时 = init 段 + 已确认
+	// 落盘的分片字节（调用方按账本对齐 .part 后给），全新任务 = 0。
+	// 它让 flushedBytes 报的是**绝对文件偏移**，恢复时能直接拿去 os.Truncate。
+	baseBytes int64
+	// flushedBytes 已确认落盘的绝对字节数（含 baseBytes），与 flushed 序号在同一次
+	// 结算里推进 —— 账本成对，读端不会看到错配组合。
+	flushedBytes int64
+	// pendingBytes 已写进 bufio、尚未落盘的字节数。只有 flush 成功后才并入
+	// flushedBytes：把"写进缓冲区"当成已落盘，正是 R9 那个断点虚高的坑。
+	pendingBytes int64
 }
 
 // newStreamWriter 以追加模式打开 path（不存在则创建），从 startIdx 开始写。
 // 追加模式是断点续传的关键：恢复时直接从上次断点继续往后写。
-
-func newStreamWriter(path string, startIdx int, onWrite, onFlush func(int), norm func([]byte) []byte) (*streamWriter, error) {
+//
+// baseBytes 是调用方按账本对齐后、文件里已被记账的字节数。传错的后果是
+// flush 回调报出错误的绝对偏移（进而把 .part 截到错误位置），所以调用方
+// 必须保证"传到这里的 baseBytes == 文件当前长度"（见 pipeline 的对齐判据）。
+func newStreamWriter(path string, startIdx int, baseBytes int64, onWrite func(int), onFlush func(int, int64), norm func([]byte) []byte) (*streamWriter, error) {
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
 	if err != nil {
 		return nil, err
 	}
 	return &streamWriter{
-		next:    startIdx,
-		flushed: startIdx,
-		buf:     make(map[int][]byte),
-		w:       bufio.NewWriterSize(f, 8<<20),
-		f:       f,
-		onWrite: onWrite,
-		onFlush: onFlush,
-		norm:    norm,
+		next:         startIdx,
+		flushed:      startIdx,
+		buf:          make(map[int][]byte),
+		w:            bufio.NewWriterSize(f, 8<<20),
+		f:            f,
+		onWrite:      onWrite,
+		onFlush:      onFlush,
+		norm:         norm,
+		baseBytes:    baseBytes,
+		flushedBytes: baseBytes,
 	}, nil
 }
 
@@ -276,8 +412,10 @@ func (sw *streamWriter) submit(idx int, data []byte) error {
 		if sw.norm != nil {
 			d = sw.norm(d)
 		}
-		if _, err := sw.w.Write(d); err != nil {
+		if n, err := sw.w.Write(d); err != nil {
 			return err
+		} else {
+			sw.pendingBytes += int64(n)
 		}
 		sw.next++
 	}
@@ -298,11 +436,24 @@ func (sw *streamWriter) flushLocked() {
 	if err := sw.w.Flush(); err != nil {
 		return // 写入错误由下一次 Write 暴露，这里不吞掉断点推进即可
 	}
-	if sw.flushed != sw.next {
-		sw.flushed = sw.next
-		if sw.onFlush != nil {
-			sw.onFlush(sw.flushed)
-		}
+	sw.settleLocked()
+}
+
+// settleLocked 在缓冲**成功落盘之后**结算账本（调用方须持 mu）。
+//
+// 结算动作必须晚于 flush：pendingBytes 记的是"已写进 bufio"的字节，缓冲区
+// 没落盘时它们不在文件里；拿它当断点会让恢复从文件末尾之后的位置续写，
+// 中间那段永远缺失（R9）。序号与字节数在同一次结算里推进，读端永远拿到
+// 自洽的一对（见 dlJob.flushed）。
+func (sw *streamWriter) settleLocked() {
+	if sw.pendingBytes == 0 && sw.flushed == sw.next {
+		return
+	}
+	sw.flushedBytes += sw.pendingBytes
+	sw.pendingBytes = 0
+	sw.flushed = sw.next
+	if sw.onFlush != nil {
+		sw.onFlush(sw.flushed, sw.flushedBytes)
 	}
 }
 
@@ -325,6 +476,15 @@ func (sw *streamWriter) Flushed() int {
 	return sw.flushed
 }
 
+// FlushedBytes 返回已确认落盘的**绝对字节数**（含 baseBytes），与 Flushed()
+// 描述同一时刻。恢复时按它对 .part 做对齐（truncate 到账本位置），
+// 所以它必须来自写入层自己的结算，不能拿 os.Stat().Size() 代替。
+func (sw *streamWriter) FlushedBytes() int64 {
+	sw.mu.Lock()
+	defer sw.mu.Unlock()
+	return sw.flushedBytes
+}
+
 // Close 冲刷缓冲并关闭文件。保存断点前必须先调用，否则尾部数据会丢。
 
 func (sw *streamWriter) Close() error {
@@ -333,10 +493,7 @@ func (sw *streamWriter) Close() error {
 	err := sw.w.Flush()
 	if err == nil {
 		// 尾部数据已落盘，断点可以安全推进到 next
-		sw.flushed = sw.next
-		if sw.onFlush != nil {
-			sw.onFlush(sw.flushed)
-		}
+		sw.settleLocked()
 		err = sw.f.Close()
 		return err
 	}
@@ -348,15 +505,31 @@ func (sw *streamWriter) Close() error {
 // 三种模式自动选择：
 //  1. 分片续传：.part.meta 位图存在 → 只下载未完成的分片
 //  2. 分片下载：全新文件且服务器支持 Range（Content-Range 给出总大小）→ 并发分片
-//  3. 单连接续传：其余情况 → Range 追加（206）/ 全量覆盖（200）/ 丢弃重下（416）
+//  3. 单连接续传：其余情况 → Range 追加（206）/ 全量覆盖（200）/ 丢弃重下（416）。
+//     按文件大小续传的前提是"上次确知为单连接连续追加"（partModeStream）：分片模式
+//     或模式未知（旧任务）一律先清空，见下方模式守卫。
 //
 // 分片模式下 ctx 取消或失败会保留 .part 与 .meta（位图记下已落盘的片），
 // 任务恢复后只重下缺失片。片长固定为 chunkSizeFixed、与并发数解耦，
 // 否则片数恒等于并发数、中断时位图上一个 true 都来不及有（详见该常量说明）。
 func (j *dlJob) downloadDirect(ctx context.Context, outPath string) error {
 	// 模式 1：分片续传（位图恢复）
+	//
+	// 位图必须与 .part 的实际长度相容才敢采信（P0-5）。位图是**独立文件**，它的
+	// 生命周期与 .part 并不绑定：任何"只删了 .part、位图留下"的路径（失败任务转
+	// 取消、外部手工删除、别的版本写的残留……）都会留下一个**内部自洽却描述不到
+	// 实处**的位图。此时照旧走模式 1，被它标记为"已完成"的片就永远不会下载 ——
+	// 成品中间是空洞，而函数返回 nil、界面显示「已保存」（本项目头号缺陷形态）。
+	//
+	// 不相容时**必须把它删掉**再往下走，不能只是"这次不采信"：下次下载时 .part
+	// 已被别的模式写长，长度检查反而会通过，残留位图就"复活"了。
 	if m, ok := loadChunkMeta(outPath); ok {
-		return j.downloadChunked(ctx, outPath, m)
+		if !chunkMetaMatchesPart(outPath, m) {
+			removeChunkMeta(outPath)
+		} else {
+			j.setPartMode(partModeChunked)
+			return j.downloadChunked(ctx, outPath, m)
+		}
 	}
 
 	// 模式 2：全新下载且服务器支持 Range → 分片下载（小文件不值得分片）
@@ -369,6 +542,7 @@ func (j *dlJob) downloadDirect(ctx context.Context, outPath string) error {
 					if err := saveChunkMeta(outPath, m); err != nil {
 						return err
 					}
+					j.setPartMode(partModeChunked)
 					return j.downloadChunked(ctx, outPath, m)
 				}
 				// 片数超限（total 来自 Content-Range、不可信）：退回单连接，不建位图
@@ -378,6 +552,41 @@ func (j *dlJob) downloadDirect(ctx context.Context, outPath string) error {
 
 	// 模式 3：单连接续传
 	offset := partFileOffset(outPath)
+	// 模式守卫（P0-4 的直链版本）：一个非空的 .part 只有在上次是**单连接连续追加**
+	// 时才是有效前缀 —— 那时文件大小恰好等于有效字节数。上次若是分片模式，文件是
+	// WriteAt 稀疏写的产物：大小 = 最大已写区间末端，**中间可能有洞**，按大小续传
+	// 会从文件末尾往后 append，那些洞永远补不上 —— 成品能播，但其中几段是坏数据，
+	// 日志一切正常（本项目头号缺陷形态）。
+	//
+	// 判据必须取"上次记录的模式"，不能取"现在能不能读到位图"：位图丢失本身
+	// 就是要防的形态，拿它当判据等于没有守卫。
+	//
+	// 方向一律 fail-safe（与 pipeline.go 的 alignPartToLedger 是同一条原则：账本/
+	// 模式不可用即清空重下，绝不按文件大小猜）。所以这里**只有确知是 stream 才敢
+	// 按大小续传**，其余两态都清空重下：
+	//   - 分片模式（chunked）：位图已丢，文件可能带洞；
+	//   - 空串：v0.5.0 升级上来的旧任务 —— 那个版本已有 WriteAt 分片下载，但没有
+	//     partMode 字段，于是读到空串。**空值的含义是"不知道"，不是"安全"**。
+	//
+	// ⚠️ 2026-09-23 修正：原判据是 `partModeNow() == partModeChunked`，只认"已知是
+	// 分片"。旧任务读到空串 ⇒ 守卫整个不生效 ⇒ 带洞的 .part 被按大小续传，洞留在
+	// 成品里（形态②"对象不存在 vs 对象为空"：判据只写过非空的那一半）。
+	if mode := j.partModeNow(); offset > 0 && mode != partModeStream {
+		if mode == partModeChunked {
+			fmt.Printf("[direct] 上次为分片模式但位图已丢失，临时文件可能存在空洞：清空重下\n")
+			j.setRestartNote("续传位图丢失，已从头下载")
+		} else {
+			fmt.Printf("[direct] 上次的写入模式未知（升级前的旧任务），无法确认临时文件是有效前缀：清空重下\n")
+			j.setRestartNote("续传信息不完整，已从头下载（原有临时文件已清空）")
+		}
+		if err := os.Truncate(outPath, 0); err != nil {
+			return err
+		}
+		offset = 0
+	}
+	if offset == 0 {
+		j.setPartMode(partModeStream)
+	}
 	for attempt := 0; ; attempt++ {
 		req, err := j.rt.newRequest(j.m3u8URL, j.segmentReferer(j.m3u8URL))
 		if err != nil {
@@ -412,7 +621,11 @@ func (j *dlJob) downloadDirect(ctx context.Context, outPath string) error {
 		case http.StatusRequestedRangeNotSatisfiable:
 			resp.Body.Close()
 			if offset > 0 && attempt == 0 {
+				// 416 = 服务器说这个区间不成立（内容已变 / 文件被换）。
+				// 连位图一起丢：既然内容已变，位图记的"哪些片已完成"全部作废，
+				// 留着它下次会被当成有效账本（P0-5）。与上面 MarkStale 同一处理。
 				os.Remove(outPath)
+				removeChunkMeta(outPath)
 				offset = 0
 				continue
 			}
@@ -451,6 +664,23 @@ type chunkMeta struct {
 
 func chunkMetaPath(partPath string) string { return partPath + ".meta" }
 
+// chunkMetaTmpPath 位图原子写的临时文件（见 writeFileAtomic：先写它、再 rename
+// 到 chunkMetaPath）。
+func chunkMetaTmpPath(partPath string) string { return chunkMetaPath(partPath) + ".tmp" }
+
+// removeChunkMeta 删掉位图及其原子写的临时文件。
+//
+// 收尾 / 失效 / 取消路径统一走这里：只删 .meta 会把 writeFileAtomic 在 Sync 与
+// Rename 之间被杀时留下的 .meta.tmp 变成孤儿 —— 任务早就结束了，再没人来覆盖它。
+func removeChunkMeta(partPath string) error {
+	if err := os.Remove(chunkMetaPath(partPath)); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	// 临时文件不存在是常态（正常路径下它已被 rename 走），错误一律忽略
+	os.Remove(chunkMetaTmpPath(partPath))
+	return nil
+}
+
 // chunkCount 按片长切分 total 字节得到的片数（向上取整；用除余避免 total+size 溢出）。
 func chunkCount(total, size int64) int64 {
 	if size < 1 {
@@ -482,12 +712,49 @@ func loadChunkMeta(partPath string) (*chunkMeta, bool) {
 	return &m, true
 }
 
+// chunkMetaMatchesPart 判定位图与 .part 的**实际长度**是否相容（P0-5）。
+//
+// loadChunkMeta 只校验位图**自洽**（片数与 Total/Size 对得上），它看不见 .part ——
+// 而"位图说第 i 片已完成"在盘上是一个可观测事实：downloadRange 用 WriteAt 把
+// [i*Size, min((i+1)*Size, Total)) 写进文件，所以文件长度至少要到那个区间的末尾。
+//
+// 取**最高的那片已完成**算下界就够了：文件长度是单调的，最高的那片满足，
+// 比它低的必然也满足。
+//
+// 不相容的唯一现实成因是"位图是上一次尝试的残留、.part 已经换成了新的"——
+// 此时采信位图会让被标记完成的片永不下载 ⇒ 成品带洞却报成功。所以要 fail-safe：
+// 一律判不可用、清空重下（与 alignPartToLedger「账本不可用即清空」同一条原则，
+// 绝不按大小猜）。
+//
+// 一片都没标完成时返回 true：位图不提供任何"跳过"指令，与没有位图等价。
+func chunkMetaMatchesPart(partPath string, m *chunkMeta) bool {
+	size := partFileOffset(partPath)
+	if size <= 0 {
+		return false // 空 .part 与"某片已完成"直接矛盾
+	}
+	for i := len(m.Done) - 1; i >= 0; i-- {
+		if !m.Done[i] {
+			continue
+		}
+		need := int64(i+1) * m.Size
+		if need > m.Total {
+			need = m.Total
+		}
+		return size >= need
+	}
+	return true
+}
+
+// saveChunkMeta 把位图原子写盘（P1-2）：临时文件 + Sync + rename，见 writeFileAtomic。
+// 就地 O_TRUNC 写在"写盘瞬间被强杀/断电"时会留下截断的 JSON，位图随即被判不可用；
+// 而此刻 .part 是稀疏写的产物（大小 ≠ 有效字节），续传只剩"从末尾往后追加"一条路，
+// 中间的空洞会被永久留在成品里。
 func saveChunkMeta(partPath string, m *chunkMeta) error {
 	data, err := json.Marshal(m)
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(chunkMetaPath(partPath), data, 0644)
+	return writeFileAtomic(chunkMetaPath(partPath), data, 0644)
 }
 
 // 位图落盘节流：每完成这么多片、或距上次落盘达到这么久，就写一次盘。
@@ -701,7 +968,7 @@ func (j *dlJob) downloadChunked(ctx context.Context, outPath string, m *chunkMet
 		// 下次任务全量重下
 		closeFile()
 		os.Remove(outPath)
-		os.Remove(chunkMetaPath(outPath))
+		removeChunkMeta(outPath)
 		return errChunkStale
 	}
 	if store.Done() != store.Total() {
@@ -710,7 +977,7 @@ func (j *dlJob) downloadChunked(ctx context.Context, outPath string, m *chunkMet
 		store.Flush()
 		return fmt.Errorf("分片下载未完成")
 	}
-	os.Remove(chunkMetaPath(outPath))
+	removeChunkMeta(outPath)
 	return nil
 }
 
@@ -980,12 +1247,20 @@ func fetchSegment(ctx context.Context, j *dlJob, segURL string) ([]byte, error) 
 			}
 			continue
 		}
-		data, err := readAllWithIdleTimeout(resp.Body, transferIdleTimeout)
+		// 读体设体积上限。空闲超时只挡"对方卡住不动"，挡不住"对方一直吐"：
+		// 只要持续有字节到达就永远不空闲，无上限的 ReadAll 会一路读进内存
+		// 直到进程 OOM（上限取值依据见 maxSegmentBytes）。
+		data, err := readCappedWithIdleTimeout(resp.Body, resp.Body, j.rt.segBodyLimitNow(), transferIdleTimeout)
 		resp.Body.Close()
 		if err != nil {
 			lastErr = fmt.Errorf("attempt %d: read body: %w", attempt, err)
 			if ctx.Err() != nil {
 				return nil, ctx.Err()
+			}
+			if errors.Is(err, errBodyTooLarge) {
+				// 超限意味着"远端在这个 URL 上返回的不是分片"，同一个 URL 再试
+				// 还是同一份内容，没必要空耗退避（与 httpGetWithRetry 同策）。
+				return nil, lastErr
 			}
 			if !sleepCtx(ctx, time.Duration(attempt)*time.Second) {
 				return nil, ctx.Err()
@@ -1014,19 +1289,23 @@ func streamDownload(ctx context.Context, j *dlJob, segURLs []string, startIdx in
 		dispTot = 0
 	}
 	j.setSeg(int64(startIdx), dispTot)
-	j.setSegFlushed(int64(startIdx))
+	// 账本成对给出：序号用本轮起点，字节数沿用恢复时的对齐结果（baseBytes）。
+	// 后续 writer 的每次 flush 都会用"同一时刻的序号 + 绝对字节数"覆盖它。
+	baseBytes := j.flushedBytesNow()
+	j.setFlushed(int64(startIdx), baseBytes)
 
-	sw, err := newStreamWriter(outPath, startIdx, func(next int) {
+	sw, err := newStreamWriter(outPath, startIdx, baseBytes, func(next int) {
 		j.setSeg(int64(next), dispTot)
 		if j.live {
 			fmt.Printf("\r  已录制分片: %d   ", next)
 		} else {
 			fmt.Printf("\r  下载进度: %d / %d   ", next, startIdx+total)
 		}
-	}, func(flushed int) {
+	}, func(flushed int, bytes int64) {
 		// 断点只在真实落盘后推进（R9）：Engine.Stop 可能在 pipeline 收尾前
 		// 就落盘状态；若断点领先磁盘字节，续传会在文件中间留下空洞。
-		j.setSegFlushed(int64(flushed))
+		// 字节数与序号同源（一次回调），读端不会看到错配的一对。
+		j.setFlushed(int64(flushed), bytes)
 	}, func(d []byte) []byte {
 		// 写入前规范化：委托容器状态对象（fMP4 时间戳归一化 + NAL 封装转换 +
 		// 内联 init 消费）；无状态容器原样写，规范化失败降级原样写
@@ -1174,7 +1453,8 @@ dispatch:
 func finishStream(sw *streamWriter, j *dlJob, dispTot int64, closeErr error) (int, error) {
 	next, flushed := sw.Next(), sw.Flushed()
 	j.setSeg(int64(next), dispTot)
-	j.setSegFlushed(int64(flushed))
+	// 序号与字节数必须取自同一次结算（都经 sw 的锁读，见 FlushedBytes）。
+	j.setFlushed(int64(flushed), sw.FlushedBytes())
 	if closeErr != nil {
 		return flushed, closeErr
 	}
@@ -1192,22 +1472,60 @@ func finishStream(sw *streamWriter, j *dlJob, dispTot int64, closeErr error) (in
 // 返回 (已写分片数, 错误)：暂停/取消时返回当前断点与 nil，由上层按意图收尾。
 // ============================================================
 
-// livePollInterval / liveMaxEmptyPolls 为 Runtime 字段（约 75s/25 次兜底，
-// 防死流/直播结束但无 ENDLIST 时挂死；测试可调短）。
+// livePollInterval / liveMaxEmptyPolls 为 Runtime 字段：每 livePollInterval
+// （runtime.go 默认 3s）轮询一次，连续 liveMaxEmptyPolls（默认 25）次没有新分片
+// 就判定直播结束 —— 默认即 75 秒无新分片。防死流/直播结束但无 ENDLIST 时挂死；
+// 测试可调短。
+//
+// ⚠️ 这条注释原来写作"约 75s/25 次兜底"，没说清哪个是间隔，被读成过
+// "75 秒一轮 × 25 次"（差 25 倍）。数字以 runtime.go 的默认值为准，别在注释里
+// 复述成含糊形式。
 
-func (j *dlJob) liveDownload(ctx context.Context, outPath string, from int) (int, error) {
+// liveEndKind 报告 liveDownload 是"怎么结束的"。
+//
+// 三个正常出口（用户中断 / 播放列表声明结束 / 长时间无新分片）都返回 nil error，
+// 上层只能靠它区分。不区分就会把"推断结束"当成"确证结束"、记成一次完整录完 ——
+// 本项目头号缺陷形态（产物可能不完整，而状态与日志显示一切正常）。
+type liveEndKind int
+
+const (
+	liveEndNone     liveEndKind = iota // 没走到任何正常出口（报错返回）
+	liveEndUserStop                    // ctx 取消：用户停止 / 取消 / 程序退出
+	liveEndEndList                     // 播放列表出现 #EXT-X-ENDLIST：源站声明结束
+	liveEndInferred                    // 连续 liveMaxEmptyPolls 次无新分片：推断结束
+)
+
+// note 返回这条结束方式的用户可见说明。
+//
+// 文案归枚举自己所有（而不是由收尾调用方拼字符串）：结束方式的**判据强度不同，
+// 说法就必须不同**，两句话摆在一起才能被逐字对比。原先这段 switch 写在
+// runDiskPipeline 的收尾段里，于是"结束方式 → 文案"的映射与它的枚举定义隔了
+// 一个文件 —— 加一种结束方式时得靠记忆去找改哪儿。
+//
+// userStop / none 返回空串：那两条不是"录完了"，说明该由中断路径给（见 finalizeCause）。
+func (k liveEndKind) note() string {
+	switch k {
+	case liveEndEndList:
+		return "播放列表已结束" // 源站白纸黑字声明结束 —— 确证
+	case liveEndInferred:
+		return "播放列表停止更新 · 末尾可能不全" // 只是"列表不再增长" —— 推断
+	}
+	return ""
+}
+
+func (j *dlJob) liveDownload(ctx context.Context, outPath string, from int) (int, liveEndKind, error) {
 	next := from
 	empty := 0
 	for {
 		if err := ctx.Err(); err != nil {
-			return next, nil // 用户中断（停止/取消/退出）：干净返回，收尾意图由上层 finishInterrupt 决定
+			return next, liveEndUserStop, nil // 用户中断（停止/取消/退出）：干净返回，收尾意图由上层 finishInterrupt 决定
 		}
 		content, base, isDirect, err := j.fetchPlaylist(ctx)
 		if err != nil {
-			return next, err
+			return next, liveEndNone, err
 		}
 		if isDirect {
-			return next, fmt.Errorf("直播播放列表响应变为直链媒体，无法继续跟随录制")
+			return next, liveEndNone, fmt.Errorf("直播播放列表响应变为直链媒体，无法继续跟随录制")
 		}
 		cur := parsePlaylist(content, base)
 		// 同一轮窗口内换 key（key rotation）无法安全解密：显式失败。
@@ -1218,11 +1536,11 @@ func (j *dlJob) liveDownload(ctx context.Context, outPath string, from int) (int
 		// 非 identity 的 KEYFORMAT 在点播路径都会被它挡下，直播若只做简易校验
 		// 就成了绕过口 —— 那几类恰好都是「产物坏了但日志正常」的静默损坏。
 		if kerr := validatePlaylist(cur); kerr != nil {
-			return next, kerr
+			return next, liveEndNone, kerr
 		}
 		// 每轮轮询重新装配解密器（幂等：key 未变不重拉）；key 轮换时按新 key 解密后续分片
 		if kerr := j.ensureDecryptor(ctx, cur.key); kerr != nil {
-			return next, kerr
+			return next, liveEndNone, kerr
 		}
 
 		// 窗口滚动检测：上一轮录到的最大序号与本轮列表首片之间若断开，说明中间
@@ -1264,7 +1582,7 @@ func (j *dlJob) liveDownload(ctx context.Context, outPath string, from int) (int
 			commitLiveWaterline(j, pendSeqs, startIdx)
 			if derr != nil {
 				if ctx.Err() != nil {
-					return next, nil
+					return next, liveEndUserStop, nil
 				}
 				// 这批里"本该录到、却没写进文件"的分片，在产物时间轴上就是一段
 				// 真实空洞（源站故障时它们大概率已跟着窗口滚走）。用户主动停止
@@ -1276,27 +1594,27 @@ func (j *dlJob) liveDownload(ctx context.Context, outPath string, from int) (int
 				if written < len(newDurs) {
 					j.addGapSeconds(sumDurs(newDurs[written:]))
 				}
-				return next, derr
+				return next, liveEndNone, derr
 			}
 			if cur.hasEndList {
 				fmt.Println("[live] 播放列表出现 ENDLIST，直播录制自然结束")
-				return next, nil
+				return next, liveEndEndList, nil
 			}
 		} else {
 			if cur.hasEndList {
 				fmt.Println("[live] 播放列表出现 ENDLIST，直播录制自然结束")
-				return next, nil
+				return next, liveEndEndList, nil
 			}
 			empty++
 			if empty >= j.rt.liveMaxEmptyPolls {
 				fmt.Printf("[live] 连续 %d 次轮询无新分片，判定直播结束\n", empty)
-				return next, nil
+				return next, liveEndInferred, nil
 			}
 		}
 
 		select {
 		case <-ctx.Done():
-			return next, nil
+			return next, liveEndUserStop, nil
 		case <-time.After(j.rt.livePollInterval):
 		}
 	}

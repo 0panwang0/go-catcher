@@ -159,20 +159,46 @@ func (e *Engine) handleResume(w http.ResponseWriter, r *http.Request) {
 		jsonError(w, http.StatusBadRequest, "task already finished")
 		return
 	}
-	// 直播任务一律不给恢复入口（含"录制中断"的终态与旧状态文件遗留的断点任务）。
-	// 这是产品语义，不是能力缺失：中间的内容已经从滑动窗口滚走，接着录只能
-	// 产出一个时间轴带空洞的文件。要接着录就回直播页重新开始。
+	// 直播任务的「继续」= 结束录制并把已录部分收尾成成品（学徒 2026-09-20 定）。
+	//
+	// 直播流没有"接着录"这回事：中断期间的分片已从滑动窗口滚走，接着录只能在
+	// 产物时间轴上留一段空洞。所以这条入口不是"无法恢复"，而是**收尾** ——
+	// 用户点「继续」的含义是"我接受这个结果"，不是"从未中断过"。
+	//
+	// 分流放在后端而不是靠前端给对按钮：GUI / CLI / 扩展任何入口调 resume 都走
+	// 这里。收尾复用与点「停止」相同的两个函数（finishInterrupt→finishStop、
+	// finishStoppedTask→finishStop），两条入口的产物规则因此天然一致。
 	if te.st.live {
+		te.intent = intentStop
+		te.st.stage = "停止中"
+		cancel := te.cancel
+		running := te.st.running || te.st.queued
 		te.mu.Unlock()
-		jsonError(w, http.StatusBadRequest, "直播流不支持恢复：暂停期间的内容已从列表滚走，请重新开始录制")
+		if running && cancel != nil {
+			// 还在录：中断它，收尾交给 pipeline 的中断路径（与运行中点「停止」同路）。
+			cancel()
+			writeJSON(w, http.StatusOK, actionResp{OK: true, ID: id, Resumed: true})
+			return
+		}
+		// 已静止（失败 / 中断后）：pipeline 早已退出，直接按现有 .part 收尾。
+		go finishStoppedTask(te)
+		writeJSON(w, http.StatusOK, actionResp{OK: true, ID: id, Resumed: true})
 		return
 	}
-	if te.st.running && !te.st.paused {
+	// 忙碌判据必须含 queued（P2-13）：「已受理但还在等并发槽」的任务
+	// running=false、queued=true（pipeline.go 进 limiter.acquire 之前就是这么写的），
+	// 只判 running 会给它发通行证 ⇒ 连发两次 /resume 起两条 pipeline，各自持有并发
+	// 槽、各自 te.job = job（后者覆盖前者）、两个 streamWriter 以 O_APPEND 写同一个
+	// .part ⇒ 分片交错；te.cancel 也被覆盖，此后 /pause 只能取消其中一条。
+	// 槽满时（默认 MaxConcurrent=3）这个窗口可以长达整个排队时长，不是微秒级竞态。
+	// 同函数的直播分支判的是 `running || queued`，这里与它对齐。
+	if (te.st.running || te.st.queued) && !te.st.paused {
 		te.mu.Unlock()
 		writeJSON(w, http.StatusOK, actionResp{OK: true, ID: id, Running: true})
 		return
 	}
-	// 清掉旧意图，重新起一个 goroutine（会重新拿并发槽并接着断点下）
+	// 清掉旧意图并置忙 —— 与上面的判据同在 te.mu 临界区内，所以「检查」与「置忙」
+	// 是一个原子步骤：并发的第二次 /resume 一定看得到 queued=true 并从上面返回。
 	te.intent = intentNone
 	te.st.paused = false
 	te.st.done = false
@@ -182,7 +208,6 @@ func (e *Engine) handleResume(w http.ResponseWriter, r *http.Request) {
 	te.st.queued = true
 	te.mu.Unlock()
 
-	// 清掉旧意图，重新起一个 goroutine（会重新拿并发槽并接着断点下）。
 	// 与新建任务同一入口，也必须走 runGuarded：续传会重新跑一遍 init 段处理。
 	go runGuarded(te, func() { runDiskPipeline(te) })
 	writeJSON(w, http.StatusOK, actionResp{OK: true, ID: id, Resumed: true})
@@ -218,6 +243,12 @@ func (e *Engine) handleCancel(w http.ResponseWriter, r *http.Request) {
 		te.mu.Unlock()
 		if part != "" {
 			_ = os.Remove(part)
+			// 位图必须与 .part 一起删（P0-5）：留下一个"说第 0..K 片已完成"的位图，
+			// 而 .part 已经没了 —— 用户重新下载同一个视频时会认领同一个文件名，
+			// 新建的 0 字节 .part 配上这个残留位图，被标记完成的片**永远不会下载**，
+			// 成品中间是空洞、函数却返回成功。下面「已运行时取消」那个分支一直是
+			// 配对写的，这一支漏了（同一函数两分支一对一错）。
+			_ = removeChunkMeta(part)
 			fmt.Printf("[disk] 失败任务转取消，删除 .part: %s\n", part)
 			e.rt.markDirty()
 		}
@@ -258,7 +289,7 @@ func (e *Engine) handleCancel(w http.ResponseWriter, r *http.Request) {
 		te.mu.Unlock()
 		if part != "" {
 			_ = os.Remove(part)
-			_ = os.Remove(part + ".meta")
+			_ = removeChunkMeta(part)
 		}
 		e.rt.markDirty()
 	}
@@ -457,8 +488,8 @@ func (e *Engine) handleOpenFolder(w http.ResponseWriter, r *http.Request) {
 
 // handleConfig GET 返回当前配置；POST 按补丁语义更新——只应用请求里出现的字段，缺省字段保持现值，
 // 这样 {uiView:"compact"} 之类的局部更新不会顺带把并发/重试清零。
-// 并发/重试即时生效；端口只写入配置，下次服务启动（托盘重启 / 重开程序）才生效——
-// 服务正跑着时改端口，响应带 restartRequired=true 提示前端弹"需重启服务"。
+// 并发/重试即时生效；端口只写入配置，下次服务启动（重开客户端）才生效——
+// 服务正跑着时改端口，响应带 restartRequired=true 提示前端弹"需重启客户端"。
 // configResp /config 的响应体。
 //   - systemProxy：当前检测到的 Windows 系统代理（设置页「跟随系统」模式回显）
 //   - clamped：请求里有值越界、已被夹取到合法区间（前端据此提示用户）

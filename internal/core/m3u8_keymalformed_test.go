@@ -108,7 +108,9 @@ func TestLiveFollowRejectsMalformedKey(t *testing.T) {
 
 	out := filepath.Join(t.TempDir(), "live.ts")
 	j := &dlJob{rt: testStd, m3u8URL: srv.URL + "/live.m3u8", live: true}
-	if _, err := j.liveDownload(context.Background(), out, 0); err == nil {
+	if _, endKind, err := j.liveDownload(context.Background(), out, 0); err == nil {
 		t.Fatal("直播遇到畸形加密声明必须报错，不能当明文继续录")
+	} else if endKind != liveEndNone {
+		t.Fatalf("endKind=%v want liveEndNone（报错路径不该被记成任何一种正常结束）", endKind)
 	}
 }

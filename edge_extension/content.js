@@ -28,13 +28,36 @@
   const SEGMENT_WINDOW_MS = 15000;
   const CONCURRENCY = 8;
   const MAX_RETRIES = 3;
+  // 轮询查询任务状态的失败上限：连续查不到任务（本地服务重启过、任务被清理）就
+  // 落到失败态，而不是每 700ms 永久轮询 —— 否则面板会永停在「正在连接…」，
+  // 用户看不出已经失败。阈值取自共享模块（P2-2 修订：原先这里与 downloader.js
+  // 各写一份 15、靠跨文件对值防漂移，现在唯一来源是 src/background/constants.js）。
+  const POLL_MAX_MISSES = P.POLL_MAX_MISSES;
+  // 与上面 P 非空同一条理由：取不到就是**装配错误**（constants.js 没挂进
+  // content-shared 入口），而 undefined 会让 `misses > undefined` 恒假 ⇒
+  // 轮询永不放弃、面板永停「正在连接…」。装配错了就立刻死、死得可读。
+  if (!Number.isFinite(POLL_MAX_MISSES)) {
+    throw new Error("__m3u8Shared.POLL_MAX_MISSES 缺失：constants.js 未挂进 content-shared 入口");
+  }
   const DEBUG = false; // true 时在页面控制台输出悬停判定日志（排查按钮不出现用）
 
   function dbg(...args) {
     if (DEBUG) console.log("[M3U8 Catcher]", ...args);
   }
 
+  // pollGiveUp 连续查不到任务的次数是否已达放弃阈值。抽成纯函数是为了可测：
+  // 这个判据一旦被删掉或改成恒 false，轮询就退回"永久静默轮询"（P2-2 的形态）。
+  function pollGiveUp(misses) {
+    return misses > POLL_MAX_MISSES;
+  }
+
   let currentBtn = null;
+  // btnDismissed 用户点过按钮上的 ✕：本页（本次文档会话）不再自动弹出下载按钮。
+  //
+  // 刻意**不落盘、不进 storage**：这是"这次页面上我不想看见它"的临时意愿，刷新页面即复位 ——
+  // 跨会话记住它反而会让用户下次找不到按钮（"按钮去哪了"比"按钮碍事"更难排查）。
+  // 作用范围是本 frame：嵌入式播放器的按钮由那个 frame 自己的这份变量管，两边各关各的。
+  let btnDismissed = false;
   // currentTarget 悬停目标：{el, src, pageUrl}。
   //   video 场景：本 frame 内的 video 元素，pageUrl = location.href
   //   iframe 场景：跨域播放器 iframe（video 在 frame 内，本 frame 拿不到），
@@ -46,6 +69,13 @@
   let gateToken = 0; // 悬停检查令牌：仅最新一次悬停的结果生效
   let gatePending = null; // 正在检查链接的目标元素
   let lastPointer = { x: -1, y: -1 }; // 最近一次指针位置（复查用）
+  // lastRect 目标的**最后已知矩形**。站点把播放器收走时（悬停预览小窗被销毁、MSE 重挂载、
+  // 元素被置为 display:none），实时矩形会塌成 0×0 或直接断连；按钮区若还去读实时矩形，
+  // 就会退化到 (0,0) 上的一个点，指针从视频移向按钮的那条缝里下一次 mouseover 就把按钮
+  // 判死 —— 学徒实测的「小窗视频，移过去就消失」正是这么来的：真机上按钮在 y=52 那一步
+  // 消失，而视频顶边在 56、按钮底边在 48，那就是中间那条 8px 的缝（复现探针
+  // `.workbuddy/tmp/mini_btn.mjs`）。有它撑着，用户走到一半站点把窗收了也还点得到。
+  let lastRect = null;
   let recheckTimer = null;
   let panel = null;
   let activeTaskId = null; // 多任务并发：本次下载的 server 任务 id，轮询用
@@ -55,6 +85,19 @@
   let activeLive = false;
   let analyzing = false;
   let abortController = null;
+  // trackTimer 进度轮询的句柄（trackDownload 起、stopTrack 停）。
+  //
+  // 必须放在**模块级**而不是 trackDownload 的局部：面板可以在不点面板内 X 的情况下
+  // 消失（点灰底、点页面上别处触发重画），而那时局部变量已经不可达 —— 轮询会一直
+  // 跑下去，直到某次查到 complete 又**自己把面板弹回来**（A-5）。
+  let trackTimer = null;
+  // stopTrack 停掉进度轮询。幂等：多次调用安全（面板关闭路径有多条）。
+  function stopTrack() {
+    if (trackTimer !== null) {
+      clearInterval(trackTimer);
+      trackTimer = null;
+    }
+  }
 
   // ============================================================
   // MAIN world fetch 代理桥接
@@ -138,9 +181,11 @@
 
   function onHover(e) {
     if (currentBtn && (e.target === currentBtn || currentBtn.contains(e.target))) return;
-    // 按钮位于目标外部上方：光标在「目标矩形向上扩展的条带」内时保持按钮，
-    // 否则鼠标一离开目标边界按钮就会消失，根本来不及点
-    if (inButtonZone(e.clientX, e.clientY)) return;
+    // 按钮位于目标外部上方：光标在「目标矩形 + 向上扩展的条带」内时保持按钮，
+    // 否则鼠标一离开目标边界按钮就会消失，根本来不及点。
+    // ⚠️ 判据里包含按钮自身的矩形（见 pointerInButtonZone）—— 站点在指针离开小窗时
+    // 把它收掉，光标此刻可能正好落在已经"没主"的按钮上，只看目标矩形就会把按钮判死。
+    if (pointerInButtonZone(e.clientX, e.clientY)) return;
     const target = findMediaTargetAtPoint(e.clientX, e.clientY);
     if (target) showButtonIfSniffed(target);
     else hideButton();
@@ -237,6 +282,10 @@
   //           另外把 src 里 ?url= 编码的目标地址作为 embedUrl 传下去，供后台
   //           精确命中（解析页跳转到别的主机播放时，同站匹配会全部落空）
   async function showButtonIfSniffed(target) {
+    // 用户已经点过 ✕：本页后续一律不弹（悬停 / 定时复查 / 在途回调都走这里进来）。
+    // 挡在**最前面**：晚到的 async 检查回来时也要被这条挡住，不能靠"hideButton 把
+    // 按钮删了"就算完 —— 它只是删了当前那个元素，下一次悬停照样会建一个新的。
+    if (btnDismissed) return;
     if (currentTarget && currentTarget.el === target.el) return;
     if (gatePending === target.el) return; // 同一目标的检查在途
     if (deniedEl === target.el && Date.now() - deniedAt < SRC_RECHECK_MS) return;
@@ -262,6 +311,12 @@
     }
     if (gatePending === target.el) gatePending = null;
     if (token !== gateToken) return; // 期间鼠标已移到别的目标
+    // 期间用户点了 ✕：一样不再显示。
+    // 与入口那条分工：入口挡的是"进函数时就已经关掉"（连消息都不发），这条挡的是
+    // "检查已经发出去、等待期间才关掉"。上面 token 那条判据其实**也**能挡住这一档
+    // （dismissButton 会前移 token），但 token 管的是"鼠标移到别处"——让它兼管用户意图
+    // 是巧合而不是设计，所以在这里把意图显式写一遍。
+    if (btnDismissed) return;
     if (found) {
       dbg("命中链接，显示按钮", target.pageUrl);
       showButton(target);
@@ -298,7 +353,14 @@
 
     const btn = document.createElement("div");
     btn.className = "m3u8-catcher-btn";
-    btn.innerHTML = `<span class="ic">⬇</span><span class="txt">下载该视频</span>`;
+    // ✕ 常驻在按钮右侧、用一条竖线隔开（学徒 2026-09-30 拍的形态）：
+    // 常驻才看得见"这玩意能关"，宽度恒定不会因为 hover 抖一下。
+    // 两侧负 margin 与 padding 等量抵消：视觉位置与占位宽度都跟不加 padding 时一模一样，
+    // 但命中区从 13×13 撑到 23×21 —— 13px 的 ✕ 实在太难点中（按钮高才 32px）。
+    btn.innerHTML =
+      `<span class="ic">⬇</span><span class="txt">下载该视频</span>` +
+      `<span class="sep" style="width:1px;height:13px;background:rgba(255,255,255,.4);margin:0 3px 0 4px"></span>` +
+      `<span class="cls" style="font-size:13px;opacity:.9;line-height:1;padding:4px 5px;margin:-4px -5px">✕</span>`;
     Object.assign(btn.style, {
       position: "fixed",
       zIndex: "2147483647",
@@ -329,57 +391,115 @@
       await onDownloadClick(target);
     });
 
+    // ✕ 是按钮的子节点：不把事件拦在这里，它会冒泡到上面那个 click，
+    // 变成"点关闭反而开始下载"。必须在 ✕ 自己的监听里 stopPropagation。
+    const closeEl = btn.querySelector(".cls");
+    if (closeEl) {
+      closeEl.addEventListener("click", (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        dismissButton();
+      });
+    }
+
     document.body.appendChild(btn);
     currentBtn = btn;
     repositionButton();
   }
 
   function hideButton() {
+    // 让在途的 showButtonIfSniffed 作废：它 await 回来时 token 已不匹配、直接返回，
+    // 不会在按钮已被隐藏后又把按钮建回来（P3-3 的形态：悬停期间在途的异步检查
+    // 晚到一步，覆盖了"隐藏"这个更新的状态）。
+    gateToken++;
     if (currentBtn) {
       currentBtn.remove();
       currentBtn = null;
     }
     currentTarget = null;
+    lastRect = null; // 换了目标就从零开始，别拿上一个视频的矩形撑按钮区
+  }
+
+  // dismissButton 用户点了按钮上的 ✕：撤掉按钮，并让本页**后续**也不再自动弹。
+  // 只 hideButton 是不够的 —— 那只是删掉当前这个元素，下一次悬停（或 700ms 一次的
+  // 定时复查）照样把新按钮建出来。抑制开关在 showButtonIfSniffed 的最前面拦。
+  function dismissButton() {
+    btnDismissed = true;
+    hideButton();
   }
 
   function repositionButton() {
     if (!currentBtn || !currentTarget) return;
-    // 目标被页面重建（播放器重挂载）后引用会变成游离节点，矩形全为 0：
-    // 先收起，交给 mediaRecheck 按坐标重新定位、重新显示
-    if (!currentTarget.el.isConnected) {
-      hideButton();
+    // 目标被站点收走（悬停小窗关闭 / 播放器重挂载 / 元素被藏）⇒ 实时矩形不可用。
+    // **指针已经在按钮上、或正冲着按钮来时钉住不动**（位置停在上一次算好的地方）：
+    // 站点收小窗多半正是被"指针离开它"触发的，而用户此刻正是在往按钮上伸手；
+    // 链接早就嗅探到了（下载读的是嗅探记录，不依赖这个元素还在），按钮留着才点得到。
+    // 指针不在按钮区里时照旧收起 —— 别把这条读成"目标没了也不收"。
+    const live = liveTargetRect();
+    if (!live) {
+      if (!pointerInButtonZone()) hideButton();
       return;
     }
-    const rect = currentTarget.el.getBoundingClientRect();
-    if (rect.width === 0 || rect.height === 0) {
-      hideButton();
-      return;
-    }
+    lastRect = live;
     // 首选：视频左上角正上方（视频外部），不遮挡画面
     const btnH = currentBtn.offsetHeight || 0;
-    const outsideTop = Math.max(rect.top, 0) - btnH - BTN_GAP;
+    const outsideTop = Math.max(live.top, 0) - btnH - BTN_GAP;
     if (outsideTop >= 0) {
       currentBtn.style.top = `${outsideTop}px`;
-      currentBtn.style.left = `${Math.max(rect.left, 0)}px`;
+      currentBtn.style.left = `${Math.max(live.left, 0)}px`;
       return;
     }
     // 上方空间不足（视频贴近视口顶端）：回退到视频内部左上角
-    currentBtn.style.top = `${Math.max(rect.top, 0) + BTN_GAP}px`;
-    currentBtn.style.left = `${Math.max(rect.left, 0) + BTN_GAP}px`;
+    currentBtn.style.top = `${Math.max(live.top, 0) + BTN_GAP}px`;
+    currentBtn.style.left = `${Math.max(live.left, 0) + BTN_GAP}px`;
   }
 
-  // inButtonZone 光标是否处于「目标矩形向上扩展一个按钮高度的条带」内。
-  // 按钮放在目标外部上方后，这是鼠标从目标移到按钮的必经之路。
-  function inButtonZone(x, y) {
-    if (!currentBtn || !currentTarget) return false;
-    const rect = currentTarget.el.getBoundingClientRect();
-    const btnH = currentBtn.offsetHeight || 0;
+  // ---- 按钮定位与「指针正朝按钮去」的判定 ----
+  // pinHold 纯函数：指针在按钮上、或在「目标矩形向上扩展一个按钮高度的条带」内。
+  // 输入全是普通数值/矩形对象，不碰 DOM，好逐例说清（tests/buttonpin.test.js）。
+  function pinHold(px, py, btnBox, targetBox, btnH) {
+    if (!btnBox) return false;
+    if (px >= btnBox.left && px <= btnBox.right && py >= btnBox.top && py <= btnBox.bottom) {
+      return true;
+    }
+    if (!targetBox) return false;
     return (
-      x >= rect.left - BTN_GAP &&
-      x <= rect.right + BTN_GAP &&
-      y >= rect.top - btnH - BTN_GAP * 2 &&
-      y <= rect.bottom + BTN_GAP
+      px >= targetBox.left - BTN_GAP &&
+      px <= targetBox.right + BTN_GAP &&
+      py >= targetBox.top - btnH - BTN_GAP * 2 &&
+      py <= targetBox.bottom + BTN_GAP
     );
+  }
+
+  function boxOf(el) {
+    const r = el.getBoundingClientRect();
+    return { left: r.left, right: r.right, top: r.top, bottom: r.bottom, width: r.width, height: r.height };
+  }
+
+  // liveTargetRect 目标的实时矩形；元素断连、或已被站点收成 0×0 时返回 null
+  // （＝"实时矩形不可用"，而不是"目标在原点"）。
+  function liveTargetRect() {
+    if (!currentTarget || !currentTarget.el || !currentTarget.el.isConnected) return null;
+    const r = currentTarget.el.getBoundingClientRect();
+    if (r.width <= 0 || r.height <= 0) return null;
+    return { left: r.left, right: r.right, top: r.top, bottom: r.bottom, width: r.width, height: r.height };
+  }
+
+  // targetRect 按钮定位与按钮区共用的矩形：实时优先，实时不可用就退回最后已知。
+  // ⚠️ 这处**必须**保留 lastRect 兜底，别再改回只看实时矩形（成因见 lastRect 的注释）。
+  function targetRect() {
+    return liveTargetRect() || lastRect;
+  }
+
+  // pointerInButtonZone 指针是否"正冲着按钮"：在按钮上，或在从目标到按钮的必经条带里
+  // （条带同时覆盖目标矩形本身）。判据用坐标而不是 hover 状态：站点把小窗收掉之后
+  // 不会再有点向我们的 mouseover，那时候只有坐标还靠得住。
+  function pointerInButtonZone(px, py) {
+    if (!currentBtn) return false;
+    const x = typeof px === "number" ? px : lastPointer.x;
+    const y = typeof py === "number" ? py : lastPointer.y;
+    if (x < 0 || y < 0) return false;
+    return pinHold(x, y, boxOf(currentBtn), targetRect(), currentBtn.offsetHeight || 0);
   }
 
   window.addEventListener("scroll", repositionButton, true);
@@ -429,7 +549,17 @@
       const el = target.src ? target.el : null;
       const options = await expandVideoOptions(resp.sources, pageUrl, el);
       if (!options.length) {
-        showPanel("error", "候选链接均无法解析（可能被 CDN 阻断），请稍后重试。");
+        // 候选拿到了、但一条都展开不出画质。**这里不能只传一句字符串**：
+        // showPanel 的 error 分支要据此拼"手动兜底命令"，缺 --url 的命令跑不通，
+        // 而这条兜底命令正是"本地服务没起来时用户唯一的手段"（A-4）。
+        // 用原始候选的第一条拼：它至少指向同一个播放列表/直链。
+        const first = resp.sources[0] || {};
+        showPanel("error", {
+          message: "候选链接均无法解析（可能被 CDN 阻断），请稍后重试。",
+          m3u8Url: first.url || "",
+          pageUrl: first.pageUrl || pageUrl || location.href,
+          title: first.title || document.title || "",
+        });
         return;
       }
 
@@ -837,14 +967,27 @@
     document.body.appendChild(panel);
   }
 
-  function panelShell(title, bodyHTML) {
+  // 面板外壳：卡片 = 标题栏 + **自己会滚的主体** + **钉底的 footer**。
+  //
+  // 为什么主体必须自己滚（2026-09-30 学徒实测报出）：卡片封顶 max-height:85vh 且
+  // overflow:hidden，主体原先直接当 flex 子项 ⇒ 内容一旦超过 85vh 就被**静默裁掉**，
+  // 而且当时没有任何滚动容器 —— 滚都滚不到。浏览器窗口一变小（内容 554px 时窗口高
+  // ≤652 就触发），「确认下载 / 取消」整行凭空消失，用户只能看到半个面板。
+  //
+  // 所以：内容进滚动区，**所有"必须够得着"的按钮走第三个参数**（footer 是 flex:none
+  // 且排在滚动区之外），任何窗口高度下按钮都留在卡片里。窗口够大时滚动区不滚，
+  // 外观与从前只差按钮上面那条分隔线。
+  // ⚠️ min-height:0 不能省：flex 子项的 min-height 默认是 auto，缺了它滚动区不肯收缩，
+  // 照样把 footer 顶出卡片（真机上量过：去掉它等于没修）。
+  function panelShell(title, bodyHTML, footerHTML) {
     return `
       <div style="max-width:720px;width:90%;max-height:85vh;background:#fff;border-radius:8px;box-shadow:0 8px 32px rgba(0,0,0,0.35);display:flex;flex-direction:column;overflow:hidden;">
         <div style="display:flex;align-items:center;justify-content:space-between;padding:14px 18px;border-bottom:1px solid #e5e7eb;background:#f8f9fb;">
           <div style="font-size:16px;font-weight:700;color:#111;">${P.escapeHtml(title)}</div>
           <button id="m3u8-catcher-close" style="border:none;background:transparent;font-size:20px;color:#6b7280;cursor:pointer;line-height:1;">×</button>
         </div>
-        ${bodyHTML}
+        <div style="flex:1 1 auto;min-height:0;overflow-y:auto;">${bodyHTML}</div>
+        ${footerHTML || ""}
       </div>
     `;
   }
@@ -891,10 +1034,12 @@
          <div style="padding:0 28px 20px;">
            <div style="background:#1f2937;color:#e5e7eb;padding:12px;border-radius:6px;font-family:Menlo,Consolas,monospace;font-size:12px;line-height:1.6;word-break:break-all;white-space:pre-wrap;" id="go-cmd-text">${P.escapeHtml(goCmd)}</div>
            <div style="margin-top:6px;color:#9ca3af;font-size:11.5px;line-height:1.5;">exe 路径由本地服务运行时自动检测；显示为裸文件名时，先打开一次 GoCatcher 客户端即可，或在扩展设置里手动配置。</div>
-           <div style="margin-top:10px;display:flex;gap:8px;align-items:center;">
-             <button id="copy-go-cmd" style="padding:6px 14px;font-size:13px;border:none;background:#3b82f6;color:#fff;border-radius:4px;cursor:pointer;font-weight:600;">复制命令</button>
-             <span id="copy-feedback" style="color:#22c55e;font-size:12px;display:none;">✓ 已复制到剪贴板</span>
-           </div>
+         </div>`,
+        // 命令越长面板越高（命令块自身无滚动上限）⇒ 「复制命令」同样钉底，
+        // 否则超长 URL 一进来按钮就被推出卡片，而它正是这块面板唯一的可用出口
+        `<div style="flex:none;padding:12px 28px;border-top:1px solid #e5e7eb;background:#fff;display:flex;gap:8px;align-items:center;">
+           <button id="copy-go-cmd" style="padding:6px 14px;font-size:13px;border:none;background:#3b82f6;color:#fff;border-radius:4px;cursor:pointer;font-weight:600;">复制命令</button>
+           <span id="copy-feedback" style="color:#22c55e;font-size:12px;display:none;">✓ 已复制到剪贴板</span>
          </div>`
       );
       const btn = panel.querySelector("#copy-go-cmd");
@@ -957,6 +1102,43 @@
       );
       const doneBtn = panel.querySelector("#completed-close");
       if (doneBtn) doneBtn.addEventListener("click", closePanel);
+    } else if (state === "interrupted") {
+      // 直播故障中断：成品**已保存但没录完**，绝不能显示成 🎉「下载完成」——
+      // 那会把"产物不完整"藏起来（R2，本项目头号缺陷形态）。如实说明已保存、
+      // 中断原因（后端 stage）与时间轴上的缺口（gapSeconds）。
+      const fn = (payload && payload.filename) || "video.ts";
+      const gap = Math.round((payload && payload.gapSeconds) || 0);
+      // 缺口 / 失效提示先算成**纯文本**，再在模板里过 escapeHtml —— 不在模板外拼
+      // HTML 片段（xss-guard 的白名单只给"本地字面量"留位，不为了省事扩它）。
+      const gapNote = gap > 0 ? (gap >= 60 ? "中间缺失约 " + (gap / 60).toFixed(1) + " 分钟" : "中间缺失约 " + gap + " 秒") : "";
+      const staleNote = payload && payload.fileMissing ? "文件已被移动或删除" : "";
+      panel.innerHTML = panelShell(
+        "下载该视频",
+        `<div style="padding:30px 28px;text-align:center;">
+          <div style="font-size:30px;margin-bottom:10px;">⚠️</div>
+          <div style="color:#d97706;font-weight:600;font-size:16px;margin-bottom:8px;">已保存（录制中断）</div>
+          <div style="font-size:13px;color:#374151;margin-bottom:6px;">文件名：<code style="background:#f3f4f6;padding:2px 6px;border-radius:3px;font-family:Menlo,Consolas,monospace;">${P.escapeHtml(fn)}</code></div>
+          ${payload && payload.finalPath ? `<div style="font-size:12px;color:#6b7280;margin-bottom:8px;word-break:break-all;">位置：${P.escapeHtml(payload.finalPath)}</div>` : ""}
+          <div style="font-size:12px;color:#92400e;margin-bottom:6px;">${P.escapeHtml((payload && payload.stage) || "录制中断 · 已保存")}</div>
+          ${gapNote ? `<div style="font-size:12px;color:#92400e;margin-bottom:6px;">${P.escapeHtml(gapNote)}</div>` : ""}
+          ${staleNote ? `<div style="font-size:12px;color:#d32f2f;margin-bottom:6px;">${P.escapeHtml(staleNote)}</div>` : ""}
+          <button id="interrupted-close" style="margin-top:10px;padding:8px 20px;font-size:13px;border:none;background:#d97706;color:#fff;border-radius:5px;cursor:pointer;">知道了</button>
+        </div>`
+      );
+      const itBtn = panel.querySelector("#interrupted-close");
+      if (itBtn) itBtn.addEventListener("click", closePanel);
+    } else if (state === "stoppedEmpty") {
+      // 用户主动停止但没录到内容（R3）：既不是完成也不是失败 ——
+      // 旧代码落到 error 分支，显示成「下载失败：下载失败」。给一句中性说明即可。
+      panel.innerHTML = panelShell(
+        "下载该视频",
+        `<div style="padding:32px 28px;text-align:center;">
+          <div style="font-size:13px;color:#6b7280;margin-bottom:10px;">已停止，未录制到内容。</div>
+          <button id="stopped-empty-close" style="padding:8px 20px;font-size:13px;border:none;background:#6b7280;color:#fff;border-radius:5px;cursor:pointer;">关闭</button>
+        </div>`
+      );
+      const seBtn = panel.querySelector("#stopped-empty-close");
+      if (seBtn) seBtn.addEventListener("click", closePanel);
     } else if (state === "cancelled") {
       panel.innerHTML = panelShell(
         "下载该视频",
@@ -1084,15 +1266,15 @@
           <div style="margin-top:4px;font-size:11px;color:#9ca3af;">下载时可改名字 / 改位置</div>
         </div>
 
-        <div style="display:flex;gap:10px;">
-          <button id="confirm-cancel" style="flex:1;padding:11px;border:1px solid #d1d5db;background:#fff;border-radius:5px;cursor:pointer;font-size:14px;color:#374151;">取消</button>
-          <button id="confirm-go" style="flex:2;padding:11px;border:none;background:#3b82f6;color:#fff;border-radius:5px;cursor:pointer;font-size:14px;font-weight:600;">⬇ 确认下载</button>
-        </div>
-
         <div style="margin-top:14px;padding:10px 12px;background:#f0f9ff;border-radius:5px;font-size:12px;color:#0c4a6e;line-height:1.5;">
           💡 点击"确认下载"后会弹出 Windows"选择文件夹"框，选好后由本地 Go 程序直接下载并保存到该文件夹。<br>
           <span style="color:#0369a1;">首次使用需先打开一次 <code style="background:#fff;padding:1px 4px;border-radius:2px;">go-catcher.exe</code>（GoCatcher 客户端，打开即自动启动下载服务）。</span>
         </div>
+      </div>`,
+      // 操作按钮走 footer（钉底），不跟内容一起滚：窗口变小时它是**唯一**的出口，被裁掉就没法继续也没法退出
+      `<div style="flex:none;padding:12px 24px;border-top:1px solid #e5e7eb;background:#fff;display:flex;gap:10px;">
+        <button id="confirm-cancel" style="flex:1;padding:11px;border:1px solid #d1d5db;background:#fff;border-radius:5px;cursor:pointer;font-size:14px;color:#374151;">取消</button>
+        <button id="confirm-go" style="flex:2;padding:11px;border:none;background:#3b82f6;color:#fff;border-radius:5px;cursor:pointer;font-size:14px;font-weight:600;">⬇ 确认下载</button>
       </div>`
     );
 
@@ -1152,7 +1334,7 @@
       // 多任务并发：记录本次任务 id，供后续轮询精确定位（多个标签页各下各的互不串扰）
       activeTaskId = resp.taskId || null;
       // live 标记按本任务重算：上个任务若是直播，残留的 true 会让点播任务首帧
-      // 画出「停止（保存已录）」（评审自审 #13）。嗅探的 live 是启发式——false
+      // 画出「停止」（评审自审 #13）。嗅探的 live 是启发式——false
       // 不代表点播，误判由第一次轮询以服务端字段纠正；这里重算只为清掉上一个
       // 任务的残留、并让本任务 sniff 到的 true 即刻生效。
       activeLive = !!(source && source.live);
@@ -1180,10 +1362,30 @@
   function trackDownload(source) {
     // 首帧的 live 标记由 triggerDownload 在进面板前按本任务重算（嗅探启发式），
     // 服务端的权威标记要等第一次轮询才到；任一状态变化都会重画控件。
-    const interval = setInterval(async () => {
+    let misses = 0; // 连续查不到任务的次数（上限见 pollGiveUp）
+    // 先停掉上一个轮询：不这样，同一页面里"关掉再开另一个任务"会留下两个 interval
+    // 同时往同一块面板写（旧任务的状态把新面板刷成别的样子）。
+    stopTrack();
+    trackTimer = setInterval(async () => {
       try {
         const resp = await chrome.runtime.sendMessage({ type: "queryDownload", taskId: activeTaskId });
-        if (!resp || !resp.exists) return; // server 还没就绪或短暂不可达，继续轮询
+        if (!resp || !resp.exists) {
+          // 刚发起时服务端可能还没登记该任务，前几次查不到属正常；但连续查不到
+          // 达到上限，说明本地服务重启过或任务已被清理 —— 必须落到可区分的失败态，
+          // 不许继续静默轮询（那会让面板永停在「正在连接…」，用户看不出已失败）。
+          // 判据与 downloader.js 的 pollTask 同口径。
+          if (pollGiveUp(++misses)) {
+            stopTrack();
+            showPanel("error", {
+              message: "任务状态丢失（本地服务可能已重启）",
+              m3u8Url: source.url,
+              pageUrl: source.pageUrl || location.href,
+              title: source.title || document.title || "",
+            });
+          }
+          return;
+        }
+        misses = 0;
         const state = resp.state;
         if (state === "inProgress" || state === "paused") {
           const stage = resp.stage || "下载中";
@@ -1198,14 +1400,31 @@
           }
           updateInitiatedProgress(pct, stage, resp);
         } else if (state === "complete") {
-          clearInterval(interval);
+          stopTrack();
           showPanel("completed", {
             ...source,
             finalPath: resp.finalPath,
             filename: resp.filename,
           });
-        } else if (state === "error" || state === "interrupted" || state === "canceled") {
-          clearInterval(interval);
+        } else if (state === "interrupted") {
+          // 中断收尾：成品已保存但没录完 —— 走"已保存（录制中断）"面板。
+          // **不能**落到下面的 error 分支：那条拼的是「下载失败：…」，语义正好反了
+          // （产物明明保存下来了，R2）。
+          stopTrack();
+          showPanel("interrupted", {
+            ...source,
+            finalPath: resp.finalPath,
+            filename: resp.filename,
+            stage: resp.stage,
+            gapSeconds: resp.gapSeconds,
+            fileMissing: resp.fileMissing,
+          });
+        } else if (state === "stoppedEmpty") {
+          // 用户主动停止但没录到内容（R3）：中性收尾面板，不是「下载失败」。
+          stopTrack();
+          showPanel("stoppedEmpty", { ...source });
+        } else if (state === "error" || state === "canceled") {
+          stopTrack();
           if (state === "canceled") {
             showPanel("cancelled");
           } else {
@@ -1222,7 +1441,9 @@
       }
     }, 700);
 
-    const stopTracking = () => clearInterval(interval);
+    // 面板内 X 与"点灰底关面板"必须走**同一条**清理路径（A-5）：这里只做别名，
+    // 不再自己 clearInterval —— 局部句柄正是"关掉后轮询还在跑"的成因。
+    const stopTracking = stopTrack;
     if (panel) {
       const closeBtn = panel.querySelector("#m3u8-catcher-close");
       if (closeBtn) closeBtn.addEventListener("click", stopTracking, { once: true });
@@ -1234,10 +1455,12 @@
   //
   // 直播与点播是两套语义，混用会直接坏掉 —— 服务端 /pause 对直播返回 400
   // （"直播录制请使用停止：直播流不支持暂停后续录"）：
-  //   - 直播：只有「停止（保存已录）」与「取消」，**没有任何恢复入口**。
+  //   - 直播：只有「停止」与「取消」，**没有任何恢复入口**。
   //     暂停期间的分片已从滑动窗口滚走，接着录只会在产物里留一个时间轴空洞。
-  //     这与主界面 index.html 的控制按钮（'⏹ 停止（保存已录）'）一致。
-  //   - 点播：运行中「暂停」，暂停后「继续下载」——断点续传在这里是真的。
+  //     这与主界面 index.html 的控制按钮（'⏹ 停止'）一致。
+  //     按钮文案不带括号补充说明（学徒 2026-09-20 定）："停止后已录部分会保存成文件"
+  //     由面板底部那行完整句子承担（见 renderInitiatedControls 里的 hint）。
+  //   - 点播：运行中「暂停」，暂停后「继续」——断点续传在这里是真的。
   // 纯函数、不碰 DOM，renderInitiatedControls 与回归测试共用同一份判据。
   //
   // 配色与图标跟内置前端（web/index.html 的 actions()/rowCard()）保持同一套：
@@ -1247,13 +1470,13 @@
   function controlButtons(live, paused) {
     if (live) {
       return [
-        { ctl: "stop", label: "⏹ 停止（保存已录）", kind: "primary" },
+        { ctl: "stop", label: "⏹ 停止", kind: "primary" },
         { ctl: "cancel", label: "✕ 取消", kind: "danger" },
       ];
     }
     if (paused) {
       return [
-        { ctl: "resume", label: "⏯ 继续下载", kind: "primary" },
+        { ctl: "resume", label: "⏯ 继续", kind: "primary" },
         { ctl: "cancel", label: "✕ 取消", kind: "danger" },
       ];
     }
@@ -1356,6 +1579,10 @@
   }
 
   function closePanel() {
+    // 关面板 = 连轮询一起停（A-5）。不这样，点灰底/点页面别处关掉面板后，
+    // interval 仍在每 700ms 查一次任务：查到 complete 就把面板**自己弹回来**，
+    // 页面开着期间也一直白跑。
+    stopTrack();
     if (panel) {
       panel.remove();
       panel = null;
@@ -1461,8 +1688,37 @@
   // 测试钩子：node 环境下（有 module、无扩展 API）把纯函数挂出去，供
   // tests/livecontrols.test.js 与 tests/contentparse.test.js 直接调用。
   // content script 里没有 module，整段不执行 —— 对线上行为零影响。
+  // panelShell / renderConfirmPanel / showPanel：tests/panellayout.test.js 要**真跑**
+  // 一遍面板渲染（喂最小 DOM 桩），断言"按钮在滚动区之外"——它守的是布局契约，
+  // 扫字符串比不出来（同一个 id 留在 body 里也能让字符串断言全绿）。
   if (typeof module !== "undefined" && module.exports) {
-    module.exports.__ui = { controlButtons, CTL_STYLE, buildGoCommand, buildOutputName };
+    module.exports.__ui = {
+      controlButtons,
+      CTL_STYLE,
+      buildGoCommand,
+      buildOutputName,
+      // P2-2：轮询放弃判据与阈值（tests/polllimit.test.js 拿它与 downloader.js 对值）
+      pollGiveUp,
+      POLL_MAX_MISSES,
+      // P3-3：hideButton 真跑断言用（token 必须前移，否则晚到的检查会把按钮画回）
+      hideButton,
+      gateTokenNow: () => gateToken,
+      // 悬停按钮的保命逻辑：真跑断言用（tests/buttonpin.test.js 施加"站点收走小窗"）
+      pinHold,
+      targetRect,
+      showButtonIfSniffed,
+      repositionButton,
+      setPointer: (x, y) => {
+        lastPointer.x = x;
+        lastPointer.y = y;
+      },
+      // 按钮上的 ✕：真跑断言用（tests/buttondismiss.test.js 施加"用户点了关闭"）
+      dismissButton,
+      btnDismissedNow: () => btnDismissed,
+      panelShell,
+      renderConfirmPanel,
+      showPanel,
+    };
   }
 
   if (document.readyState === "loading") {

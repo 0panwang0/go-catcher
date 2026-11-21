@@ -16,15 +16,17 @@
 // ⚠ 下面这几行 import 必须各自保持**单行**：tests/downloader.test.js 在 node 里靠
 //   「去掉 import 行 + 逐个前置展开模块源码」来加载本文件（node 无法直接 import
 //   扩展页脚本，也不值得为它改 package.json 的 type）。
-import { fetchText, parseDuration, parseSegments, parseVariants, shortQuality, qualityFromURL, fmtDur } from "./src/background/m3u8-parse.js";
+import { fetchText, parseDuration, parseSegments, parseVariants, shortQuality, qualityFromURL, sanitizeQuality, fmtDur } from "./src/background/m3u8-parse.js";
 import { sanitizeFileName, assembleGoCommand } from "./src/background/cli-args.js";
 import { isCandidateURL, isPlaylistURL } from "./src/background/media-url.js";
 import { escapeHtml } from "./src/background/html-escape.js";
+// 阈值与浮层侧（content.js）共用一份来源 —— 本页是 ESM，可以直接 import，
+// 不必经由 content-shared.js（那条路是给经典脚本 content.js 用的）。
+import { POLL_MAX_MISSES } from "./src/background/constants.js";
 
 const ANALYZE_LIMIT = 12; // 最多分析的嗅探条数
 const MAIN_VIDEO_MIN = 60; // 时长 >= 60s 判定为主视频
 const POLL_INTERVAL_MS = 700; // 轮询服务端任务状态的间隔
-const POLL_MAX_MISSES = 15; // 连续查不到任务多少次后放弃（≈10s，服务重启过）
 
 const $ = (sel) => document.querySelector(sel);
 
@@ -43,7 +45,9 @@ document.addEventListener("DOMContentLoaded", async () => {
   const autoUrl = params.get("url");
   const autoTitle = params.get("title") || "";
   const autoPage = params.get("pageUrl") || "";
-  const autoQuality = params.get("quality") || "";
+  // 必须过白名单（P0-2）：这个值由 openDownloader 把"被嗅探页面的 quality"
+  // 拼进本页 URL 得来，属页面可控输入，读回时和 qualityFromURL 用同一道收窄。
+  const autoQuality = sanitizeQuality(params.get("quality"));
   if (autoUrl) {
     $("#manualUrl").value = autoUrl;
     $("#manualName").value = autoTitle;
@@ -226,6 +230,11 @@ function renderList(list) {
       kind = "分析失败"; kindClass = "fail";
     }
 
+    // ⚠️ 本段每个插值都必须过 escapeHtml，无例外（评审 P0-2）：
+    // info 里含 item.quality，它的来源是 qualityFromURL 的 ?quality= 分支，
+    // 内容由**被嗅探的页面**决定 ⇒ 直接拼进 innerHTML 就是存储型注入
+    // （先写进 storage，之后每次打开本页都重渲染）。原来整段只有 info 这一处漏，
+    // 所以「本段无例外」这条规则本身就是防它复发的手段。
     const durText = item.duration > 0 ? fmtDur(item.duration) : "";
     const segText = item.segments ? `${item.segments} 分片` : "";
     const q = item.quality || "";
@@ -244,8 +253,8 @@ function renderList(list) {
       </div>
       <div class="meta">
         <span class="host">${escapeHtml(host)}</span>
-        ${info ? `<span class="info">${info}</span>` : ""}
-        <span class="time">${time}</span>
+        ${info ? `<span class="info">${escapeHtml(info)}</span>` : ""}
+        <span class="time">${escapeHtml(time)}</span>
         ${srcLink}
       </div>
       <div class="url" title="${escapeHtml(item.url)}">${escapeHtml(item.url)}</div>`;

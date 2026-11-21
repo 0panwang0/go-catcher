@@ -28,6 +28,8 @@ import (
 	"net"
 	"net/http"
 	"strings"
+
+	"github.com/0panwang0/go-catcher/internal/platform"
 )
 
 const (
@@ -98,7 +100,17 @@ func (r *Runtime) ensureAPIToken() string {
 		if err := r.saveConfigLocked(); err != nil {
 			// 落盘失败不影响本次运行（token 已在内存里），但下次启动会换一枚，
 			// 扩展需要重新握手——这里至少留一条痕迹，不要把失败彻底吞掉。
-			fmt.Printf("[auth] 令牌落盘失败（下次启动将更换令牌）: %v\n", err)
+			//
+			// ⚠️ 必须走 platform.Logf，**绝不能 fmt.Printf**（P1-8）：本函数在
+			// RunNativeHost 的启动路径上（nativehost.go → configuredPort() →
+			// initRuntimeConfig() → 这里），而宿主模式下 main 刻意不调
+			// AttachParentConsole/SetupFileLogging ⇒ os.Stdout 就是浏览器与本进程
+			// 之间的 **native messaging 协议通道**。往里面写一行诊断，浏览器会把它
+			// 当成 4 字节长度前缀解析 ⇒ 帧错位 ⇒ 扩展侧"连上了但永远收不到响应"，
+			// 而所有文件日志一切正常（本项目头号缺陷形态）。
+			// platform.Logf 的既定语义正是"有文件日志就写文件、否则退回 stderr、
+			// 绝不写 os.Stdout"，与本处的需求逐字吻合。
+			platform.Logf("[auth] 令牌落盘失败（下次启动将更换令牌）: %v", err)
 		}
 	}
 	return r.cfg.APIToken
